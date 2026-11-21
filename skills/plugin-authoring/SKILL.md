@@ -1,6 +1,6 @@
 ---
 name: plugin-authoring
-description: shared-skills プラグインにルールやスキルを追加または変更する手順。置き場所(rules/AGENTS.md、rules/、skills/)の判断、粒度と構成の指針、テンプレートからの作成、plugin.json のバージョン更新、構造検査を扱う。共有すべきルールやスキルを新規作成する、既存のものを統合または分離する、または shared-skills プラグインを編集するときに使用する。日本語の文体規範は japanese-tech-writing に委ねる。
+description: shared-skills プラグインにルールやスキルを追加または変更する手順。置き場所(rules/AGENTS.md、rules/、skills/)の判断、粒度と構成の指針、テンプレートからの作成、plugin.json のバージョン更新、構造検査、全スキル横断の単体テスト実行を扱う。共有すべきルールやスキルを新規作成する、既存のものを統合または分離する、または shared-skills プラグインを編集するときに使用する。日本語の文体規範は japanese-tech-writing に委ねる。
 ---
 
 # shared-skills へのルールとスキルの追加と変更
@@ -18,6 +18,8 @@ description: shared-skills プラグインにルールやスキルを追加ま�
 - **リポジトリ固有の手順**：作業対象リポジトリにしか関係しない手順は本スキルの対象外とし、そのリポジトリの `.agents/skills/`、`.agents/rules/`、または `AGENTS.md` に置く。
 - **生成と記帳の機械化**：命名規約の検査、テンプレートの複写、README 収録一覧への行追加、`plugin.json` の version バンプは `scripts/new_entry.py` が担う。
   - 置き場所と粒度の判断、description と本文の執筆だけがモデルの仕事である。
+- **全スキル横断の単体テスト**：`skills/` 配下には `__init__.py` を置かず、各スキルのスクリプトが自身のディレクトリ前提のインポートを使う構成となっている。
+  - 一括実行と 0 件通過の抑止は `scripts/run_all_tests.py` が担う。
 
 ## 手順
 
@@ -31,6 +33,8 @@ description: shared-skills プラグインにルールやスキルを追加ま�
 4. 作成した内容を `guidelines.md` のチェックリストで点検する。
    - 特に description は、モデルが読むかどうかを決める唯一の材料なので、読み込むべき状況が一文で特定できることを確認する。
    - 機械化できる項目は `python skills/plugin-authoring/scripts/check_plugin.py` の実行でも確認する。
+   - スクリプトやテストを変更した場合は `python skills/plugin-authoring/scripts/run_all_tests.py` で全スキルの単体テストを実行する。
+   - ルートから `python -m unittest discover -s skills -p "test_*.py"` を実行しても `__init__.py` がないため 0 件通過で終了コード 0 になる点に注意し、横断確認にそのまま使わない。
    - description の状況特定など判断が要る項目は引き続き目視で確認する。
 5. `plugin.json` の `version` を規約どおりに上げる。
    - 手順 3 の生成では追加の分のパッチが済んでいる。

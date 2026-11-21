@@ -18,8 +18,11 @@ skills/plugin-authoring/guidelines.md のチェックリストのうち、機械
 - plugin.json: name, version, description を持つ JSON。
   displayName, suggestedPrompts, disabled, author, homepage, repository,
   license, keywords, platforms など公式仕様フィールドについても型を検査する
+- hooks.json (存在する場合): 公式スキーマのイベント名・未知キー・ハンドラ型、
+  および command 内のプラグイン内相対スクリプト実在を検査する
 - --version-base <ref>: 指定した git ref の plugin.json と version が
-  変わっていることを確認(PR でのバージョン更新忘れの検出用)
+  変わっていることを確認(PR でのバージョン更新忘れと hooks.json 等の
+  削除・改名時のマイナーバンプ漏れ検出用)
 
 実行: `python skills/plugin-authoring/scripts/check_plugin.py` (プラグインルートから)
 違反があれば非ゼロで終了する。標準ライブラリのみで動作する。
@@ -41,9 +44,28 @@ SKILL_LINE_LIMIT = 200
 AGENTS_SECTION_LINE_LIMIT = 5
 # version の意味づけ対象となるプラグイン中身のパス。これらの移動・改名・削除は
 # guidelines.md の規約上マイナーバンプを要求する
-VERSIONED_CONTENT_PATHS = ("rules", "skills", "AGENTS.md", "README.md")
+VERSIONED_CONTENT_PATHS = ("rules", "skills", "AGENTS.md", "README.md", "hooks.json")
 PLUGIN_JSON_PATH = Path("plugin.json")
 PLUGIN_JSON_LABEL = PLUGIN_JSON_PATH.as_posix()
+HOOKS_JSON_PATH = Path("hooks.json")
+HOOKS_JSON_LABEL = HOOKS_JSON_PATH.as_posix()
+HOOKS_GROUPED_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
+HOOKS_FLAT_EVENTS = frozenset({"SessionStart", "PreInvocation", "PostInvocation", "Stop"})
+HOOKS_SPEC_ALLOWED_KEYS = frozenset({"enabled"}) | HOOKS_GROUPED_EVENTS | HOOKS_FLAT_EVENTS
+HOOKS_GROUP_ALLOWED_KEYS = frozenset({"matcher", "hooks"})
+HOOKS_HANDLER_ALLOWED_KEYS = frozenset({"type", "command", "timeout"})
+HOOKS_ALLOWED_HANDLER_TYPES = frozenset({"command"})
+HOOK_SCRIPT_RUNNERS = frozenset(
+    {"python", "python3", "py", "node", "bash", "sh", "zsh", "pwsh", "powershell"}
+)
+HOOK_RUNNER_INLINE_FLAGS = frozenset(
+    {"-c", "-m", "-e", "--eval", "-p", "--print", "-command", "-encodedcommand", "-enc"}
+)
+HOOK_RUNNER_VALUE_FLAGS = frozenset(
+    {"-executionpolicy", "-ep", "-w", "-x", "-r", "--require", "--loader", "--import"}
+)
+HOOK_SCRIPT_EXTENSIONS = (".py", ".sh", ".js", ".mjs", ".cjs", ".ts", ".ps1", ".cmd", ".bat")
+HOOK_SHELL_SEPARATORS = frozenset({";", "&&", "||", "|", "&"})
 AGENTS_MD_PATH = Path("rules") / "AGENTS.md"
 IGNORED_RULE_STEMS = frozenset({"AGENTS", "GEMINI"})
 README_PATH = Path("README.md")
@@ -537,6 +559,326 @@ def check_plugin_json(root: Path = REPO_ROOT) -> List[str]:
     return validate_plugin_json(data)
 
 
+def _tokenize_hook_command(command: str) -> Optional[List[str]]:
+    """コマンド文字列をバックスラッシュを保持したままトークン分割する。
+
+    未閉鎖クォートがある場合は None を返す。
+    """
+    tokens: List[str] = []
+    buf: List[str] = []
+    in_token = False
+    quote: Optional[str] = None
+    i = 0
+    n = len(command)
+
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            if quote == "'" and ch == "'":
+                quote = None
+                i += 1
+                continue
+            if quote == '"':
+                if ch == "\\" and i + 1 < n and command[i + 1] == '"':
+                    buf.append('"')
+                    i += 2
+                    continue
+                if ch == '"':
+                    quote = None
+                    i += 1
+                    continue
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch.isspace():
+            if in_token:
+                tokens.append("".join(buf))
+                buf = []
+                in_token = False
+            i += 1
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            in_token = True
+            i += 1
+            continue
+
+        two = command[i : i + 2]
+        if two in ("&&", "||"):
+            if in_token:
+                tokens.append("".join(buf))
+                buf = []
+                in_token = False
+            tokens.append(two)
+            i += 2
+            continue
+
+        if ch in (";", "|", "&"):
+            if in_token:
+                tokens.append("".join(buf))
+                buf = []
+                in_token = False
+            tokens.append(ch)
+            i += 1
+            continue
+
+        buf.append(ch)
+        in_token = True
+        i += 1
+
+    if quote is not None:
+        return None
+    if in_token:
+        tokens.append("".join(buf))
+    return tokens
+
+
+def _has_unexpanded_plugin_root(token: str) -> bool:
+    return (
+        token.startswith("$PLUGIN_ROOT")
+        or token.startswith("${PLUGIN_ROOT}")
+        or token.startswith("%PLUGIN_ROOT%")
+    )
+
+
+def _is_direct_script_token(token: str) -> bool:
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", token):
+        return False
+    if token.startswith(("./", "../", ".\\", "..\\")):
+        return True
+    if _has_unexpanded_plugin_root(token):
+        return True
+    if "/" in token and not token.startswith("/"):
+        return True
+    if "\\" in token and not re.match(r"^(?:[A-Za-z]:\\|\\\\)", token):
+        return True
+    return token.lower().endswith(HOOK_SCRIPT_EXTENSIONS)
+
+
+def _extract_hook_script_paths(command: str) -> Tuple[List[str], List[str]]:
+    """hook command からスクリプトパス候補と構文エラーを抽出する。"""
+    tokens = _tokenize_hook_command(command)
+    if tokens is None:
+        return [], ["command の引用符が閉じられていません"]
+
+    segments: List[List[str]] = []
+    current: List[str] = []
+    for tok in tokens:
+        if tok in HOOK_SHELL_SEPARATORS:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(tok)
+    if current:
+        segments.append(current)
+
+    candidates: List[str] = []
+    errors: List[str] = []
+
+    for seg in segments:
+        idx = 0
+        while idx < len(seg) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[idx]):
+            idx += 1
+        if idx >= len(seg):
+            continue
+
+        cmd_tok = seg[idx]
+        cmd_name = Path(cmd_tok.replace("\\", "/")).name.lower()
+        if cmd_name.endswith(".exe"):
+            cmd_name = cmd_name[:-4]
+
+        candidate: Optional[str] = None
+        if cmd_name in HOOK_SCRIPT_RUNNERS:
+            j = idx + 1
+            while j < len(seg):
+                arg = seg[j]
+                arg_lower = arg.lower()
+                if arg_lower in HOOK_RUNNER_INLINE_FLAGS:
+                    break
+                if arg_lower == "-file":
+                    if j + 1 < len(seg):
+                        candidate = seg[j + 1]
+                    break
+                if arg_lower in HOOK_RUNNER_VALUE_FLAGS:
+                    j += 2
+                    continue
+                if cmd_name in {"python", "python3", "py"} and (
+                    arg_lower.startswith("-c") or arg_lower.startswith("-m")
+                ):
+                    break
+                if (
+                    cmd_name in {"python", "python3", "py", "bash", "sh", "zsh"}
+                    and arg.startswith("-")
+                    and not arg.startswith("--")
+                    and len(arg) > 2
+                    and any(ch in arg[1:].lower() for ch in ("c", "m", "e"))
+                ):
+                    break
+                if arg == "--":
+                    if j + 1 < len(seg):
+                        candidate = seg[j + 1]
+                    break
+                if arg.startswith("-"):
+                    j += 1
+                    continue
+                candidate = arg
+                break
+        elif _is_direct_script_token(cmd_tok):
+            candidate = cmd_tok
+
+        if candidate is None:
+            continue
+        if _has_unexpanded_plugin_root(candidate):
+            errors.append(
+                f"command で $PLUGIN_ROOT/%PLUGIN_ROOT% は変数置換されないため、"
+                f"プラグインルートからの相対パスを指定してください ({candidate!r})"
+            )
+        else:
+            candidates.append(candidate)
+
+    return candidates, errors
+
+
+def _check_hook_command_scripts(
+    command: str, label: str, root: Path, errors: List[str]
+) -> None:
+    candidates, parse_errors = _extract_hook_script_paths(command)
+    for err in parse_errors:
+        errors.append(f"{label}: {err}")
+
+    root_resolved = root.resolve()
+    for candidate in candidates:
+        if "\\" in candidate:
+            errors.append(
+                f"{label}: スクリプトパス {candidate!r} にバックスラッシュ '\\' は使えません"
+                "(POSIX 相対パス '/' を使用してください)"
+            )
+            continue
+        if candidate.startswith("/") or re.match(r"^[A-Za-z]:", candidate):
+            errors.append(
+                f"{label}: スクリプトパス {candidate!r} はプラグインルートからの相対パスである必要があります"
+            )
+            continue
+        target = (root / candidate).resolve()
+        try:
+            target.relative_to(root_resolved)
+        except ValueError:
+            errors.append(
+                f"{label}: スクリプトパス {candidate!r} がプラグインディレクトリ外を参照しています"
+            )
+            continue
+        if not target.is_file():
+            errors.append(f"{label}: 参照スクリプトが見つかりません: {candidate}")
+
+
+def _validate_hook_handler(
+    handler: object, label: str, root: Optional[Path], errors: List[str]
+) -> None:
+    if not isinstance(handler, dict):
+        errors.append(f"{label} はオブジェクトである必要があります")
+        return
+    for key in sorted(set(handler.keys()) - HOOKS_HANDLER_ALLOWED_KEYS):
+        errors.append(f"{label} に未知のキー {key!r} があります")
+
+    if "type" in handler:
+        handler_type = handler["type"]
+        if not isinstance(handler_type, str) or handler_type not in HOOKS_ALLOWED_HANDLER_TYPES:
+            errors.append(f"{label}.type は 'command' のみ指定できます")
+
+    has_valid_command = False
+    if "command" not in handler or not _is_non_empty_string(handler["command"]):
+        errors.append(f"{label}.command は空でない文字列である必要があります")
+    else:
+        has_valid_command = True
+
+    if "timeout" in handler:
+        timeout = handler["timeout"]
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+            errors.append(f"{label}.timeout は正の整数である必要があります")
+
+    if has_valid_command and root is not None:
+        _check_hook_command_scripts(handler["command"], label, root, errors)
+
+
+def validate_hooks_json(data: object, root: Optional[Path] = None) -> List[str]:
+    """hooks.json の公式仕様スキーマと参照スクリプト実在を検査する。"""
+    errors: List[str] = []
+    if not isinstance(data, dict):
+        return [f"{HOOKS_JSON_LABEL}: JSON のトップレベルがオブジェクトではありません"]
+
+    for hook_name, spec in data.items():
+        if not _is_non_empty_string(hook_name):
+            errors.append(f"{HOOKS_JSON_LABEL}: フック名は空でない文字列である必要があります")
+            continue
+        hook_label = f"{HOOKS_JSON_LABEL}.{hook_name}"
+        if not isinstance(spec, dict):
+            errors.append(f"{hook_label} はオブジェクトである必要があります")
+            continue
+
+        for key in sorted(set(spec.keys()) - HOOKS_SPEC_ALLOWED_KEYS):
+            errors.append(f"{hook_label} に未知のキー {key!r} があります")
+
+        if "enabled" in spec and not isinstance(spec["enabled"], bool):
+            errors.append(f"{hook_label}.enabled は真偽値である必要があります")
+
+        for event in sorted(HOOKS_GROUPED_EVENTS):
+            if event not in spec:
+                continue
+            groups = spec[event]
+            event_label = f"{hook_label}.{event}"
+            if not isinstance(groups, list):
+                errors.append(f"{event_label} は配列である必要があります")
+                continue
+            for g_idx, group in enumerate(groups):
+                group_label = f"{event_label}[{g_idx}]"
+                if not isinstance(group, dict):
+                    errors.append(f"{group_label} はオブジェクトである必要があります")
+                    continue
+                for key in sorted(set(group.keys()) - HOOKS_GROUP_ALLOWED_KEYS):
+                    errors.append(f"{group_label} に未知のキー {key!r} があります")
+                if "matcher" not in group or not isinstance(group["matcher"], str):
+                    errors.append(f"{group_label}.matcher は文字列である必要があります")
+                if "hooks" not in group or not isinstance(group["hooks"], list):
+                    errors.append(f"{group_label}.hooks は配列である必要があります")
+                    continue
+                for h_idx, handler in enumerate(group["hooks"]):
+                    _validate_hook_handler(
+                        handler, f"{group_label}.hooks[{h_idx}]", root, errors
+                    )
+
+        for event in sorted(HOOKS_FLAT_EVENTS):
+            if event not in spec:
+                continue
+            handlers = spec[event]
+            event_label = f"{hook_label}.{event}"
+            if not isinstance(handlers, list):
+                errors.append(f"{event_label} は配列である必要があります")
+                continue
+            for h_idx, handler in enumerate(handlers):
+                _validate_hook_handler(
+                    handler, f"{event_label}[{h_idx}]", root, errors
+                )
+
+    return errors
+
+
+def check_hooks_json(root: Path = REPO_ROOT) -> List[str]:
+    """hooks.json の存在時検査(未配置は許容)を行う。"""
+    path = root / HOOKS_JSON_PATH
+    if not path.exists():
+        return []
+    if not path.is_file():
+        return [f"{HOOKS_JSON_LABEL} がファイルではありません"]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return [f"{HOOKS_JSON_LABEL}: JSON として解釈できません({e})"]
+    return validate_hooks_json(data, root=root)
+
+
 def check_version_bump(base_ref: str, root: Path = REPO_ROOT) -> List[str]:
     """base ref と version を比較し、規約通りのバンプかを検査する
 
@@ -604,6 +946,7 @@ def main() -> int:
         ("README.md", check_readme()),
         ("docs/*.md", check_docs()),
         ("plugin.json", check_plugin_json()),
+        ("hooks.json", check_hooks_json()),
     ]
     if args.version_base:
         checks.append(("version bump", check_version_bump(args.version_base)))

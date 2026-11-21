@@ -19,12 +19,12 @@ import re
 import subprocess
 import sys
 from typing import Any, Callable
-import urllib.parse
 
 _DECISIONS_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "gemini-decisions-api" / "scripts"
 if str(_DECISIONS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_DECISIONS_SCRIPTS_DIR))
 
+import decision_hygiene  # noqa: E402
 import run_decisions  # noqa: E402
 
 DEFAULT_MODEL = run_decisions.DEFAULT_MODEL
@@ -46,12 +46,19 @@ MAX_REPO_FILES_IN_SNAPSHOT = 800
 
 DEFAULT_DOC_GLOBS: tuple[str, ...] = (
     "README.md",
+    "AGENTS.md",
+    "GEMINI.md",
+    "CLAUDE.md",
     "docs/**/*.md",
-    "skills/**/SKILL.md",
-    ".agents/skills/**/SKILL.md",
-    ".agents/rules/*.md",
-    "rules/*.md",
+    "skills/**/*.md",
+    ".agents/skills/**/*.md",
+    ".agents/rules/**/*.md",
+    ".agent/rules/**/*.md",
+    "_agents/rules/**/*.md",
+    "_agent/rules/**/*.md",
+    "rules/**/*.md",
 )
+DEFAULT_EXCLUDED_DOC_GLOBS: tuple[str, ...] = ("**/slop-catalog.md",)
 
 DEFAULT_EXCLUDED_DIRS: frozenset[str] = frozenset(
     {
@@ -69,49 +76,13 @@ DEFAULT_EXCLUDED_DIRS: frozenset[str] = frozenset(
     }
 )
 
-SAFE_ENV_BASENAMES: frozenset[str] = frozenset(
-    {
-        ".env.example",
-        ".env.sample",
-        ".env.template",
-        ".env.dist",
-        ".env.schema",
-    }
-)
-SAFE_ENV_SUFFIXES: tuple[str, ...] = (
-    ".example",
-    ".sample",
-    ".template",
-    ".dist",
-    ".schema",
-)
+SAFE_ENV_BASENAMES: frozenset[str] = decision_hygiene.SAFE_ENV_BASENAMES
+SAFE_ENV_SUFFIXES: tuple[str, ...] = decision_hygiene.SAFE_ENV_SUFFIXES
 
-SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "秘密鍵ヘッダ (PRIVATE KEY)",
-        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?:\s+BLOCK)?-----"),
-    ),
-    (
-        "Google API キー (AIza...)",
-        re.compile(r"AIza[0-9A-Za-z_-]{20,}"),
-    ),
-    (
-        "GitHub トークン (gh*_...)",
-        re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
-    ),
-    (
-        "GitHub Fine-grained PAT (github_pat_...)",
-        re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
-    ),
-    (
-        "API シークレットキー (sk-...)",
-        re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}"),
-    ),
-    (
-        "AWS アクセスキー (AKIA...)",
-        re.compile(r"AKIA[0-9A-Z]{16}"),
-    ),
-)
+PRIVATE_KEY_BLOCK_RE = decision_hygiene.PRIVATE_KEY_BLOCK_RE
+PRIVATE_KEY_HEADER_RE = decision_hygiene.PRIVATE_KEY_HEADER_RE
+
+SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = decision_hygiene.SECRET_DETECT_PATTERNS
 
 FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)")
@@ -257,40 +228,24 @@ class AuditCandidate:
     estimated_scope: str | None = None
 
 
+def configure_utf8_stdio() -> None:
+    """stdin/stdout/stderr が reconfigure を持つ場合 UTF-8 へ再設定する。"""
+    decision_hygiene.configure_utf8_stdio()
+
+
 def mask_secret(text: str, secret: str | None = None) -> str:
     """エラー出力から API キーおよび秘密情報トークン実値をマスクする。"""
-    masked = text
-    if secret:
-        masked = masked.replace(secret, "[REDACTED]")
-        quoted = urllib.parse.quote(secret, safe="")
-        if quoted and quoted != secret:
-            masked = masked.replace(quoted, "[REDACTED]")
-    for _, pattern in SECRET_PATTERNS:
-        masked = pattern.sub("[REDACTED]", masked)
-    return masked
+    return decision_hygiene.mask_secret(text, secret)
 
 
 def scan_text_for_secrets(text: str) -> list[str]:
     """テキスト内の秘密鍵ヘッダ・API トークンパターンのラベル一覧を返す。"""
-    labels: list[str] = []
-    for label, pattern in SECRET_PATTERNS:
-        if pattern.search(text):
-            labels.append(label)
-    return labels
+    return decision_hygiene.scan_text_for_secrets(text, patterns=SECRET_PATTERNS)
 
 
 def is_blocked_env_path(path: Path | str) -> bool:
     """送信禁止の .env 系ファイル（雛形を除く）かどうかを判定する。"""
-    name = Path(path).name.lower()
-    if name == ".env":
-        return True
-    if name.startswith(".env."):
-        if name in SAFE_ENV_BASENAMES:
-            return False
-        if name.endswith(SAFE_ENV_SUFFIXES):
-            return False
-        return True
-    return False
+    return decision_hygiene.is_blocked_env_path(path)
 
 
 def assert_safe_file_path(path: Path | str, role: str) -> None:
@@ -664,13 +619,17 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
 
 def select_doc_files(ctx: RepoContext, path_patterns: list[str] | None) -> list[str]:
     """対象グロブまたはパス群に一致するリポジトリ内ファイル一覧を昇順で返す。"""
+    is_default = not path_patterns
     patterns = path_patterns if path_patterns else list(DEFAULT_DOC_GLOBS)
     compiled = [_glob_to_regex(pat) for pat in patterns]
+    excluded = [_glob_to_regex(pat) for pat in DEFAULT_EXCLUDED_DOC_GLOBS] if is_default else []
     selected: list[str] = []
     seen: set[str] = set()
 
     for rel in ctx.repo_files:
         if any(rx.match(rel) for rx in compiled):
+            if any(rx.match(rel) for rx in excluded):
+                continue
             if rel not in seen:
                 seen.add(rel)
                 selected.append(rel)
@@ -2113,7 +2072,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs="+",
         action="extend",
         default=[],
-        help="検査対象の相対パスまたはグロブ（省略時は README / docs / skills / rules）",
+        help="検査対象の相対パスまたはグロブ（省略時は主要ルート文書と docs / skills / rules 配下の Markdown、slop-catalog.md を除く）",
     )
     docs_parser.add_argument(
         "--facts-file",
@@ -2192,6 +2151,7 @@ def main(
     stdin_text: str | None = None,
 ) -> int:
     """CLI 引数を解釈して指定サブコマンドを実行し、終了コードを返す。"""
+    configure_utf8_stdio()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     environ = os.environ if env is None else env
@@ -2233,7 +2193,4 @@ def main(
 
 
 if __name__ == "__main__":
-    for _stream in (sys.stdin, sys.stdout, sys.stderr):
-        if hasattr(_stream, "reconfigure"):
-            _stream.reconfigure(encoding="utf-8")
     raise SystemExit(main())

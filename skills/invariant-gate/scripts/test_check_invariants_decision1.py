@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""check_invariants_decision1.py の仕様準拠単体テスト（INV-01〜INV-12 / P1-01〜P1-04）。
+"""check_invariants_decision1.py の仕様準拠単体テスト（INV-01〜INV-17 / P1-01〜P1-06）。
 
 外部ネットワーク通信を行わず、SDK・REST・git diff・エラー経路をモックして検証する。
 """
@@ -786,6 +786,244 @@ class TestInvariantGate(unittest.TestCase):
         for tok in tokens + [env_secret]:
             self.assertNotIn(tok, masked)
         self.assertIn("[REDACTED]", masked)
+
+    def test_INV_13_auto_rule_dirs_include_dot_agent_and_underscore_agent(self) -> None:
+        """INV-13: .agent/rules と _agent/rules を含む 4 種のルールディレクトリを昇順で自動検出する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_file(root / ".agents" / "rules" / "b.md", "## A1\n- Rule from .agents.\n")
+            _write_file(root / ".agents" / "rules" / "a.md", "## A0\n- Rule from .agents a.\n")
+            _write_file(root / ".agent" / "rules" / "c.md", "## B1\n- Rule from .agent.\n")
+            _write_file(root / "_agents" / "rules" / "d.md", "## C1\n- Rule from _agents.\n")
+            _write_file(root / "_agent" / "rules" / "e.md", "## D1\n- Rule from _agent.\n")
+
+            files = gate.discover_rule_files(root)
+            rel_files = [p.relative_to(root.resolve()).as_posix() for p in files]
+            self.assertEqual(
+                rel_files,
+                [
+                    ".agents/rules/a.md",
+                    ".agents/rules/b.md",
+                    ".agent/rules/c.md",
+                    "_agents/rules/d.md",
+                    "_agent/rules/e.md",
+                ],
+            )
+            rules = gate.collect_rules(root, ["src/app.py"])
+            self.assertEqual(len(rules), 5)
+
+    def test_INV_14_native_plugin_rules_discovery(self) -> None:
+        """INV-14: ネイティブプラグイン構成（JSONC 含む）または rules/AGENTS.md 共存時に rules/*.md を重複なく検出する。"""
+        manifest_cases = [
+            ("plugin.json", '{\n  // JSONC comment\n  "name": "sample",\n}\n'),
+            (".antigravity-plugin/plugin.json", '{"name": "sample"}\n'),
+            (".gemini-plugin/plugin.json", '{"name": "sample"}\n'),
+        ]
+        for manifest_rel, manifest_body in manifest_cases:
+            with self.subTest(manifest=manifest_rel):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    _write_file(root / manifest_rel, manifest_body)
+                    _write_file(root / "rules" / "AGENTS.md", "## Core\n- Rule AGENTS.\n")
+                    _write_file(root / "rules" / "GEMINI.md", "## Gem\n- Rule GEMINI.\n")
+                    _write_file(root / "rules" / "alpha.md", "## Alpha\n- Rule alpha.\n")
+                    _write_file(root / "rules" / "sub" / "nested.md", "## Nested\n- Should not recurse.\n")
+                    _write_file(root / "rules" / "legacy.mdc", "## Legacy\n- Should ignore mdc.\n")
+
+                    self.assertTrue(gate.is_native_plugin_repo(root))
+                    files = gate.discover_rule_files(root)
+                    rel_files = [p.relative_to(root.resolve()).as_posix() for p in files]
+                    self.assertEqual(
+                        rel_files,
+                        ["rules/AGENTS.md", "rules/GEMINI.md", "rules/alpha.md"],
+                    )
+
+        # rules/AGENTS.md 単独でもプラグインルール探索が有効になり重複しない
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_file(root / "rules" / "AGENTS.md", "## Core\n- Rule AGENTS.\n")
+            _write_file(root / "rules" / "domain.md", "## Domain\n- Rule domain.\n")
+            self.assertTrue(gate.is_native_plugin_repo(root))
+            files = gate.discover_rule_files(root)
+            rel_files = [p.relative_to(root.resolve()).as_posix() for p in files]
+            self.assertEqual(rel_files, ["rules/AGENTS.md", "rules/domain.md"])
+
+    def test_INV_15_non_plugin_repo_ignores_rules_dir(self) -> None:
+        """INV-15: マニフェストも rules/AGENTS.md もない通常リポジトリでは rules/*.md を自動検出しない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_file(root / "rules" / "domain.md", "## Domain\n- Should not auto-load.\n")
+            diff_file = _write_file(root / "change.diff", SAMPLE_DIFF)
+
+            self.assertFalse(gate.is_native_plugin_repo(root))
+            self.assertEqual(gate.discover_rule_files(root), [])
+
+            code_normal, out_normal, _ = _run_cli_capture(
+                ["--repo-root", str(root), "--diff-file", str(diff_file), "--format", "json"],
+                env_override={"GEMINI_API_KEY": None},
+            )
+            code_strict, out_strict, _ = _run_cli_capture(
+                ["--repo-root", str(root), "--diff-file", str(diff_file), "--strict", "--format", "json"],
+                env_override={"GEMINI_API_KEY": None},
+            )
+            self.assertEqual(code_normal, 0)
+            self.assertEqual(json.loads(out_normal)["status"], "skipped_no_rules")
+            self.assertEqual(code_strict, 2)
+            self.assertEqual(json.loads(out_strict)["code"], "no_rules_strict")
+
+    def test_INV_16_same_basename_files_produce_unique_keys(self) -> None:
+        """INV-16: 同名ルールファイルが複数階層に併存しても重複せず 64 文字以内の一意キーを採番する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_file(root / "plugin.json", '{"name": "dup-test"}\n')
+            targets = [
+                root / "AGENTS.md",
+                root / "rules" / "AGENTS.md",
+                root / ".agents" / "rules" / "common.md",
+                root / ".agent" / "rules" / "common.md",
+                root / "_agents" / "rules" / "common.md",
+                root / "_agent" / "rules" / "common.md",
+                root / "rules" / "common.md",
+            ]
+            for path in targets:
+                _write_file(path, "# Rules\n\n## Shared\n- Enforce deterministic invariant.\n")
+
+            rules = gate.collect_rules(root, ["src/app.py"])
+            self.assertEqual(len(rules), len(targets))
+            keys = [r.key for r in rules]
+            self.assertEqual(len(keys), len(set(keys)))
+            for key in keys:
+                self.assertRegex(key, run_decisions.QUESTION_KEY_RE)
+
+    def test_INV_17_shared_skills_repo_dry_run_consistency(self) -> None:
+        """INV-17: shared-skills 実構成で rules/AGENTS.md を含むルールを抽出し --dry-run ペイロードが整合する。"""
+        real_root = Path(__file__).resolve().parents[3]
+        self.assertTrue(gate.is_native_plugin_repo(real_root))
+        discovered = gate.discover_rule_files(real_root)
+        rel_discovered = [p.relative_to(real_root.resolve()).as_posix() for p in discovered]
+        self.assertIn("rules/AGENTS.md", rel_discovered)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            diff_file = _write_file(Path(tmp) / "change.diff", SAMPLE_DIFF)
+            code, out, err = _run_cli_capture(
+                [
+                    "--repo-root",
+                    str(real_root),
+                    "--diff-file",
+                    str(diff_file),
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+                env_override={"GEMINI_API_KEY": None},
+            )
+        self.assertEqual(code, 0, msg=err)
+        data = json.loads(out)
+        self.assertEqual(data["status"], "dry_run")
+        self.assertGreater(data["rule_count"], 0)
+        self.assertEqual(run_decisions.validate_payload(data["payload"]), [])
+        self.assertTrue(any(r["source_file"] == "rules/AGENTS.md" for r in data["rules"]))
+
+    def test_P1_05_mask_secret_redacts_multiline_pem_and_standalone_header(self) -> None:
+        """P1-05: mask_secret が複数行 PEM ブロック全体と閉じ行なし PEM ヘッダを [REDACTED] に置換する。"""
+        begin_rsa = "-----BEGIN " + "RSA PRIVATE KEY-----"
+        end_rsa = "-----END " + "RSA PRIVATE KEY-----"
+        pem_body = "MIIEowIBAAKCAQEAv7FakeKeyBodyLine1234567890"
+        pem_block = f"{begin_rsa}\n{pem_body}\n{end_rsa}"
+        standalone_header = "-----BEGIN " + "OPENSSH PRIVATE KEY-----"
+
+        masked_block = gate.mask_secret(f"error loading key:\n{pem_block}\ntrailing")
+        self.assertNotIn(begin_rsa, masked_block)
+        self.assertNotIn(pem_body, masked_block)
+        self.assertNotIn(end_rsa, masked_block)
+        self.assertIn("[REDACTED]", masked_block)
+        self.assertIn("trailing", masked_block)
+
+        masked_header = gate.mask_secret(f"truncated: {standalone_header} ABC")
+        self.assertNotIn(standalone_header, masked_header)
+        self.assertIn("[REDACTED]", masked_header)
+
+    def test_P1_06_env_file_arg_blocks_and_utf8_reconfigure(self) -> None:
+        """P1-06: --diff-file / --rules / --questions-file の .env 遮断と UTF-8 stdio 再構成を検証する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_file(root / "AGENTS.md", "# Rules\n\n## Check\n- Keep clean.\n")
+            valid_diff = _write_file(root / "valid.diff", SAMPLE_DIFF)
+            env_file = _write_file(root / ".env", "GEMINI_API_KEY=dummy\n")
+            env_local = _write_file(root / ".env.local", "SECRET=dummy\n")
+            env_example = _write_file(root / ".env.example", "GEMINI_API_KEY=\n")
+
+            cases = [
+                (["--diff-file", str(env_file)], "diff-file .env"),
+                (["--diff-file", str(env_local)], "diff-file .env.local"),
+                (["--diff-file", str(valid_diff), "--rules", str(env_file)], "rules .env"),
+                (["--diff-file", str(valid_diff), "--questions-file", str(env_local)], "questions-file .env.local"),
+            ]
+            for extra_args, label in cases:
+                with self.subTest(case=label):
+                    code, out, _ = _run_cli_capture(
+                        ["--repo-root", str(root), *extra_args, "--dry-run", "--format", "json"],
+                        env_override={"GEMINI_API_KEY": None},
+                    )
+                    self.assertEqual(code, 2)
+                    self.assertEqual(json.loads(out)["code"], "secret_env_file")
+
+            # 雛形 .env.example は is_sensitive_env_path で遮断されない
+            self.assertFalse(gate.is_sensitive_env_path(str(env_example)))
+            code_ex, _, err_ex = _run_cli_capture(
+                [
+                    "--repo-root",
+                    str(root),
+                    "--diff-file",
+                    str(valid_diff),
+                    "--rules",
+                    str(env_example),
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+                env_override={"GEMINI_API_KEY": None},
+            )
+            self.assertEqual(code_ex, 0, msg=err_ex)
+
+            # configure_utf8_stdio は reconfigure 対応ストリームへ encoding="utf-8" を呼び、StringIO では失敗しない
+            fake_stream = mock.MagicMock()
+            with (
+                mock.patch.object(sys, "stdin", io.StringIO()),
+                mock.patch.object(sys, "stdout", fake_stream),
+                mock.patch.object(sys, "stderr", io.StringIO()),
+            ):
+                gate.configure_utf8_stdio()
+            fake_stream.reconfigure.assert_called_once_with(encoding="utf-8")
+
+            # PYTHONIOENCODING=cp932 環境でも日本語・絵文字を含むドライラン出力が文字化け/例外にならない
+            import subprocess
+
+            _write_file(root / "AGENTS.md", "# Rules\n\n## 日本語見出し 🚀\n- 日本語ルールを確認する。\n")
+            env_cp932 = os.environ.copy()
+            env_cp932["PYTHONIOENCODING"] = "cp932"
+            env_cp932.pop("PYTHONUTF8", None)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(Path(__file__).resolve().parent / "check_invariants_decision1.py"),
+                    "--repo-root",
+                    str(root),
+                    "--diff-file",
+                    str(valid_diff),
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+                env=env_cp932,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr.decode("utf-8", "replace"))
+            parsed = json.loads(proc.stdout.decode("utf-8"))
+            self.assertEqual(parsed["status"], "dry_run")
+            self.assertIn("🚀", json.dumps(parsed, ensure_ascii=False))
 
 
 if __name__ == "__main__":

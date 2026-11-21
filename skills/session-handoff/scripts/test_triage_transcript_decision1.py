@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""triage_transcript_decision1.py のユニットテスト（T01–T12）。"""
+"""triage_transcript_decision1.py のユニットテスト（T01–T16）。"""
 
 from __future__ import annotations
 
@@ -8,10 +8,12 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
+import urllib.parse
 
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
@@ -48,7 +50,7 @@ def _make_row(
 
 
 class TestTriageTranscriptDecision1(unittest.TestCase):
-    """T01–T12 の仕様検証テスト。"""
+    """T01–T16 の仕様検証テスト。"""
 
     def test_T01_load_jsonl_skips_blank_and_broken_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -463,6 +465,177 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
                     rc_bad = mod.main(["--transcript", str(small_p), *bad_flag])
                 self.assertEqual(rc_bad, 2)
                 self.assertIn("0 以上", err_buf.getvalue())
+
+    def test_T13_error_outputs_mask_api_key_and_respect_sk_boundary(self) -> None:
+        """T13: SafetyBlockError・ApiRequestError・パスエラーで api_key の生値と URL エンコード値をマスクし、sk- 境界を誤検知しない。"""
+        raw_api_key = "key+secret/value=abc&999"
+        encoded_api_key = urllib.parse.quote(raw_api_key, safe="")
+
+        # sk- 境界: 英単語内識別子は保持され、境界付きトークンはマスクされる
+        safe_ident = "flask-app-secret-config-1234567890"
+        self.assertEqual(mod.mask_secrets(safe_ident), safe_ident)
+        self.assertEqual(
+            mod.mask_secrets(f"raw={raw_api_key} enc={encoded_api_key}", secret=raw_api_key),
+            "raw=[REDACTED] enc=[REDACTED]",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "transcript.jsonl"
+            rows = [_make_row(i, content=f"msg {i}") for i in range(4)]
+            p.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+
+            def raise_safety(*_args, **_kwargs):
+                raise run_decisions.SafetyBlockError(
+                    "prompt_feedback",
+                    "SAFETY",
+                    f"blocked for key={raw_api_key} url={encoded_api_key}",
+                )
+
+            def raise_api(*_args, **_kwargs):
+                raise run_decisions.ApiRequestError(
+                    500, f"failed key={raw_api_key} url={encoded_api_key}"
+                )
+
+            for err_fn in (raise_safety, raise_api):
+                with self.subTest(err_fn=err_fn.__name__):
+                    err_buf = io.StringIO()
+                    with mock.patch.dict(os.environ, {"GEMINI_API_KEY": raw_api_key}, clear=True), contextlib.redirect_stderr(err_buf):
+                        rc = mod.main(["--transcript", str(p), "--keep-recent", "1"], api_caller=err_fn)
+                    self.assertEqual(rc, 3)
+                    err_text = err_buf.getvalue()
+                    self.assertNotIn(raw_api_key, err_text)
+                    self.assertNotIn(encoded_api_key, err_text)
+                    self.assertIn("[REDACTED]", err_text)
+
+            # パス解決失敗時も api_key をマスクする
+            err_missing = io.StringIO()
+            missing_path = Path(tmp) / f"missing_{encoded_api_key}.jsonl"
+            with mock.patch.dict(os.environ, {"GEMINI_API_KEY": raw_api_key}, clear=True), contextlib.redirect_stderr(err_missing):
+                rc_miss = mod.main(["--transcript", str(missing_path)])
+            self.assertEqual(rc_miss, 2)
+            self.assertNotIn(raw_api_key, err_missing.getvalue())
+            self.assertNotIn(encoded_api_key, err_missing.getvalue())
+
+    def test_T14_transcript_env_file_blocking_and_template_allowance(self) -> None:
+        """T14: --transcript に .env 系ファイルを渡すと終了コード 2 で遮断し、雛形ファイルは許容する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            env_file = tmp_dir / ".env"
+            env_file.write_text(json.dumps(_make_row(0, content="secret")) + "\n", encoding="utf-8")
+            env_local = tmp_dir / ".env.local"
+            env_local.write_text(json.dumps(_make_row(0, content="secret")) + "\n", encoding="utf-8")
+            env_example = tmp_dir / ".env.local.example"
+            env_example.write_text(json.dumps(_make_row(0, content="ok")) + "\n", encoding="utf-8")
+
+            for blocked in (env_file, env_local):
+                with self.subTest(blocked=blocked.name):
+                    err_buf = io.StringIO()
+                    with contextlib.redirect_stderr(err_buf):
+                        rc = mod.main(["--transcript", str(blocked), "--dry-run"])
+                    self.assertEqual(rc, 2)
+                    self.assertIn(".env", err_buf.getvalue())
+
+            out_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf):
+                rc_ok = mod.main(["--transcript", str(env_example), "--dry-run"])
+            self.assertEqual(rc_ok, 0)
+            self.assertIn("Transcript Triage Dry-Run", out_buf.getvalue())
+
+    def test_T15_mask_before_truncate_prevents_pem_body_leak(self) -> None:
+        """T15: normalize_step が truncate_head_tail より先に mask_secrets を実行し、長い PEM ブロックの END 欠落による鍵本体露出を防ぐ。"""
+        pem_secret_body = "MIIEpAIBAAKCAQEAUniqueSecretKeyBodyLine0123456789"
+        long_pem_content = (
+            "-----BEGIN "
+            + "RSA PRIVATE KEY-----\n"
+            + (pem_secret_body + "\n") * 20
+            + "-----END "
+            + "RSA PRIVATE KEY-----\n"
+            + ("trailing normal log line\n" * 120)
+        )
+        for step_type in ("PLANNER_RESPONSE", "GENERIC", "USER_INPUT"):
+            with self.subTest(step_type=step_type):
+                content = (
+                    f"<USER_REQUEST>\n{long_pem_content}\n</USER_REQUEST>"
+                    if step_type == "USER_INPUT"
+                    else long_pem_content
+                )
+                raw = _make_row(
+                    10,
+                    step_type=step_type,
+                    content=content,
+                    thinking=long_pem_content,
+                    tool_calls=[{"name": "run_command", "args": {"CommandLine": long_pem_content}}],
+                )
+                step = mod.normalize_step(
+                    raw,
+                    max_step_chars=300,
+                    generic_normal_chars=200,
+                    include_thinking=True,
+                )
+                assert step is not None
+                self.assertNotIn(pem_secret_body, step.normalized_text)
+                self.assertNotIn("-----BEGIN ", step.normalized_text)
+                self.assertNotIn(pem_secret_body, step.raw_content)
+                self.assertNotIn(pem_secret_body, step.thinking_excerpt)
+                self.assertNotIn(pem_secret_body, step.tool_summary)
+                self.assertIn("[REDACTED]", step.normalized_text)
+
+    def test_T16_main_catches_io_decode_preprocessing_errors_and_cp932_stdio(self) -> None:
+        """T16: main() がファイル読込・デコード・前処理例外をスタックトレースなしでマスク済みエラー (exit 2) とし、cp932 環境でも動作する。"""
+        raw_api_key = "AIza" + "TranscriptSecretKey9876543210"
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "transcript.jsonl"
+            p.write_text(json.dumps(_make_row(0, content="hello")) + "\n", encoding="utf-8")
+
+            # OSError / UnicodeDecodeError / 前処理例外（build_chunks）を捕捉し exit 2
+            for target_fn, exc_obj in (
+                ("load_transcript_raw_rows", OSError(f"io failed key={raw_api_key}")),
+                (
+                    "load_transcript_raw_rows",
+                    UnicodeDecodeError("utf-8", b"\xff", 0, 1, f"bad {raw_api_key}"),
+                ),
+                ("build_chunks", RuntimeError(f"preprocess failed key={raw_api_key}")),
+            ):
+                with self.subTest(exc=exc_obj):
+                    err_buf = io.StringIO()
+                    with mock.patch.dict(os.environ, {"GEMINI_API_KEY": raw_api_key}, clear=True), mock.patch.object(
+                        mod, target_fn, side_effect=exc_obj
+                    ), contextlib.redirect_stderr(err_buf):
+                        rc = mod.main(["--transcript", str(p), "--dry-run"])
+                    self.assertEqual(rc, 2)
+                    self.assertNotIn(raw_api_key, err_buf.getvalue())
+                    self.assertIn("[REDACTED]", err_buf.getvalue())
+
+            # PYTHONIOENCODING=cp932 下で cp932 非対応文字を含む --dry-run が成功する
+            jp_p = Path(tmp) / "jp_transcript.jsonl"
+            jp_rows = [
+                _make_row(0, step_type="USER_INPUT", content="<USER_REQUEST>日本語テスト</USER_REQUEST>"),
+                _make_row(1, content="直近ステップ \U0001f680"),
+            ]
+            jp_p.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in jp_rows), encoding="utf-8")
+            script_path = _THIS_DIR / "triage_transcript_decision1.py"
+            sub_env = os.environ.copy()
+            sub_env.pop("PYTHONUTF8", None)
+            sub_env["PYTHONIOENCODING"] = "cp932"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script_path),
+                    "--transcript",
+                    str(jp_p),
+                    "--keep-recent",
+                    "1",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+                capture_output=True,
+                env=sub_env,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+            parsed = json.loads(proc.stdout.decode("utf-8"))
+            self.assertIn("\U0001f680", parsed["recent"][0]["text"])
 
 
 if __name__ == "__main__":

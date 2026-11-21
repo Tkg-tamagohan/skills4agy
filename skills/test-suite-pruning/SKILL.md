@@ -69,12 +69,12 @@ description: 既存テストスイートから不要または冗長なテスト�
    ```powershell
    # 1. キー不要のドライラン（入力検証と 6 問ペイロードの確認）
    $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-   python ~/.gemini/config/plugins/shared-skills/skills/test-suite-pruning/scripts/screen_tests_decision1.py `
+   python "$HOME/.gemini/config/plugins/shared-skills/skills/test-suite-pruning/scripts/screen_tests_decision1.py" `
      --input candidates.json --dry-run
 
    # 2. 保護対象の一次スクリーニング（GEMINI_API_KEY を参照、表形式出力）
    $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-   python ~/.gemini/config/plugins/shared-skills/skills/test-suite-pruning/scripts/screen_tests_decision1.py `
+   python "$HOME/.gemini/config/plugins/shared-skills/skills/test-suite-pruning/scripts/screen_tests_decision1.py" `
      --input candidates.json --format table
    ```
 

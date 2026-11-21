@@ -13,15 +13,14 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
-import re
 import sys
 from typing import Any, Callable
-import urllib.parse
 
 _DECISIONS_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "gemini-decisions-api" / "scripts"
 if str(_DECISIONS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_DECISIONS_SCRIPTS_DIR))
 
+import decision_hygiene  # noqa: E402
 import run_decisions  # noqa: E402
 
 DEFAULT_MODEL = run_decisions.DEFAULT_MODEL
@@ -92,17 +91,7 @@ DISPATCH_MODE_CRITERIA: dict[str, str] = {
     ),
 }
 
-SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("Google API キー (AIza...)", re.compile(r"AIza[0-9A-Za-z_-]{20,}")),
-    ("GitHub トークン (gh*_...)", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
-    ("GitHub Fine-grained PAT (github_pat_...)", re.compile(r"github_pat_[A-Za-z0-9_]{20,}")),
-    ("API シークレットキー (sk-...)", re.compile(r"sk-[A-Za-z0-9_-]{20,}")),
-    ("AWS アクセスキー (AKIA...)", re.compile(r"AKIA[0-9A-Z]{16}")),
-    (
-        "秘密鍵ヘッダ (PRIVATE KEY)",
-        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?:\s+BLOCK)?-----"),
-    ),
-)
+SECRET_PATTERNS = decision_hygiene.SECRET_DETECT_PATTERNS
 
 
 class TriageError(RuntimeError):
@@ -117,24 +106,12 @@ class TriageError(RuntimeError):
 
 def mask_secret(text: str, secret: str | None = None) -> str:
     """エラー出力等から API キーおよび秘密トークン実値をマスクする。"""
-    masked = text
-    if secret:
-        masked = masked.replace(secret, "[REDACTED]")
-        quoted = urllib.parse.quote(secret, safe="")
-        if quoted and quoted != secret:
-            masked = masked.replace(quoted, "[REDACTED]")
-    for _, pattern in SECRET_PATTERNS:
-        masked = pattern.sub("[REDACTED]", masked)
-    return masked
+    return decision_hygiene.mask_secret(text, secret)
 
 
 def scan_text_for_secrets(text: str) -> list[str]:
     """テキスト内に含まれる秘密情報パターンのラベル一覧を返す（実値は返さない）。"""
-    matched_labels: list[str] = []
-    for label, pattern in SECRET_PATTERNS:
-        if pattern.search(text):
-            matched_labels.append(label)
-    return matched_labels
+    return decision_hygiene.scan_text_for_secrets(text, patterns=SECRET_PATTERNS)
 
 
 def _format_recent_commits(recent_commits: Any) -> str:
@@ -610,10 +587,22 @@ def _load_raw_input(args: argparse.Namespace, stdin_text: str | None) -> Any:
         )
     try:
         if args.input:
+            if decision_hygiene.is_blocked_env_path(args.input):
+                raise TriageError(
+                    "secret_env_file",
+                    f"機密環境ファイル (.env) は --input に指定できません: {args.input}",
+                    exit_code=2,
+                )
             raw_text = Path(args.input).read_text(encoding="utf-8")
         else:
             raw_text = stdin_text if stdin_text is not None else sys.stdin.read()
         return json.loads(raw_text)
+    except UnicodeDecodeError as exc:
+        raise TriageError(
+            "invalid_input_encoding",
+            f"入力ファイルは UTF-8 としてデコードできません: {exc}",
+            exit_code=2,
+        ) from exc
     except OSError as exc:
         raise TriageError("input_read_error", f"入力ファイルを読み込めません: {exc}", exit_code=2) from exc
     except json.JSONDecodeError as exc:
@@ -627,6 +616,7 @@ def main(
     env: dict[str, str] | None = None,
     stdin_text: str | None = None,
 ) -> int:
+    decision_hygiene.configure_utf8_stdio()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
@@ -749,10 +739,4 @@ def main(
 
 
 if __name__ == "__main__":
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8")
-    if hasattr(sys.stdin, "reconfigure"):
-        sys.stdin.reconfigure(encoding="utf-8")
     raise SystemExit(main())

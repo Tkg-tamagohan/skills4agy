@@ -20,6 +20,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+import decision_hygiene as dh  # noqa: E402
 import run_decisions as rd  # noqa: E402
 
 DECISION1_TIMEOUT_SECONDS = 8.0
@@ -67,15 +68,7 @@ WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:(?:[\\/]|$)")
 SAFE_PYTHON_SHORT_FLAGS = frozenset({"B", "u", "s", "E", "I"})
 MAX_WHITELIST_SEGMENTS = 10
 
-SAFE_ENV_FILENAMES = frozenset(
-    {
-        ".env.example",
-        ".env.sample",
-        ".env.template",
-        ".env.dist",
-        ".env.schema",
-    }
-)
+SAFE_ENV_FILENAMES = dh.SAFE_ENV_BASENAMES
 
 PRIVATE_KEY_EXACT_NAMES = frozenset(
     {
@@ -180,11 +173,11 @@ GOOG_HEADER_QUOTED_RE = re.compile(
     r"(?i)(x-goog-api-key\s*[:=]\s*)([\"'])(?:\\.|(?!\2).)+\2"
 )
 GOOG_HEADER_PLAIN_RE = re.compile(r"(?i)(x-goog-api-key\s*[:=]\s*)([^\s;|&\"'`]+)")
-GOOGLE_KEY_RE = re.compile(r"AIza[0-9A-Za-z_-]{16,}")
-GH_TOKEN_RE = re.compile(r"gh[pousr]_[A-Za-z0-9]{16,}")
-GH_PAT_RE = re.compile(r"github_pat_[A-Za-z0-9_]{16,}")
-SK_TOKEN_RE = re.compile(r"sk-[A-Za-z0-9_-]{16,}")
-AWS_AKIA_RE = re.compile(r"AKIA[0-9A-Z]{16}")
+GOOGLE_KEY_RE = dh.GOOGLE_API_KEY_RE
+GH_TOKEN_RE = dh.GITHUB_TOKEN_RE
+GH_PAT_RE = dh.GITHUB_PAT_RE
+SK_TOKEN_RE = dh.SECRET_KEY_PREFIX_RE
+AWS_AKIA_RE = dh.AWS_ACCESS_KEY_RE
 ASSIGN_QUOTED_RE = re.compile(
     r"(?i)([A-Za-z0-9_-]*(?:api_?key|apikey|secret|token|password|passwd|credential|key)\s*=\s*)"
     r"([\"'])(?:\\.|(?!\2).)+\2"
@@ -193,9 +186,7 @@ ASSIGN_PLAIN_RE = re.compile(
     r"(?i)([A-Za-z0-9_-]*(?:api_?key|apikey|secret|token|password|passwd|credential|key)\s*=\s*)"
     r"([^\s;|&\"'`]+)"
 )
-PEM_BLOCK_RE = re.compile(
-    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
-)
+PEM_BLOCK_RE = dh.PRIVATE_KEY_BLOCK_RE
 
 DECISION1_QUESTIONS: dict[str, dict[str, Any]] = {
     "risk_level": {
@@ -238,21 +229,12 @@ DECISION1_QUESTIONS: dict[str, dict[str, Any]] = {
 def redact_secrets(text: str, extra_secrets: tuple[str, ...] = ()) -> str:
     """送信前およびエラーログ出力向けに秘密情報やトークンをマスクする。"""
     masked = text
-    for secret in extra_secrets:
-        if secret:
-            masked = masked.replace(secret, "[REDACTED]")
-    masked = PEM_BLOCK_RE.sub("[REDACTED]", masked)
     masked = BEARER_RE.sub(r"\g<1>[REDACTED]", masked)
     masked = GOOG_HEADER_QUOTED_RE.sub(r"\g<1>\g<2>[REDACTED]\g<2>", masked)
     masked = GOOG_HEADER_PLAIN_RE.sub(r"\g<1>[REDACTED]", masked)
-    masked = GOOGLE_KEY_RE.sub("[REDACTED]", masked)
-    masked = GH_TOKEN_RE.sub("[REDACTED]", masked)
-    masked = GH_PAT_RE.sub("[REDACTED]", masked)
-    masked = SK_TOKEN_RE.sub("[REDACTED]", masked)
-    masked = AWS_AKIA_RE.sub("[REDACTED]", masked)
     masked = ASSIGN_QUOTED_RE.sub(r"\g<1>\g<2>[REDACTED]\g<2>", masked)
     masked = ASSIGN_PLAIN_RE.sub(r"\g<1>[REDACTED]", masked)
-    return masked
+    return dh.mask_secrets(masked, secrets=extra_secrets)
 
 
 def _tokenize_command(command: str) -> list[str]:
@@ -395,9 +377,8 @@ def _extract_secret_file_hits(command: str) -> list[str]:
         low_norm = norm.lower()
         base = norm.rsplit("/", 1)[-1].lower()
 
-        if base == ".env" or base.startswith(".env."):
-            if base not in SAFE_ENV_FILENAMES:
-                hits.append(base)
+        if dh.is_blocked_env_path(base):
+            hits.append(base)
             continue
 
         if base in PRIVATE_KEY_EXACT_NAMES:
@@ -1241,9 +1222,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _configure_utf8_stdio() -> None:
-    for stream in (sys.stdin, sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8")
+    dh.configure_utf8_stdio()
 
 
 def main(

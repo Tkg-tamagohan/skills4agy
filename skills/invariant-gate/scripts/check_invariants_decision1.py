@@ -2,7 +2,8 @@
 """Gemini Decision 1 を用いたプロジェクト非依存の不変条件検査 CLI。
 
 任意のリポジトリの git diff とルール文書（AGENTS.md / GEMINI.md / CLAUDE.md /
-.agents/rules/*.md / _agents/rules/*.md / --rules / .agents/invariants.json）を
+.agents/rules/*.md / .agent/rules/*.md / _agents/rules/*.md / _agent/rules/*.md /
+プラグインの rules/*.md / --rules / .agents/invariants.json）を
 1 回の Decisions API 呼び出しで突合し、違反候補と警告を抽出する。
 """
 
@@ -18,12 +19,12 @@ import re
 import subprocess
 import sys
 from typing import Any, Callable
-import urllib.parse
 
 _DECISIONS_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "gemini-decisions-api" / "scripts"
 if str(_DECISIONS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_DECISIONS_SCRIPTS_DIR))
 
+import decision_hygiene  # noqa: E402
 import run_decisions  # noqa: E402
 
 DEFAULT_MODEL = run_decisions.DEFAULT_MODEL
@@ -52,35 +53,36 @@ AUTO_RULE_FILES: tuple[str, ...] = (
 
 AUTO_RULE_DIRS: tuple[str, ...] = (
     ".agents/rules",
+    ".agent/rules",
     "_agents/rules",
+    "_agent/rules",
 )
 
-SAFE_ENV_BASENAMES = frozenset(
-    {
-        ".env.example",
-        ".env.sample",
-        ".env.template",
-        ".env.dist",
-        ".env.schema",
-    }
+PLUGIN_MANIFEST_FILES: tuple[str, ...] = (
+    "plugin.json",
+    ".antigravity-plugin/plugin.json",
+    ".gemini-plugin/plugin.json",
 )
 
-SAFE_ENV_SUFFIXES: tuple[str, ...] = (
-    ".example",
-    ".sample",
-    ".template",
-    ".dist",
-    ".schema",
+PLUGIN_RULE_FILES: tuple[str, ...] = (
+    "rules/AGENTS.md",
+    "rules/GEMINI.md",
 )
 
-PRIVATE_KEY_HEADER_RE = re.compile(
-    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?:\s+BLOCK)?-----"
+PLUGIN_RULE_DIRS: tuple[str, ...] = (
+    "rules",
 )
-GOOGLE_API_KEY_RE = re.compile(r"AIza[0-9A-Za-z_-]{20,}")
-GITHUB_TOKEN_RE = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")
-GITHUB_PAT_RE = re.compile(r"github_pat_[A-Za-z0-9_]{20,}")
-SECRET_KEY_PREFIX_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}")
-AWS_ACCESS_KEY_RE = re.compile(r"AKIA[0-9A-Z]{16}")
+
+SAFE_ENV_BASENAMES = decision_hygiene.SAFE_ENV_BASENAMES
+SAFE_ENV_SUFFIXES = decision_hygiene.SAFE_ENV_SUFFIXES
+
+PRIVATE_KEY_BLOCK_RE = decision_hygiene.PRIVATE_KEY_BLOCK_RE
+PRIVATE_KEY_HEADER_RE = decision_hygiene.PRIVATE_KEY_HEADER_RE
+GOOGLE_API_KEY_RE = decision_hygiene.GOOGLE_API_KEY_RE
+GITHUB_TOKEN_RE = decision_hygiene.GITHUB_TOKEN_RE
+GITHUB_PAT_RE = decision_hygiene.GITHUB_PAT_RE
+SECRET_KEY_PREFIX_RE = decision_hygiene.SECRET_KEY_PREFIX_RE
+AWS_ACCESS_KEY_RE = decision_hygiene.AWS_ACCESS_KEY_RE
 
 SECRET_TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("Google API キー (AIza...)", GOOGLE_API_KEY_RE),
@@ -127,17 +129,12 @@ class GateError(Exception):
         self.message = message
 
 
+configure_utf8_stdio = decision_hygiene.configure_utf8_stdio
+
+
 def mask_secret(text: str, secret: str | None = None) -> str:
-    """エラー出力から API キーおよび主要トークン文字列を確実にマスクする。"""
-    masked = text
-    if secret:
-        masked = masked.replace(secret, "[REDACTED]")
-        quoted = urllib.parse.quote(secret, safe="")
-        if quoted and quoted != secret:
-            masked = masked.replace(quoted, "[REDACTED]")
-    for _, pattern in SECRET_TOKEN_PATTERNS:
-        masked = pattern.sub("[REDACTED]", masked)
-    return masked
+    """エラー出力から API キーおよび主要トークン・秘密鍵文字列を確実にマスクする。"""
+    return decision_hygiene.mask_secret(text, secret)
 
 
 def _normalize_rel_path(path_str: str) -> str:
@@ -186,17 +183,7 @@ def is_lockfile_path(path_str: str) -> bool:
 
 def is_sensitive_env_path(path_str: str) -> bool:
     """送信遮断対象となる .env 系ファイルかどうかを判定する。"""
-    name = _normalize_rel_path(path_str).rsplit("/", 1)[-1].lower()
-    if name in SAFE_ENV_BASENAMES:
-        return False
-    if name == ".env":
-        return True
-    if name.startswith(".env."):
-        for suffix in SAFE_ENV_SUFFIXES:
-            if name.endswith(suffix):
-                return False
-        return True
-    return False
+    return decision_hygiene.is_blocked_env_path(path_str.strip())
 
 
 def check_diff_secrets(changed_files: list[str], diff_text: str) -> list[str]:
@@ -216,8 +203,8 @@ def check_diff_secrets(changed_files: list[str], diff_text: str) -> list[str]:
             if not found_private_key and PRIVATE_KEY_HEADER_RE.search(line):
                 findings.append("差分の追加行または文脈行に秘密鍵ヘッダ（PRIVATE KEY）が含まれています。")
                 found_private_key = True
-            for label, pattern in SECRET_TOKEN_PATTERNS:
-                if label not in found_token_labels and pattern.search(line):
+            for label in decision_hygiene.scan_text_for_secrets(line, patterns=SECRET_TOKEN_PATTERNS):
+                if label not in found_token_labels:
                     found_token_labels.append(label)
 
     if found_token_labels:
@@ -526,6 +513,11 @@ def resolve_extra_rules(
     return combined
 
 
+def is_native_plugin_repo(repo_root: Path) -> bool:
+    """対象リポジトリルートにネイティブプラグインのマニフェストまたは rules/AGENTS.md があるか判定する。"""
+    return any((repo_root / rel).is_file() for rel in (*PLUGIN_MANIFEST_FILES, "rules/AGENTS.md"))
+
+
 def discover_rule_files(
     repo_root: Path,
     extra_rules: list[str] | None = None,
@@ -549,7 +541,22 @@ def discover_rule_files(
             for md_file in sorted(dir_path.glob("*.md"), key=lambda p: p.name.lower()):
                 add_if_file(md_file)
 
+    if is_native_plugin_repo(repo_root):
+        for rel in PLUGIN_RULE_FILES:
+            add_if_file(repo_root / rel)
+
+        for rel_dir in PLUGIN_RULE_DIRS:
+            dir_path = repo_root / rel_dir
+            if dir_path.is_dir():
+                for md_file in sorted(dir_path.glob("*.md"), key=lambda p: p.name.lower()):
+                    add_if_file(md_file)
+
     for item in extra_rules or []:
+        if is_sensitive_env_path(item):
+            raise GateError(
+                "secret_env_file",
+                f"秘密情報を含む可能性があるため .env 系ファイルを --rules に指定できません: {item}",
+            )
         raw_path = Path(item)
         candidate = raw_path if raw_path.is_absolute() else (
             raw_path if raw_path.exists() else repo_root / raw_path
@@ -674,6 +681,11 @@ def collect_rules(
 
     custom_path: Path | None = None
     if questions_file:
+        if is_sensitive_env_path(questions_file):
+            raise GateError(
+                "secret_env_file",
+                f"秘密情報を含む可能性があるため .env 系ファイルを --questions-file に指定できません: {questions_file}",
+            )
         raw_q = Path(questions_file)
         custom_path = raw_q if raw_q.is_absolute() else (
             raw_q if raw_q.exists() else repo_root / raw_q
@@ -851,6 +863,11 @@ def acquire_diff(
 ) -> tuple[list[str], str]:
     """--diff-file または git diff から変更ファイル一覧と差分テキストを取得する。"""
     if diff_file:
+        if is_sensitive_env_path(diff_file):
+            raise GateError(
+                "secret_env_file",
+                f"秘密情報を含む可能性があるため .env 系ファイルを --diff-file に指定できません: {diff_file}",
+            )
         path = Path(diff_file)
         if not path.is_file():
             raise GateError("diff_file_not_found", f"差分ファイルが見つかりません: {diff_file}")
@@ -1183,6 +1200,7 @@ def run_cli(
     argv: list[str] | None = None,
     rest_opener: Callable[..., Any] | None = None,
 ) -> int:
+    configure_utf8_stdio()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()

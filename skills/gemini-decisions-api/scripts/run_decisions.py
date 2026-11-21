@@ -22,6 +22,12 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+import decision_hygiene  # noqa: E402
+
 DEFAULT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/decisions"
 DEFAULT_MODEL = "gemini-decision-1"
 
@@ -736,6 +742,10 @@ def _build_input_blocks(
     for text in args.text:
         blocks.append({"type": "text", "text": text})
     for file_str in args.text_file:
+        if decision_hygiene.is_blocked_env_path(file_str):
+            raise ValueError(
+                f"機密環境ファイル (.env) は --text-file に指定できません: {file_str}"
+            )
         text_content = Path(file_str).read_text(encoding="utf-8")
         blocks.append({"type": "text", "text": text_content})
     if args.stdin:
@@ -763,8 +773,12 @@ def main(
     env: dict[str, str] | None = None,
     stdin_text: str | None = None,
 ) -> int:
+    decision_hygiene.configure_utf8_stdio()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    environ = os.environ if env is None else env
+    api_key = environ.get("GEMINI_API_KEY", "").strip()
 
     if args.min_confidence is not None and not (0.0 <= args.min_confidence <= 1.0):
         print("エラー: --min-confidence は 0.0 から 1.0 の範囲で指定してください。", file=sys.stderr)
@@ -774,6 +788,10 @@ def main(
         input_blocks = _build_input_blocks(args, stdin_text=stdin_text)
         questions: dict[str, Any] = {}
         if args.questions:
+            if decision_hygiene.is_blocked_env_path(args.questions):
+                raise ValueError(
+                    f"機密環境ファイル (.env) は --questions に指定できません: {args.questions}"
+                )
             loaded = json.loads(Path(args.questions).read_text(encoding="utf-8"))
             if not isinstance(loaded, dict):
                 raise ValueError("--questions の JSON は質問キーをマップしたオブジェクトが必要です。")
@@ -784,7 +802,7 @@ def main(
                 raise ValueError(f"質問キーが重複しています: {key}")
             questions[key] = q_obj
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"入力エラー: {exc}", file=sys.stderr)
+        print(decision_hygiene.mask_secret(f"入力エラー: {exc}", api_key), file=sys.stderr)
         return 2
 
     payload: dict[str, Any] = {
@@ -796,15 +814,13 @@ def main(
     if errors:
         print("事前バリデーションエラー:", file=sys.stderr)
         for err in errors:
-            print(f"- {err}", file=sys.stderr)
+            print(decision_hygiene.mask_secret(f"- {err}", api_key), file=sys.stderr)
         return 2
 
     if args.dry_run:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
-    environ = os.environ if env is None else env
-    api_key = environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         print(
             "エラー: 環境変数 GEMINI_API_KEY が設定されていません。"
@@ -823,10 +839,15 @@ def main(
         )
         enriched = enrich_response(raw_response, min_confidence=args.min_confidence)
     except SafetyBlockError as exc:
-        print(json.dumps(exc.to_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
+        blocked = exc.to_dict()
+        blocked["message"] = decision_hygiene.mask_secret(
+            str(blocked.get("message", "")), api_key
+        )
+        print(json.dumps(blocked, ensure_ascii=False, indent=2), file=sys.stderr)
         return 3
-    except ApiRequestError as exc:
-        print(f"API エラー: {exc.message}", file=sys.stderr)
+    except (ApiRequestError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        msg = exc.message if isinstance(exc, ApiRequestError) else f"{type(exc).__name__}: {exc}"
+        print(decision_hygiene.mask_secret(f"API エラー: {msg}", api_key), file=sys.stderr)
         return 1
 
     if args.format == "table":

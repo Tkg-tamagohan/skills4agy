@@ -36,25 +36,37 @@ CI では `--strict` か `counts` を使う。
 
 リポジトリ直下に `.sloplintignore` がある構成では、除外対象を `.sloplintignore`（gitignore 形式のパス一覧で、1 行 1 件）で管理する。
 `references/slop-catalog.md` は禁止語彙のカタログ自体であり言及が規範抵触として検出されるため、恒久除外の対象とする。
+`.sloplintignore` を置かない構成では、各検査コマンド側で `references/slop-catalog.md` と対象外のディレクトリ（`.git` や依存パッケージ配下、作業用下書きなど）を除外する。
 
-Git 管理下のリポジトリで除外を適用して全対象を `--strict` で検査する手順は次のとおり。
+Git 管理下のリポジトリで `.sloplintignore`（存在する場合）を適用して全対象を `--strict` で検査する手順は次のとおり。
+他リポジトリから呼び出す場合は、`skills/japanese-tech-writing/scripts/slop_lint.py` を実際のスキル配置パスへ読み替える。
 
 ```bash
 status=0
 excluded=$(mktemp); trap 'rm -f "$excluded"' EXIT
-git ls-files -z -c -i -X .sloplintignore -- '*.md' > "$excluded"
+if [ -f .sloplintignore ]; then
+  git ls-files -z -c -i -X .sloplintignore -- '*.md' > "$excluded"
+else
+  : > "$excluded"
+fi
 while IFS= read -r -d '' f; do
   grep -qzxF -- "$f" "$excluded" && continue
+  case "$f" in references/slop-catalog.md|*/references/slop-catalog.md) continue ;; esac
   python3 skills/japanese-tech-writing/scripts/slop_lint.py --strict "$f" || status=1
 done < <(git ls-files -z -- '*.md')
 exit $status
 ```
 
 AGY の Windows 環境や `.gemini` 配下（パス制限により直接引数で読めない場合）では、Python から標準入力 `-` 経由で一括検査する。
+PowerShell では `$env:PYTHONUTF8="1"` と `$env:PYTHONIOENCODING="utf-8"` の両方を設定し、終了コード `2` や `3` のエラー理由も欠落させないため `stdout` と `stderr` を合わせて出力する。
+
+Git 管理下のリポジトリでは、`git ls-files` と `.sloplintignore`（存在時）を用いて追跡対象だけを検査する。
 
 ```powershell
-$env:PYTHONUTF8="1"; python -c "import pathlib, subprocess, sys; files = [p for p in sorted(pathlib.Path('.').rglob('*.md')) if p.name != 'slop-catalog.md']; failed = [(str(p), r.stdout) for p in files for r in [subprocess.run([sys.executable, 'skills/japanese-tech-writing/scripts/slop_lint.py', '--strict', '-'], input=p.read_text('utf-8'), capture_output=True, text=True, encoding='utf-8')] if r.returncode != 0]; print('\n'.join(f'=== {f} ===\n{o}' for f, o in failed) if failed else 'ALL_CLEAN'); sys.exit(bool(failed))"
+$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"; python -c "import pathlib, subprocess, sys; git = lambda *a: subprocess.run(['git', '-c', 'core.quotePath=false', *a], capture_output=True, text=True, encoding='utf-8', check=True).stdout.split('\0')[:-1]; excl = set(git('ls-files', '-z', '-c', '-i', '-X', '.sloplintignore', '--', '*.md')) if pathlib.Path('.sloplintignore').is_file() else set(); files = [pathlib.Path(f) for f in sorted(git('ls-files', '-z', '--', '*.md')) if f not in excl and not f.endswith('references/slop-catalog.md')]; failed = [(str(p), (r.stdout + r.stderr).decode('utf-8', 'replace').strip()) for p in files for r in [subprocess.run([sys.executable, 'skills/japanese-tech-writing/scripts/slop_lint.py', '--strict', '-'], input=p.read_bytes(), capture_output=True)] if r.returncode != 0]; print('\n'.join(f'=== {f} ===\n{o}' for f, o in failed) if failed else 'ALL_CLEAN'); sys.exit(bool(failed))"
 ```
+
+Git 管理外のディレクトリや未追跡ファイルも検査する場合は `Path('.').rglob('*.md')` で走査できるが、`.sloplintignore` は解釈されないため、`.git` などの隠しディレクトリや不要ディレクトリと `slop-catalog.md` 以外の除外対象を条件へ明示的に追加する。
 
 ## 語の一覧(.yomiyasu-words/)
 

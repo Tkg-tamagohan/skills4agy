@@ -131,7 +131,7 @@ Antigravity のプラグイン仕様（builtin スキル `agy-customizations` �
 | `rules/*.md` | 採用 | `trigger: model_decision` により状況合致時のみ本文を読み込むルールを置く。 |
 | `skills/*/SKILL.md` | 採用 | オンデマンドで呼び出す手順や知識を置く。 |
 | `agents/*.md` | 現状は見送り | カスタムサブエージェントは本プラグインではまだ必要とせず、まずは共通ルールとスキルに集中する。 |
-| `hooks.json` | 現状は見送り | ライフサイクルフックが必要な自動化処理はなく、ルールとスキルのみで完結させる。 |
+| `hooks.json` | 採用 | ルートに配置する。モデル判断に頼らず決定論的な安全ガードや自動介入が必須な処理に限り使用し、補助スクリプトは関連スキルの `scripts/` または `hooks/` に置く。一時停止には `"enabled": false` を使う。 |
 | `mcp_config.json` | 現状は見送り | 全セッションで起動する MCP サーバーを本プラグインに含める必要はない。 |
 
 ## チェックリスト
@@ -147,3 +147,4 @@ Antigravity のプラグイン仕様（builtin スキル `agy-customizations` �
 - [ ] 大きさの目安(`rules/AGENTS.md` の一節 5 行、rule 30 行、skill 200 行)に収まる、または超える理由がある
 - [ ] `plugin.json` の `version` を変更の種類に応じて上げた
 - [ ] `README.md` の収録一覧と構成の説明を追随させた
+- [ ] `hooks.json` を変更した場合は構文と参照スクリプトの相対パスを `check_plugin.py` で確認し、`README.md` の構成説明と同期させた

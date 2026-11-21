@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""screen_drift_decision1.py のオフライン単体テスト。
+"""screen_drift_decision1.py のオフライン単体テスト（SDD-01〜SDD-18）。
 
 外部通信を行わず、モック opener 注入と一時ディレクトリ（非 Git および Git）を用いて
 docs / backlog / candidates の 3 モード、決定論的ヒント、安全側分類、秘密情報遮断、
@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -19,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -198,7 +200,8 @@ def _create_sample_repo(base: Path) -> Path:
 
 
 class QuestionSchemaDesignTests(unittest.TestCase):
-    def test_questions_pass_validation_and_avoid_negative_noul_phrasing(self) -> None:
+    def test_SDD_01_questions_pass_validation_and_avoid_negative_noul_phrasing(self) -> None:
+        """SDD-01: docs / candidates 質問マップがスキーマ検証を通過し否定疑問文を含まない。"""
         for name, q_map in (
             ("docs", sdd.build_docs_questions()),
             ("candidates", sdd.build_candidates_questions()),
@@ -222,7 +225,8 @@ class QuestionSchemaDesignTests(unittest.TestCase):
 
 
 class DocsModeTests(unittest.TestCase):
-    def test_missing_path_hints_deterministic_filtering(self) -> None:
+    def test_SDD_02_missing_path_hints_deterministic_filtering(self) -> None:
+        """SDD-02: 文書内パスの不在ヒント抽出がコードブロックや外部 URL を除外して決まる。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = _create_sample_repo(Path(tmp))
             ctx = sdd.collect_repo_context(root, 10)
@@ -231,7 +235,8 @@ class DocsModeTests(unittest.TestCase):
             hints = sdd.extract_missing_path_hints(broken_text, "docs/broken.md", ctx)
             self.assertEqual(hints, ["src/deleted.py", "src/missing.py"])
 
-    def test_docs_dry_run_and_table_non_git_fallback(self) -> None:
+    def test_SDD_03_docs_dry_run_and_table_non_git_fallback(self) -> None:
+        """SDD-03: 非 Git リポジトリでの docs --dry-run が json / table 形式で動作する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = _create_sample_repo(Path(tmp))
             code, out, err = _run_cli(
@@ -252,7 +257,8 @@ class DocsModeTests(unittest.TestCase):
             self.assertIn("docs/broken.md", out_t)
             self.assertIn("Summary: dry_run subcommand=docs total=3", out_t)
 
-    def test_docs_safe_side_classification_and_parallel_order(self) -> None:
+    def test_SDD_04_docs_safe_side_classification_and_parallel_order(self) -> None:
+        """SDD-04: docs モードの安全側分類と並列実行時の入力順序保持を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = _create_sample_repo(Path(tmp))
             (root / "docs" / "mech.md").write_text(
@@ -315,7 +321,8 @@ class DocsModeTests(unittest.TestCase):
             self.assertEqual(report["usage"]["total_output_tokens"], 0)
             self.assertIn("ゼロ乖離の保証ではありません", report["note"])
 
-    def test_docs_git_repo_collects_log_and_staleness(self) -> None:
+    def test_SDD_05_docs_git_repo_collects_log_and_staleness(self) -> None:
+        """SDD-05: Git リポジトリ上で直近ログと陳腐化日数を収集する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = _create_sample_repo(Path(tmp))
             try:
@@ -339,9 +346,97 @@ class DocsModeTests(unittest.TestCase):
             self.assertIn("Recent Git Log:", snapshot)
             self.assertIn("initial", snapshot)
 
+    def test_SDD_16_expanded_default_globs_catch_aux_and_instruction_docs(self) -> None:
+        """SDD-16: 拡張既定グロブが補助文書とルート指示文書を捕捉し CHANGELOG.md と既定 slop-catalog.md を除外する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rel_files = [
+                "README.md",
+                "AGENTS.md",
+                "GEMINI.md",
+                "CLAUDE.md",
+                "CHANGELOG.md",
+                "docs/guide.md",
+                "skills/demo/SKILL.md",
+                "skills/demo/guidelines.md",
+                "skills/demo/references/api-reference.md",
+                "skills/japanese-tech-writing/references/slop-catalog.md",
+                ".agents/skills/helper/notes.md",
+                ".agents/rules/r1.md",
+                ".agent/rules/r2.md",
+                "_agents/rules/sub/r3.md",
+                "_agent/rules/r4.md",
+                "rules/sub/r5.md",
+            ]
+            for rel in rel_files:
+                path = root / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"# {rel}\n", encoding="utf-8")
+
+            code, out, err = _run_cli(
+                ["docs", "--repo", str(root), "--dry-run", "--format", "json"],
+            )
+            self.assertEqual(code, 0, msg=err)
+            report = json.loads(out)
+            selected = [item["file"] for item in report["items"]]
+            expected = sorted(
+                [
+                    "README.md",
+                    "AGENTS.md",
+                    "GEMINI.md",
+                    "CLAUDE.md",
+                    "docs/guide.md",
+                    "skills/demo/SKILL.md",
+                    "skills/demo/guidelines.md",
+                    "skills/demo/references/api-reference.md",
+                    ".agents/skills/helper/notes.md",
+                    ".agents/rules/r1.md",
+                    ".agent/rules/r2.md",
+                    "_agents/rules/sub/r3.md",
+                    "_agent/rules/r4.md",
+                    "rules/sub/r5.md",
+                ]
+            )
+            self.assertEqual(selected, expected)
+            self.assertNotIn("CHANGELOG.md", selected)
+            self.assertNotIn("skills/japanese-tech-writing/references/slop-catalog.md", selected)
+
+    def test_SDD_17_explicit_paths_allows_slop_catalog(self) -> None:
+        """SDD-17: 既定モードで除外される slop-catalog.md を明示的な --paths 指定で選択できる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog = root / "skills" / "japanese-tech-writing" / "references" / "slop-catalog.md"
+            catalog.parent.mkdir(parents=True, exist_ok=True)
+            catalog.write_text("# Catalog\n", encoding="utf-8")
+            (root / "README.md").write_text("# Readme\n", encoding="utf-8")
+
+            code_default, out_default, err_default = _run_cli(
+                ["docs", "--repo", str(root), "--dry-run", "--format", "json"],
+            )
+            self.assertEqual(code_default, 0, msg=err_default)
+            default_files = [item["file"] for item in json.loads(out_default)["items"]]
+            self.assertEqual(default_files, ["README.md"])
+
+            code_explicit, out_explicit, err_explicit = _run_cli(
+                [
+                    "docs",
+                    "--repo",
+                    str(root),
+                    "--paths",
+                    "skills/japanese-tech-writing/references/slop-catalog.md",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+            )
+            self.assertEqual(code_explicit, 0, msg=err_explicit)
+            explicit_files = [item["file"] for item in json.loads(out_explicit)["items"]]
+            self.assertEqual(explicit_files, ["skills/japanese-tech-writing/references/slop-catalog.md"])
+
 
 class BacklogModeTests(unittest.TestCase):
-    def test_backlog_markdown_extraction_and_single_request_call(self) -> None:
+    def test_SDD_06_backlog_markdown_extraction_and_single_request_call(self) -> None:
+        """SDD-06: backlog Markdown の未完了項目抽出と 1 リクエスト一括突合を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = _create_sample_repo(Path(tmp))
             backlog_file = root / "BACKLOG.md"
@@ -393,7 +488,8 @@ class BacklogModeTests(unittest.TestCase):
             self.assertEqual(report["results"][1]["line"], 8)
             self.assertFalse(report["results"][1]["needs_verification"])
 
-    def test_backlog_json_input_and_empty_skip(self) -> None:
+    def test_SDD_07_backlog_json_input_and_empty_skip(self) -> None:
+        """SDD-07: backlog の空入力スキップと JSON 入力の dry-run を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = _create_sample_repo(Path(tmp))
             empty_md = root / "EMPTY.md"
@@ -419,7 +515,8 @@ class BacklogModeTests(unittest.TestCase):
             self.assertEqual(code_d, 0, msg=err_d)
             self.assertIn("BL-1", out_d)
 
-    def test_backlog_exceeds_1000_questions_rejected(self) -> None:
+    def test_SDD_08_backlog_exceeds_1000_questions_rejected(self) -> None:
+        """SDD-08: backlog の質問数が 1,000 件を超えると終了コード 2 で拒否する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = _create_sample_repo(Path(tmp))
             big_md = root / "BIG.md"
@@ -433,7 +530,8 @@ class BacklogModeTests(unittest.TestCase):
 
 
 class CandidatesModeTests(unittest.TestCase):
-    def test_input_and_stdin_mutual_exclusion(self) -> None:
+    def test_SDD_09_input_and_stdin_mutual_exclusion(self) -> None:
+        """SDD-09: candidates の --input と --stdin の排他検証を確認する。"""
         code_none, _, err_none = _run_cli(["candidates"])
         self.assertEqual(code_none, 2)
         self.assertIn("invalid_input_source", err_none)
@@ -442,12 +540,14 @@ class CandidatesModeTests(unittest.TestCase):
         self.assertEqual(code_both, 2)
         self.assertIn("invalid_input_source", err_both)
 
-    def test_empty_candidates_skipped_without_api_key(self) -> None:
+    def test_SDD_10_empty_candidates_skipped_without_api_key(self) -> None:
+        """SDD-10: candidates が空配列なら API キーなしで skipped_empty_input を返す。"""
         code, out, err = _run_cli(["candidates", "--stdin"], stdin_text="[]")
         self.assertEqual(code, 0, msg=err)
         self.assertEqual(json.loads(out)["status"], "skipped_empty_input")
 
-    def test_candidates_parallel_order_and_parent_review_escalation(self) -> None:
+    def test_SDD_11_candidates_parallel_order_and_parent_review_escalation(self) -> None:
+        """SDD-11: candidates の並列実行順保持と要親確認エスカレーションを検証する。"""
         items = [
             {
                 "id": "C-1",
@@ -508,7 +608,8 @@ class CandidatesModeTests(unittest.TestCase):
 
 
 class SecurityAndErrorHandlingTests(unittest.TestCase):
-    def test_env_blocked_and_env_example_allowed(self) -> None:
+    def test_SDD_12_env_blocked_and_env_example_allowed(self) -> None:
+        """SDD-12: .env の遮断と .env.example 雛形の許可を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = _create_sample_repo(Path(tmp))
             (root / ".env").write_text("SECRET_VAL=12345\n", encoding="utf-8")
@@ -526,7 +627,8 @@ class SecurityAndErrorHandlingTests(unittest.TestCase):
             self.assertEqual(code_ok, 0, msg=err_ok)
             self.assertEqual(json.loads(out_ok)["total"], 1)
 
-    def test_secret_patterns_blocked_and_masked_before_api_call(self) -> None:
+    def test_SDD_13_secret_patterns_blocked_and_masked_before_api_call(self) -> None:
+        """SDD-13: 秘密情報パターンを API 送信前に検出しマスクして遮断する。"""
         secrets = [
             "-----BEGIN RSA PRIVATE KEY-----\nABC",
             "AIzaSyDummyGoogleApiKey1234567890",
@@ -563,7 +665,8 @@ class SecurityAndErrorHandlingTests(unittest.TestCase):
             self.assertIn("secret_detected", err)
             self.assertNotIn(secret, err)
 
-    def test_max_chars_limit_and_missing_api_key_and_key_masking(self) -> None:
+    def test_SDD_14_max_chars_limit_and_missing_api_key_and_key_masking(self) -> None:
+        """SDD-14: 文字数上限、API キー欠如、エラー出力時のキーマスクを検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = _create_sample_repo(Path(tmp))
             code_max, _, err_max = _run_cli(
@@ -593,7 +696,8 @@ class SecurityAndErrorHandlingTests(unittest.TestCase):
             self.assertNotIn(secret_key, err_mask)
             self.assertIn("[REDACTED]", err_mask)
 
-    def test_safety_blocks_return_exit_code_3(self) -> None:
+    def test_SDD_15_safety_blocks_return_exit_code_3(self) -> None:
+        """SDD-15: 安全フィルタ遮断（HTTP 400 / HTTP 200）が終了コード 3 を返す。"""
         cand_json = json.dumps(
             [
                 {
@@ -644,6 +748,83 @@ class SecurityAndErrorHandlingTests(unittest.TestCase):
         )
         self.assertEqual(code_200, 3)
         self.assertIn("safety_blocked", err_200)
+
+    def test_SDD_18_multiline_pem_block_masking_and_utf8_reconfigure(self) -> None:
+        """SDD-18: 複数行 PEM ブロック全体マスクと main() 先頭での UTF-8 再設定を検証する。"""
+        pem_block = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEowIBAAKCAQEAsecretbodyline1\n"
+            "secretbodyline2\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        masked_block = sdd.mask_secret(f"leak: {pem_block}\ntail")
+        self.assertIn("[REDACTED]", masked_block)
+        self.assertNotIn("MIIEowIBAAKCAQEAsecretbodyline1", masked_block)
+        self.assertNotIn("secretbodyline2", masked_block)
+        self.assertNotIn("BEGIN RSA PRIVATE KEY", masked_block)
+        self.assertNotIn("END RSA PRIVATE KEY", masked_block)
+
+        masked_header = sdd.mask_secret("-----BEGIN PRIVATE KEY-----\npartial_unclosed")
+        self.assertNotIn("BEGIN PRIVATE KEY", masked_header)
+        self.assertIn("[REDACTED]", masked_header)
+
+        def pem_error_opener(req: object, timeout: float = 30.0) -> _FakeHTTPResponse:
+            raise run_decisions.ApiRequestError(500, f"failed: {pem_block}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _create_sample_repo(Path(tmp))
+            (root / "README.md").write_text(
+                "# チェック ✓ 日本語 — テスト\n",
+                encoding="utf-8",
+            )
+            code_pem, _, err_pem = _run_cli(
+                ["docs", "--repo", str(root), "--paths", "README.md"],
+                opener=pem_error_opener,
+                env={"GEMINI_API_KEY": "test-key"},
+            )
+            self.assertEqual(code_pem, 1)
+            self.assertIn("[REDACTED]", err_pem)
+            self.assertNotIn("secretbodyline2", err_pem)
+
+            reconf_calls: list[str | None] = []
+
+            class _ReconfigurableStringIO(io.StringIO):
+                def reconfigure(self, *, encoding: str | None = None) -> None:
+                    reconf_calls.append(encoding)
+
+            out_stream = _ReconfigurableStringIO()
+            err_stream = io.StringIO()
+            with mock.patch.object(sys, "stdout", out_stream), mock.patch.object(sys, "stderr", err_stream):
+                code_reconf = sdd.main(["docs", "--repo", str(root), "--dry-run"], env={})
+            self.assertEqual(code_reconf, 0, msg=err_stream.getvalue())
+            self.assertEqual(reconf_calls, ["utf-8"])
+
+            sub_env = os.environ.copy()
+            sub_env.pop("PYTHONUTF8", None)
+            sub_env["PYTHONIOENCODING"] = "cp932"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(_SCRIPT_DIR / "screen_drift_decision1.py"),
+                    "docs",
+                    "--repo",
+                    str(root),
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+                capture_output=True,
+                env=sub_env,
+                check=False,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                msg=proc.stderr.decode("utf-8", errors="replace"),
+            )
+            stdout_text = proc.stdout.decode("utf-8")
+            self.assertIn("チェック ✓ 日本語 — テスト", stdout_text)
 
 
 if __name__ == "__main__":

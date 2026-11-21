@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""run_decisions.py の単体テスト（テスト ID: GD-01–GD-14）。
+"""run_decisions.py の単体テスト（テスト ID: GD-01–GD-16）。
 
 Gemini Decisions API 公式仕様（2026年11月版）を根拠とし、
 通信部分はモックオープナー注入で決定論的に検証する。
@@ -11,11 +11,14 @@ import base64
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
@@ -409,6 +412,173 @@ class TestRunDecisions(unittest.TestCase):
         self.assertIn("交換窓口", table)
         self.assertIn("即時対応", table)
         self.assertIn("output_tokens=0", table)
+
+    def test_gd15_error_outputs_mask_api_key_and_secrets(self) -> None:
+        """GD-15: SafetyBlockError、ApiRequestError、TimeoutError、OSError、JSONDecodeError、入力エラーで API キー実値と秘密パターンをマスクする。"""
+        raw_api_key = "key+with/secret=chars&123456"
+        encoded_api_key = urllib.parse.quote(raw_api_key, safe="")
+        dummy_ghp = "ghp_" + "LeakTestToken1234567890"
+        pem_block = (
+            "-----BEGIN "
+            + "RSA PRIVATE KEY-----\n"
+            + "MIIEpAIBAAKCAQEATestBodyLine\n"
+            + "-----END "
+            + "RSA PRIVATE KEY-----"
+        )
+
+        # 1. SafetyBlockError (prompt_feedback)
+        def safety_opener(req, timeout=30.0):
+            return _MockHTTPResponse(
+                {
+                    "answers": {},
+                    "prompt_feedback": {
+                        "block_reason": "safety",
+                        "block_reason_message": f"blocked key={raw_api_key} url={encoded_api_key}\n{pem_block}",
+                    },
+                }
+            )
+
+        out1, err1 = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out1), contextlib.redirect_stderr(err1):
+            rc1 = rd.main(
+                ["--text", "x", "--noul", "q1=ok?"],
+                opener=safety_opener,
+                env={"GEMINI_API_KEY": raw_api_key},
+            )
+        self.assertEqual(rc1, 3)
+        self.assertNotIn(raw_api_key, err1.getvalue())
+        self.assertNotIn(encoded_api_key, err1.getvalue())
+        self.assertNotIn("MIIEpAIBAAKCAQEATestBodyLine", err1.getvalue())
+        self.assertIn("[REDACTED]", err1.getvalue())
+
+        # 2. ApiRequestError / TimeoutError / OSError / JSONDecodeError
+        def raise_http_500(req, timeout=30.0):
+            raise urllib.error.HTTPError(
+                url=rd.DEFAULT_ENDPOINT,
+                code=500,
+                msg="Internal",
+                hdrs={},
+                fp=io.BytesIO(f"err {raw_api_key} {encoded_api_key} {dummy_ghp}".encode("utf-8")),
+            )
+
+        def raise_timeout(req, timeout=30.0):
+            raise TimeoutError(f"timeout key={raw_api_key}")
+
+        def raise_oserror(req, timeout=30.0):
+            raise OSError(f"os err url={encoded_api_key}")
+
+        def bad_json_response(req, timeout=30.0):
+            class _BadResp:
+                def read(self) -> bytes:
+                    return b"{not-json"
+
+                def __enter__(self) -> _BadResp:
+                    return self
+
+                def __exit__(self, *_args) -> bool:
+                    return False
+
+            return _BadResp()
+
+        for fn in (raise_http_500, raise_timeout, raise_oserror, bad_json_response):
+            with self.subTest(opener=fn.__name__):
+                out_e, err_e = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out_e), contextlib.redirect_stderr(err_e):
+                    rc_e = rd.main(
+                        ["--text", "x", "--noul", "q1=ok?"],
+                        opener=fn,
+                        env={"GEMINI_API_KEY": raw_api_key},
+                    )
+                self.assertEqual(rc_e, 1)
+                self.assertNotIn(raw_api_key, err_e.getvalue())
+                self.assertNotIn(encoded_api_key, err_e.getvalue())
+                self.assertNotIn(dummy_ghp, err_e.getvalue())
+
+        # 3. 入力エラー（存在しないファイル名に api_key 相当文字やトークンが混入してもマスク）
+        out_in, err_in = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out_in), contextlib.redirect_stderr(err_in):
+            rc_in = rd.main(
+                ["--text-file", f"missing_{dummy_ghp}.txt", "--noul", "q1=ok?"],
+                env={"GEMINI_API_KEY": raw_api_key},
+            )
+        self.assertEqual(rc_in, 2)
+        self.assertNotIn(dummy_ghp, err_in.getvalue())
+        self.assertIn("[REDACTED]", err_in.getvalue())
+
+    def test_gd16_env_file_blocking_and_cp932_utf8_stdio(self) -> None:
+        """GD-16: --text-file/--questions で .env 系を遮断し雛形と本文内トークンを許容、cp932 環境でも UTF-8 出力が成功する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            env_file = tmp_dir / ".env.local"
+            env_file.write_text("GEMINI_API_KEY=secret\n", encoding="utf-8")
+            example_text = tmp_dir / ".env.local.example"
+            example_text.write_text("SAMPLE_TEXT=ok\n", encoding="utf-8")
+            questions_env = tmp_dir / ".env"
+            questions_env.write_text('{"q1": {"type": "noul", "instructions": "ok?"}}', encoding="utf-8")
+            questions_example = tmp_dir / ".env.example"
+            questions_example.write_text('{"q1": {"type": "noul", "instructions": "ok?"}}', encoding="utf-8")
+
+            # --text-file .env.local -> exit 2
+            out1, err1 = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out1), contextlib.redirect_stderr(err1):
+                rc1 = rd.main(
+                    ["--text-file", str(env_file), "--noul", "q1=ok?", "--dry-run"],
+                    env={},
+                )
+            self.assertEqual(rc1, 2)
+            self.assertIn(".env", err1.getvalue())
+
+            # --questions .env -> exit 2
+            out2, err2 = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out2), contextlib.redirect_stderr(err2):
+                rc2 = rd.main(
+                    ["--text", "hello", "--questions", str(questions_env), "--dry-run"],
+                    env={},
+                )
+            self.assertEqual(rc2, 2)
+            self.assertIn(".env", err2.getvalue())
+
+            # 雛形ファイルは許容される
+            out3, err3 = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out3), contextlib.redirect_stderr(err3):
+                rc3 = rd.main(
+                    ["--text-file", str(example_text), "--questions", str(questions_example), "--dry-run"],
+                    env={},
+                )
+            self.assertEqual(rc3, 0, msg=err3.getvalue())
+
+        # 本文内トークン文字列（--text）は汎用 CLI の仕様上遮断しない（Decision F）
+        dummy_body_token = "sk-" + "docExampleToken1234567890"
+        out4, err4 = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out4), contextlib.redirect_stderr(err4):
+            rc4 = rd.main(
+                ["--text", f"example={dummy_body_token}", "--noul", "q1=ok?", "--dry-run"],
+                env={},
+            )
+        self.assertEqual(rc4, 0, msg=err4.getvalue())
+
+        # PYTHONIOENCODING=cp932 下で cp932 非対応文字（絵文字等）を含む --dry-run が UnicodeEncodeError にならない
+        script_path = Path(__file__).resolve().parent / "run_decisions.py"
+        sub_env = os.environ.copy()
+        sub_env.pop("PYTHONUTF8", None)
+        sub_env["PYTHONIOENCODING"] = "cp932"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(script_path),
+                "--text",
+                "日本語と絵文字 \U0001f680 テスト",
+                "--noul",
+                "q1=正常に出力できますか？",
+                "--dry-run",
+            ],
+            capture_output=True,
+            env=sub_env,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+        parsed = json.loads(proc.stdout.decode("utf-8"))
+        self.assertIn("\U0001f680", parsed["input"][0]["text"])
 
 
 if __name__ == "__main__":

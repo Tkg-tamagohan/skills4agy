@@ -21,6 +21,7 @@ _DECISIONS_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "gemini-decisions
 if str(_DECISIONS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_DECISIONS_SCRIPTS_DIR))
 
+import decision_hygiene  # noqa: E402
 import run_decisions  # noqa: E402
 
 DEFAULT_MODEL = run_decisions.DEFAULT_MODEL
@@ -65,22 +66,10 @@ ERROR_SIGNAL_RE = re.compile(
     r"\bFAILED\b|\bERROR:|error:|AssertionError|Exception:|PermissionError|SyntaxError)"
 )
 
-PRIVATE_KEY_BLOCK_RE = re.compile(
-    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?:\s+BLOCK)?-----[\s\S]*?"
-    r"-----END [A-Z0-9 ]*PRIVATE KEY(?:\s+BLOCK)?-----"
-)
-PRIVATE_KEY_HEADER_RE = re.compile(
-    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?:\s+BLOCK)?-----"
-)
+PRIVATE_KEY_BLOCK_RE = decision_hygiene.PRIVATE_KEY_BLOCK_RE
+PRIVATE_KEY_HEADER_RE = decision_hygiene.PRIVATE_KEY_HEADER_RE
 SECRET_REPLACE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    PRIVATE_KEY_BLOCK_RE,
-    PRIVATE_KEY_HEADER_RE,
-    re.compile(r"AIza[0-9A-Za-z_-]{20,}"),
-    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
-    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}"),
-    re.compile(r"AKIA[0-9A-Z]{16}"),
-    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}"),
+    decision_hygiene.SECRET_REDACT_PATTERNS + (decision_hygiene.BEARER_TOKEN_RE,)
 )
 
 PRIORITY_ARG_KEYS: tuple[str, ...] = (
@@ -126,12 +115,13 @@ class ClassifiedStep:
     is_borderline: bool = False
 
 
-def mask_secrets(text: str) -> str:
-    """外部 API 送信前に既知のシークレット・秘密鍵パターンをマスクする。"""
-    masked = text
-    for pattern in SECRET_REPLACE_PATTERNS:
-        masked = pattern.sub("[REDACTED]", masked)
-    return masked
+def mask_secrets(text: str, secret: str | None = None) -> str:
+    """外部 API 送信前およびエラー出力向けに既知のシークレット・秘密鍵・API キー実値をマスクする。"""
+    return decision_hygiene.mask_secrets(
+        text,
+        secrets=(secret,) if secret else (),
+        extra_patterns=(decision_hygiene.BEARER_TOKEN_RE,),
+    )
 
 
 def truncate_head_tail(text: str, max_chars: int, head_ratio: float = 0.65) -> str:
@@ -157,6 +147,7 @@ def _clean_arg_value(value: Any, max_len: int = 100) -> str:
                 text = decoded
         except json.JSONDecodeError:
             text = text[1:-1]
+    text = mask_secrets(text)
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) > max_len:
         return text[: max_len - 3] + "..."
@@ -217,16 +208,18 @@ def normalize_step(
     step_type = str(raw.get("type") or "UNKNOWN")
     status = str(raw.get("status") or "")
     created_at = str(raw.get("created_at") or "")
-    raw_content = str(raw.get("content") or "")
-    tool_summary = summarize_tool_calls(raw.get("tool_calls"))
-    thinking_raw = str(raw.get("thinking") or "")
+    raw_content_orig = str(raw.get("content") or "")
+    is_error_signal = status.upper() == "ERROR" or bool(ERROR_SIGNAL_RE.search(raw_content_orig))
+
+    # truncate_head_tail で秘密鍵の END 行等が欠落する前に必ずマスクを実行する
+    raw_content = mask_secrets(raw_content_orig)
+    tool_summary = mask_secrets(summarize_tool_calls(raw.get("tool_calls")))
+    thinking_raw = mask_secrets(str(raw.get("thinking") or ""))
     thinking_excerpt = (
         truncate_head_tail(thinking_raw, DEFAULT_THINKING_CHARS, head_ratio=0.7)
         if include_thinking and thinking_raw.strip()
         else ""
     )
-
-    is_error_signal = status.upper() == "ERROR" or bool(ERROR_SIGNAL_RE.search(raw_content))
 
     parts: list[str] = []
     if step_type == "USER_INPUT":
@@ -261,9 +254,9 @@ def normalize_step(
         created_at=created_at,
         is_error_signal=is_error_signal,
         normalized_text=body,
-        raw_content=mask_secrets(raw_content),
-        tool_summary=mask_secrets(tool_summary),
-        thinking_excerpt=mask_secrets(thinking_excerpt),
+        raw_content=raw_content,
+        tool_summary=tool_summary,
+        thinking_excerpt=thinking_excerpt,
     )
 
 
@@ -297,6 +290,10 @@ def resolve_transcript_path(
 ) -> Path:
     """CLI 引数から対象の transcript.jsonl パスを解決する。"""
     if transcript:
+        if decision_hygiene.is_blocked_env_path(transcript):
+            raise ValueError(
+                f"機密環境ファイル (.env) は --transcript に指定できません: {transcript}"
+            )
         path = Path(transcript).expanduser()
         if not path.is_file():
             raise FileNotFoundError(f"transcript ファイルが見つかりません: {path}")
@@ -781,8 +778,10 @@ def main(
     *,
     api_caller: Callable[..., dict[str, Any]] | None = None,
 ) -> int:
+    decision_hygiene.configure_utf8_stdio()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
 
     if args.keep_recent < 0:
         print("エラー: --keep-recent は 0 以上を指定してください。", file=sys.stderr)
@@ -809,26 +808,66 @@ def main(
             latest=args.latest,
             app_data_dir=app_data_dir,
         )
-    except (FileNotFoundError, ValueError, RuntimeError) as exc:
-        print(f"エラー: {exc}", file=sys.stderr)
+        file_bytes = transcript_path.stat().st_size
+        raw_rows, parse_warnings = load_transcript_raw_rows(transcript_path)
+        json_meta_kwargs: dict[str, Any] = {
+            "transcript_path": transcript_path,
+            "drop_borderline": args.drop_borderline,
+            "transcript_steps": len(raw_rows),
+            "transcript_bytes": file_bytes,
+            "min_steps": args.min_steps,
+            "min_bytes": args.min_bytes,
+        }
+        skip_threshold = should_skip_below_threshold(
+            row_count=len(raw_rows),
+            file_bytes=file_bytes,
+            min_steps=args.min_steps,
+            min_bytes=args.min_bytes,
+        )
+        chunks: list[list[TranscriptStep]] = []
+        recent_steps: list[TranscriptStep] = []
+        warnings: list[str] = list(parse_warnings)
+        truncated_old = 0
+        payloads: list[dict[str, Any]] = []
+        chunk_stats: list[dict[str, Any]] = []
+        if not skip_threshold:
+            chunks, recent_steps, chunk_warnings, truncated_old = build_chunks(
+                raw_rows,
+                keep_recent=args.keep_recent,
+                max_chars=args.max_chars,
+                max_chunks=args.max_chunks,
+                max_step_chars=args.max_step_chars,
+                include_thinking=args.include_thinking,
+            )
+            warnings = parse_warnings + chunk_warnings
+            for idx, chunk in enumerate(chunks, start=1):
+                payload = build_decision_payload(chunk, model=args.model)
+                validation_errors = run_decisions.validate_payload(payload)
+                if validation_errors:
+                    print(
+                        mask_secrets(
+                            f"エラー: チャンク {idx} のペイロード検証に失敗しました:\n"
+                            + "\n".join(f"- {e}" for e in validation_errors),
+                            secret=api_key,
+                        ),
+                        file=sys.stderr,
+                    )
+                    return 2
+                payloads.append(payload)
+                chunk_stats.append(
+                    {
+                        "chunk_index": idx,
+                        "step_count": len(chunk),
+                        "step_range": [chunk[0].step_index, chunk[-1].step_index],
+                        "input_chars": len(payload["input"]),
+                        "question_count": len(payload["questions"]),
+                    }
+                )
+    except Exception as exc:  # noqa: BLE001
+        print(mask_secrets(f"エラー: {exc}", secret=api_key), file=sys.stderr)
         return 2
 
-    file_bytes = transcript_path.stat().st_size
-    raw_rows, parse_warnings = load_transcript_raw_rows(transcript_path)
-    json_meta_kwargs: dict[str, Any] = {
-        "transcript_path": transcript_path,
-        "drop_borderline": args.drop_borderline,
-        "transcript_steps": len(raw_rows),
-        "transcript_bytes": file_bytes,
-        "min_steps": args.min_steps,
-        "min_bytes": args.min_bytes,
-    }
-    if should_skip_below_threshold(
-        row_count=len(raw_rows),
-        file_bytes=file_bytes,
-        min_steps=args.min_steps,
-        min_bytes=args.min_bytes,
-    ):
+    if skip_threshold:
         if args.format == "json":
             out = render_json_result(
                 **json_meta_kwargs,
@@ -855,39 +894,6 @@ def main(
                 end="",
             )
         return 0
-
-    chunks, recent_steps, chunk_warnings, truncated_old = build_chunks(
-        raw_rows,
-        keep_recent=args.keep_recent,
-        max_chars=args.max_chars,
-        max_chunks=args.max_chunks,
-        max_step_chars=args.max_step_chars,
-        include_thinking=args.include_thinking,
-    )
-    warnings = parse_warnings + chunk_warnings
-
-    payloads: list[dict[str, Any]] = []
-    chunk_stats: list[dict[str, Any]] = []
-    for idx, chunk in enumerate(chunks, start=1):
-        payload = build_decision_payload(chunk, model=args.model)
-        validation_errors = run_decisions.validate_payload(payload)
-        if validation_errors:
-            print(
-                f"エラー: チャンク {idx} のペイロード検証に失敗しました:\n"
-                + "\n".join(f"- {e}" for e in validation_errors),
-                file=sys.stderr,
-            )
-            return 2
-        payloads.append(payload)
-        chunk_stats.append(
-            {
-                "chunk_index": idx,
-                "step_count": len(chunk),
-                "step_range": [chunk[0].step_index, chunk[-1].step_index],
-                "input_chars": len(payload["input"]),
-                "question_count": len(payload["questions"]),
-            }
-        )
 
     if args.dry_run:
         if args.format == "json":
@@ -947,7 +953,6 @@ def main(
             )
         return 0
 
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key and api_caller is None:
         print(
             "エラー: 環境変数 GEMINI_API_KEY が未設定です。従来の手動 session-handoff 手順へフォールバックしてください。",
@@ -970,15 +975,21 @@ def main(
             enriched = run_decisions.enrich_response(raw_resp, min_confidence=args.min_confidence)
         except run_decisions.SafetyBlockError as exc:
             print(
-                f"エラー: チャンク {idx} が安全フィルタにより遮断されました ({exc})。"
-                "従来の手動 session-handoff 手順へフォールバックしてください。",
+                mask_secrets(
+                    f"エラー: チャンク {idx} が安全フィルタにより遮断されました ({exc})。"
+                    "従来の手動 session-handoff 手順へフォールバックしてください。",
+                    secret=api_key,
+                ),
                 file=sys.stderr,
             )
             return 3
         except run_decisions.ApiRequestError as exc:
             print(
-                f"エラー: チャンク {idx} の Decisions API 呼び出しに失敗しました ({exc})。"
-                "従来の手動 session-handoff 手順へフォールバックしてください。",
+                mask_secrets(
+                    f"エラー: チャンク {idx} の Decisions API 呼び出しに失敗しました ({exc})。"
+                    "従来の手動 session-handoff 手順へフォールバックしてください。",
+                    secret=api_key,
+                ),
                 file=sys.stderr,
             )
             return 3

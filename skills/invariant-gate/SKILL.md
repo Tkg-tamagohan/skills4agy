@@ -1,6 +1,6 @@
 ---
 name: invariant-gate
-description: 任意の Git リポジトリ上で git diff とルール文書（AGENTS.md、GEMINI.md、CLAUDE.md、.agents/rules/*.md 等）を Gemini Decision 1（gemini-decision-1）の 1 回の呼び出しで突合し、不変条件の違反候補を抽出する汎用検査手順と CLI を扱う。PR 作成前や実装完了時に差分の規約違反を網羅スクリーニングするときに使用する。Decisions API の一般仕様とスキーマ設計は gemini-decisions-api、常駐システム境界の監査観点は systems-pre-pr-audit、API キーの発行と環境変数設定の案内は scoped-secret-provisioning、Windows シェルでの引用符と文字コード対策は windows-cli-pitfalls に委ねる。
+description: 任意の Git リポジトリ上で git diff とルール文書（AGENTS.md、GEMINI.md、CLAUDE.md、.agents/rules/*.md、.agent/rules/*.md、ネイティブプラグインの rules/*.md 等）を Gemini Decision 1（gemini-decision-1）の 1 回の呼び出しで突合し、不変条件の違反候補を抽出する汎用検査手順と CLI を扱う。PR 作成前や実装完了時に差分の規約違反を網羅スクリーニングするときに使用する。Decisions API の一般仕様とスキーマ設計は gemini-decisions-api、常駐システム境界の監査観点は systems-pre-pr-audit、API キーの発行と環境変数設定の案内は scoped-secret-provisioning、Windows シェルでの引用符と文字コード対策は windows-cli-pitfalls に委ねる。
 ---
 
 # Gemini Decision 1 による汎用不変条件検査
@@ -22,7 +22,9 @@ description: 任意の Git リポジトリ上で git diff とルール文書（A
 
 同梱スクリプト `scripts/check_invariants_decision1.py` は以下の 3 層で質問を構築する。
 
-1. **自動検出（第 1 層）**：対象リポジトリルートから `AGENTS.md`、`GEMINI.md`、`CLAUDE.md`、`.agents/rules/*.md`、`_agents/rules/*.md` を昇順で読み込み、YAML frontmatter、フェンス付きコードブロック内、および `## 対象外` 節を除いて見出しまたはトップレベル箇条書き単位で抽出する。
+1. **自動検出（第 1 層）**：対象リポジトリルートから `AGENTS.md`、`GEMINI.md`、`CLAUDE.md`、`.agents/rules/*.md`、`.agent/rules/*.md`、`_agents/rules/*.md`、`_agent/rules/*.md` を昇順で読み込む。
+   リポジトリルートにネイティブプラグインのマニフェスト（`plugin.json`、`.antigravity-plugin/plugin.json`、`.gemini-plugin/plugin.json`）または `rules/AGENTS.md` が存在する場合は、`rules/AGENTS.md`、`rules/GEMINI.md`、`rules/*.md` も重複を除いて読み込む。
+   いずれも YAML frontmatter、フェンス付きコードブロック内、および `## 対象外` 節を除いて見出しまたはトップレベル箇条書き単位で抽出する。
 2. **追加指定（第 2 層）**：`--rules <path...>` または `--preset systems-pre-pr` で外部や同梱スキルの Markdown（例：`skills/systems-pre-pr-audit/SKILL.md`）を追加投入できる。
 3. **カスタム定義（第 3 層）**：対象リポジトリに `.agents/invariants.json`（または `--questions-file <path>`）があれば読み込み、既存キーの上書き、`path_globs` による変更ファイル限定、個別の `threshold` と `warn_threshold` を適用する。
 
@@ -50,21 +52,21 @@ Windows の PowerShell では実行前に `$env:PYTHONUTF8="1"; $env:PYTHONIOENC
 ```powershell
 # 1. キー不要のドライラン（抽出ルールと検証済みペイロードの確認）
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python ~/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py --dry-run
+python "$HOME/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py" --dry-run
 
 # 2. 現在の作業ツリー差分（git diff HEAD、初期コミット前は --cached）を検査
-python ~/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py
+python "$HOME/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py"
 
 # 3. PR 向けに main との差分を検査し、JSON 形式で出力
-python ~/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py --base main --format json
+python "$HOME/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py" --base main --format json
 
 # 4. 常駐システム境界プリセットを追加し、対象パスを絞って厳格モードで検査
-python ~/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py `
+python "$HOME/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py" `
   --base main --paths "src/**" --preset systems-pre-pr --strict
 
 # 5. 任意の外部ルールファイルを直接追加して検査
-python ~/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py `
-  --base main --paths "src/**" --rules ~/.gemini/config/plugins/shared-skills/skills/systems-pre-pr-audit/SKILL.md --strict
+python "$HOME/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py" `
+  --base main --paths "src/**" --rules "$HOME/.gemini/config/plugins/shared-skills/skills/systems-pre-pr-audit/SKILL.md" --strict
 ```
 
 呼び出し経路は `--backend auto`（既定）で `google-genai >= 3.2.0`（`api_version="v1beta"`）を優先し、`ImportError` または `client.decisions` 不在時は `run_decisions.py` 経由の REST へ自動で切り替える。

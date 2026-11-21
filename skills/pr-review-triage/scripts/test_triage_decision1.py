@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""triage_decision1.py の単体テスト（P3-01〜P3-10）。
+"""triage_decision1.py の単体テスト（P3-01〜P3-13）。
 
 外部ネットワーク通信を行わず、モック opener 注入と一時ディレクトリを用いて
 ドライラン、3 区分プリラベル、dispatch_mode 抽出と後方互換、信頼度・要確認エスカレーション、
@@ -11,13 +11,16 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -641,6 +644,123 @@ class TestTriageDecision1(unittest.TestCase):
         self.assertIn("| single_session |", lines[3])
         self.assertIn("| - | false | - |", lines[4])
         self.assertIn("| other (0.25) |", lines[5])
+
+    def test_P3_11_sk_boundary_and_multiline_pem_masking(self) -> None:
+        """P3-11: flask-... 等の英単語内 sk- を誤検知せず、複数行 PEM ブロックと単独ヘッダを完全マスクする。"""
+        items = [
+            {
+                "id": "SAFE_SK",
+                "source": "review_thread",
+                "path": "src/app.py",
+                "line": 12,
+                "comment_body": "Check flask-app-secret-config-1234567890 and task-executor-worker-pool-config.",
+                "code_snippet": "config_name = 'flask-app-secret-config-1234567890'",
+            }
+        ]
+        code, out, err = _run_cli(
+            ["--stdin", "--dry-run"],
+            env={},
+            stdin_text=json.dumps(items),
+        )
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(json.loads(out)["item_count"], 1)
+
+        pem_block = (
+            "-----BEGIN "
+            + "RSA PRIVATE KEY-----\n"
+            + "MIIEpAIBAAKCAQEAKeyBodyLine123\n"
+            + "-----END "
+            + "RSA PRIVATE KEY-----"
+        )
+        raw_secret = "key+with/secret=chars&123"
+        encoded_secret = urllib.parse.quote(raw_secret, safe="")
+        masked = td.mask_secret(
+            f"err key={encoded_secret}\n{pem_block}\n-----BEGIN " + "PRIVATE KEY-----\npartial",
+            raw_secret,
+        )
+        self.assertNotIn(encoded_secret, masked)
+        self.assertNotIn("MIIEpAIBAAKCAQEAKeyBodyLine123", masked)
+        self.assertNotIn("-----BEGIN ", masked)
+        self.assertIn("[REDACTED]", masked)
+
+    def test_P3_12_input_env_block_and_invalid_encoding_classification(self) -> None:
+        """P3-12: --input .env 系を secret_env_file (exit 2) で遮断しつつ item['path']=='.env' と雛形を許容し、非 UTF-8 入力を invalid_input_encoding (exit 2) に分類する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            env_file = tmp_dir / ".env"
+            env_file.write_text("[]", encoding="utf-8")
+            env_local = tmp_dir / ".env.local"
+            env_local.write_text("[]", encoding="utf-8")
+            env_example = tmp_dir / ".env.local.example"
+            env_example.write_text(json.dumps(_make_sample_items(), ensure_ascii=False), encoding="utf-8")
+            bad_utf8 = tmp_dir / "bad_cp932.json"
+            bad_utf8.write_bytes(b"\x82\xa0\xff\xfe")
+
+            for blocked_path in (env_file, env_local):
+                with self.subTest(blocked_path=blocked_path.name):
+                    code, out, err = _run_cli(["--input", str(blocked_path), "--dry-run"], env={})
+                    self.assertEqual(code, 2)
+                    self.assertEqual(out, "")
+                    self.assertIn("secret_env_file", err)
+
+            # 雛形ファイルは許容
+            code_ex, out_ex, err_ex = _run_cli(["--input", str(env_example), "--dry-run"], env={})
+            self.assertEqual(code_ex, 0, msg=err_ex)
+            self.assertEqual(json.loads(out_ex)["item_count"], 2)
+
+            # Promoted Fix 1: UnicodeDecodeError -> invalid_input_encoding (exit 2, not unexpected_error)
+            code_enc, out_enc, err_enc = _run_cli(["--input", str(bad_utf8), "--dry-run"], env={})
+            self.assertEqual(code_enc, 2)
+            self.assertEqual(out_enc, "")
+            self.assertIn("invalid_input_encoding", err_enc)
+            self.assertNotIn("予期しないエラー", err_enc)
+
+        # Decision F: item["path"] == ".env" は遮断しない
+        env_path_item = [
+            {
+                "id": "ENV_META",
+                "source": "review_thread",
+                "path": ".env",
+                "line": 1,
+                "comment_body": "Remove committed .env file from tracking.",
+            }
+        ]
+        code_meta, out_meta, err_meta = _run_cli(
+            ["--stdin", "--dry-run"],
+            env={},
+            stdin_text=json.dumps(env_path_item),
+        )
+        self.assertEqual(code_meta, 0, msg=err_meta)
+        self.assertEqual(json.loads(out_meta)["items"][0]["path"], ".env")
+
+    def test_P3_13_cp932_subprocess_outputs_japanese_utf8(self) -> None:
+        """P3-13: PYTHONIOENCODING=cp932 下でも日本語と cp932 非対応文字を含む --dry-run が成功する。"""
+        items = [
+            {
+                "id": "JP-1",
+                "source": "review_thread",
+                "path": "src/日本語.py",
+                "line": 5,
+                "comment_body": "日本語コメントと絵文字 \U0001f680 の確認",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "reviews.json"
+            input_path.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+
+            script_path = _SCRIPT_DIR / "triage_decision1.py"
+            sub_env = os.environ.copy()
+            sub_env.pop("PYTHONUTF8", None)
+            sub_env["PYTHONIOENCODING"] = "cp932"
+            proc = subprocess.run(
+                [sys.executable, str(script_path), "--input", str(input_path), "--dry-run"],
+                capture_output=True,
+                env=sub_env,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+            parsed = json.loads(proc.stdout.decode("utf-8"))
+            self.assertEqual(parsed["items"][0]["id"], "JP-1")
 
 
 if __name__ == "__main__":

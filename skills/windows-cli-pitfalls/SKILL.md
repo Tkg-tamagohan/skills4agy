@@ -1,6 +1,6 @@
 ---
 name: windows-cli-pitfalls
-description: Windows 上のシェル（PowerShell と Git Bash）でマルチバイト文字、環境変数、バックスラッシュ、gh CLI、git、curl を扱うときの罠と回避策。PowerShell セッションの非永続性、Python の cp932 ロケールによる UnicodeDecodeError、PowerShell 5.1 の && 非対応と curl エイリアス、Select-Object -First による上流コマンドの非ゼロ終了、ワイルドカード引数の非展開（scripts/*.py）、ExecutionPolicy による .ps1 拒否（pnpm.cmd）、シングルクォート内を含む外部コマンド引数の引用符剥離と $ 展開、gh CLI や git commit -F への BOM なし UTF-8 本文渡し、引用でのバックスラッシュ消失を扱う。Windows マシンでシェルコマンドやスクリプトを組み立てるときに使用する。
+description: Windows 上のシェル（PowerShell と Git Bash）でマルチバイト文字、環境変数、バックスラッシュ、gh CLI、git、curl を扱うときの罠と回避策。PowerShell セッションの非永続性、Python の cp932 ロケールによる UnicodeDecodeError、PowerShell 5.1 の && 非対応と curl エイリアス、Select-Object -First による上流コマンドの非ゼロ終了、ワイルドカード引数の非展開（scripts/*.py）、チルダ（~）引数の非展開（"$HOME/..."）、ExecutionPolicy による .ps1 拒否（pnpm.cmd）、シングルクォート内を含む外部コマンド引数の引用符剥離と $ 展開、gh CLI や git commit -F への BOM なし UTF-8 本文渡し、引用でのバックスラッシュ消失を扱う。Windows マシンでシェルコマンドやスクリプトを組み立てるときに使用する。
 ---
 
 # Windows CLI の文字コードとシェルの罠
@@ -65,6 +65,20 @@ python -m py_compile scripts/*.py
 # OK（Get-ChildItem で展開した配列を渡す）
 $pyFiles = Get-ChildItem scripts\*.py | Select-Object -ExpandProperty FullName
 python -m py_compile $pyFiles
+```
+
+## PowerShell におけるチルダ（~）引数の非展開
+
+PowerShell は `Set-Location` などのコマンドレットでは `~` をホームディレクトリへ解決するが、`python.exe` などの外部コマンドへ渡す引数中の `~/` は展開しない。
+そのため `python ~/.gemini/...` や `--rules ~/.gemini/...` を実行するとリテラル文字列が渡り、`[Errno 2] No such file or directory` やファイル未検出エラーで失敗する。
+外部コマンドへホーム配下のパスを渡すときは二重引用符で囲んだ `"$HOME/..."` を使う（単一引用 `'$HOME/...'` は変数展開されず、無引用は空白を含むユーザー名で引数が分割される）。
+
+```powershell
+# NG（外部コマンド引数中の ~ は展開されず Errno 2 で失敗する）
+python ~/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py --dry-run
+
+# OK（二重引用の "$HOME/..." は PowerShell と bash の双方で展開される）
+python "$HOME/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py" --dry-run
 ```
 
 ## Python の既定文字コード
@@ -173,6 +187,7 @@ Git Bash と Windows プロセスを併用する場合、Git Bash では `$TEMP`
 - PowerShell 5.1 では `&&` を使わず `;` に分け、`curl` ではなく `curl.exe` を使う。
 - `git diff` 等のネイティブコマンド出力を `Select-Object -First` で途中打ち切りせず、大きな差分は一時 `.patch` ファイルへ書き出して `read_file` で範囲読み込みし、確認後に削除する。
 - 外部コマンドへ複数ファイルを渡す際はワイルドカード（`*.py` 等）を直接書かず `Get-ChildItem` で展開する。
+- 外部コマンド引数へホーム配下のパスを渡すときは、PowerShell と bash の双方で展開される二重引用の `"$HOME/..."` を使う。
 - PowerShell で `.ps1` ラッパーが実行ポリシーで拒否されるコマンドは `.cmd`（例: `pnpm.cmd`）を明示する。
 - 文字化けや `Bad unicode escape` はシェル引数やパイプの文字コードを疑い、`--body-file` や `git commit -F` にはリポジトリ外へ作成した BOM なし UTF-8 一時ファイルを渡して実行後に削除し、GraphQL ミューテーションは Python の `subprocess.run` へ逃がす。
 - 短いワンライナーは外側を二重引用、内側を単一引用にし、シングルクォート内に二重引用符を含む `--jq` 式や `$`、`\"`、バックスラッシュを含む処理は `scratch/*.py` へ保存して `json.loads` 等で処理する。

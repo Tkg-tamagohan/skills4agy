@@ -28,8 +28,8 @@ description: PR のレビュー指摘を現行コードとコミット履歴、G
 
 ```powershell
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python ~/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/triage_decision1.py --input reviews.json --dry-run
-python ~/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/triage_decision1.py --input reviews.json --format table
+python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/triage_decision1.py" --input reviews.json --dry-run
+python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/triage_decision1.py" --input reviews.json --format table
 ```
 
 3. 各指摘を次の 3 区分に分類し、根拠コミット、実在する行番号と回帰テスト ID、担当区分を一覧表にする。

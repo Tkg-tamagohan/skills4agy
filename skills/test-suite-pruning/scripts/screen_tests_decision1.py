@@ -15,15 +15,14 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import re
 import sys
 from typing import Any, Callable
-import urllib.parse
 
 _DECISIONS_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "gemini-decisions-api" / "scripts"
 if str(_DECISIONS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_DECISIONS_SCRIPTS_DIR))
 
+import decision_hygiene  # noqa: E402
 import run_decisions  # noqa: E402
 
 DEFAULT_MODEL = run_decisions.DEFAULT_MODEL
@@ -45,32 +44,7 @@ PROTECTION_QUESTION_KEYS: tuple[str, ...] = (
 )
 CATEGORY_QUESTION_KEY = "pruning_category"
 
-SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "秘密鍵ヘッダ (PRIVATE KEY)",
-        re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?:\s+BLOCK)?-----"),
-    ),
-    (
-        "Google API キー (AIza...)",
-        re.compile(r"AIza[0-9A-Za-z_-]{20,}"),
-    ),
-    (
-        "GitHub トークン (gh*_...)",
-        re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
-    ),
-    (
-        "GitHub Fine-grained PAT (github_pat_...)",
-        re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
-    ),
-    (
-        "API シークレットキー (sk-...)",
-        re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
-    ),
-    (
-        "AWS アクセスキー (AKIA...)",
-        re.compile(r"AKIA[0-9A-Z]{16}"),
-    ),
-)
+SECRET_PATTERNS = decision_hygiene.SECRET_DETECT_PATTERNS
 
 
 @dataclass(frozen=True)
@@ -98,15 +72,7 @@ class ScreeningError(Exception):
 
 def mask_secret(text: str, secret: str | None = None) -> str:
     """エラー出力から API キーや秘密情報トークンの実値をマスクする。"""
-    masked = text
-    if secret:
-        masked = masked.replace(secret, "[REDACTED]")
-        quoted = urllib.parse.quote(secret, safe="")
-        if quoted and quoted != secret:
-            masked = masked.replace(quoted, "[REDACTED]")
-    for _, pattern in SECRET_PATTERNS:
-        masked = pattern.sub("[REDACTED]", masked)
-    return masked
+    return decision_hygiene.mask_secret(text, secret)
 
 
 def _iter_string_fields(value: Any, prefix: str) -> list[tuple[str, str]]:
@@ -134,13 +100,12 @@ def check_candidates_secrets(raw_items: list[Any]) -> list[str]:
         item_line = item.get("line", "-")
         for field_name, text in _iter_string_fields(item, "candidate"):
             short_field = field_name.removeprefix("candidate.")
-            for label, pattern in SECRET_PATTERNS:
-                if pattern.search(text):
-                    findings.append(
-                        f"候補 {item_id} ({item_file}:{item_line}) の {short_field} に"
-                        f"秘密情報パターン（{label}）が含まれています。"
-                    )
-                    break
+            labels = decision_hygiene.scan_text_for_secrets(text, patterns=SECRET_PATTERNS)
+            if labels:
+                findings.append(
+                    f"候補 {item_id} ({item_file}:{item_line}) の {short_field} に"
+                    f"秘密情報パターン（{labels[0]}）が含まれています。"
+                )
     return findings
 
 
@@ -671,7 +636,19 @@ def _load_raw_json(
             raw_text = stdin_text if stdin_text is not None else sys.stdin.read()
         else:
             assert input_path is not None
+            if decision_hygiene.is_blocked_env_path(input_path):
+                raise ScreeningError(
+                    "secret_env_file",
+                    f"機密環境ファイル (.env) は --input に指定できません: {input_path}",
+                    exit_code=2,
+                )
             raw_text = Path(input_path).read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ScreeningError(
+            "invalid_input_encoding",
+            f"入力ファイルは UTF-8 としてデコードできません: {exc}",
+            exit_code=2,
+        ) from exc
     except OSError as exc:
         raise ScreeningError("input_read_error", f"入力ファイルを読めません: {exc}", exit_code=2) from exc
 
@@ -709,6 +686,7 @@ def run_cli(
     stdin_text: str | None = None,
 ) -> int:
     """CLI 引数を解釈し、保護対象一次判定を実行して終了コードを返す。"""
+    decision_hygiene.configure_utf8_stdio()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     environ = os.environ if env is None else env
@@ -835,7 +813,4 @@ def main(
 
 
 if __name__ == "__main__":
-    for _stream in (sys.stdin, sys.stdout, sys.stderr):
-        if hasattr(_stream, "reconfigure"):
-            _stream.reconfigure(encoding="utf-8")
     raise SystemExit(main())

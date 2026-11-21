@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""screen_tests_decision1.py の仕様準拠単体テスト（P4-01〜P4-10）。
+"""screen_tests_decision1.py の仕様準拠単体テスト（P4-01〜P4-13）。
 
 外部ネットワーク通信を行わず、opener モック注入・--dry-run・threading.Event に
 よる決定論的並列同期を用いて保護対象フィルタ CLI の仕様を検証する。
@@ -19,6 +19,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -629,6 +630,100 @@ class TestScreenTestsDecision1(unittest.TestCase):
             code_missing, _, err_missing = _run_cli(["--input", str(missing_file)], env={})
             self.assertEqual(code_missing, 2)
             self.assertEqual(json.loads(err_missing)["code"], "input_read_error")
+
+    def test_P4_11_sk_boundary_and_multiline_pem_masking(self) -> None:
+        """P4-11: task-executor-... や flask-... を誤検知せず、複数行 PEM ブロック・単独ヘッダ・URL エンコード値をマスクする。"""
+        cand = _make_candidate(
+            cand_id="T-SAFE-SK",
+            test_name="test_task-executor-worker-pool-config",
+            code='def test_task_executor():\n    cfg = "flask-app-secret-config-1234567890"\n    svc = "task-executor-worker-pool-config"\n',
+        )
+        code, out, err = _run_cli(
+            ["--stdin", "--dry-run"],
+            env={},
+            stdin_text=json.dumps([cand]),
+        )
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(json.loads(out)["total"], 1)
+
+        pem_block = (
+            "-----BEGIN "
+            + "RSA PRIVATE KEY-----\n"
+            + "MIIEpAIBAAKCAQEAKeyBodyLine999\n"
+            + "-----END "
+            + "RSA PRIVATE KEY-----"
+        )
+        raw_secret = "key+with/secret=chars&456"
+        encoded_secret = urllib.parse.quote(raw_secret, safe="")
+        masked = screener.mask_secret(
+            f"err key={encoded_secret}\n{pem_block}\n-----BEGIN " + "PRIVATE KEY-----\npartial",
+            raw_secret,
+        )
+        self.assertNotIn(encoded_secret, masked)
+        self.assertNotIn("MIIEpAIBAAKCAQEAKeyBodyLine999", masked)
+        self.assertNotIn("-----BEGIN ", masked)
+        self.assertIn("[REDACTED]", masked)
+
+    def test_P4_12_input_env_block_and_invalid_encoding_classification(self) -> None:
+        """P4-12: --input .env 系を secret_env_file (exit 2) で遮断し雛形を許容、非 UTF-8 入力を invalid_input_encoding (exit 2) に分類する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            env_file = tmp_dir / ".env"
+            env_file.write_text("[]", encoding="utf-8")
+            env_local = tmp_dir / ".env.local"
+            env_local.write_text("[]", encoding="utf-8")
+            env_example = tmp_dir / ".env.local.example"
+            env_example.write_text(json.dumps([_make_candidate()], ensure_ascii=False), encoding="utf-8")
+            bad_utf8 = tmp_dir / "bad_cp932.json"
+            bad_utf8.write_bytes(b"\x82\xa0\xff\xfe")
+
+            for blocked in (env_file, env_local):
+                with self.subTest(blocked=blocked.name):
+                    code, out, err = _run_cli(["--input", str(blocked), "--dry-run"], env={})
+                    self.assertEqual(code, 2)
+                    self.assertEqual(out, "")
+                    err_obj = json.loads(err)
+                    self.assertEqual(err_obj["code"], "secret_env_file")
+                    self.assertEqual(err_obj["exit_code"], 2)
+
+            code_ex, out_ex, err_ex = _run_cli(["--input", str(env_example), "--dry-run"], env={})
+            self.assertEqual(code_ex, 0, msg=err_ex)
+            self.assertEqual(json.loads(out_ex)["total"], 1)
+
+            # Promoted Fix 1b: UnicodeDecodeError -> invalid_input_encoding (exit 2, not api_request_failed / exit 1)
+            code_enc, out_enc, err_enc = _run_cli(["--input", str(bad_utf8), "--dry-run"], env={})
+            self.assertEqual(code_enc, 2)
+            self.assertEqual(out_enc, "")
+            err_enc_obj = json.loads(err_enc)
+            self.assertEqual(err_enc_obj["code"], "invalid_input_encoding")
+            self.assertEqual(err_enc_obj["exit_code"], 2)
+
+    def test_P4_13_cp932_subprocess_outputs_japanese_utf8(self) -> None:
+        """P4-13: PYTHONIOENCODING=cp932 下でも日本語と cp932 非対応文字を含む --dry-run が成功する。"""
+        candidates = [
+            _make_candidate(
+                cand_id="T-CP932-01",
+                test_name="test_日本語と絵文字_\U0001f680",
+                code="def test_jp():\n    assert '日本語 \U0001f680'\n",
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "candidates.json"
+            input_path.write_text(json.dumps(candidates, ensure_ascii=False), encoding="utf-8")
+
+            script_path = _SCRIPT_DIR / "screen_tests_decision1.py"
+            sub_env = os.environ.copy()
+            sub_env.pop("PYTHONUTF8", None)
+            sub_env["PYTHONIOENCODING"] = "cp932"
+            proc = subprocess.run(
+                [sys.executable, str(script_path), "--input", str(input_path), "--dry-run"],
+                capture_output=True,
+                env=sub_env,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+            parsed = json.loads(proc.stdout.decode("utf-8"))
+            self.assertIn("\U0001f680", parsed["items"][0]["test_name"])
 
 
 if __name__ == "__main__":

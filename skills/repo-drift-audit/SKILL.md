@@ -43,7 +43,7 @@ description: リポジトリの文書、スキル、テスト資産とコード�
 
 1. 親エージェントが第一走査を自分で行い、各候補項目に根拠となる証拠（ファイル、行番号、観測した症状）を添えて列挙する。
    - 対象となる文書、スキル、残課題項目、または第一走査候補が多い場合（目安 10 件以上）は、任意で同梱の `scripts/screen_drift_decision1.py` を使い、Gemini Decision 1（`gemini-decision-1`、出力トークン 0）で優先順位付けや事前分類を行える。
-   - `docs` モードはリポジトリ構成、直近の履歴要約、文書内パスの不在ヒントを添えて各文書を評価し、`prioritize_for_audit`、`mechanization_candidate`、`low_priority_clean` へ仕分ける（非 Git 環境ではファイル走査へ切り替える）。
+   - `docs` モードはルート指示文書（`README.md`、`AGENTS.md`、`GEMINI.md`、`CLAUDE.md`）、`docs`、スキル配下の補助文書と `references/*.md`、およびルール文書（`**/slop-catalog.md` は既定除外）を対象とし、リポジトリ構成、直近の履歴要約、文書内パスの不在ヒントを添えて評価し、`prioritize_for_audit`、`mechanization_candidate`、`low_priority_clean` へ仕分ける（非 Git 環境ではファイル走査へ切り替える）。
    - `backlog` モードは残課題帳簿の未完了項目（`- [ ]` または JSON）を共有スナップショットへ 1 リクエスト（最大 1,000 問）で一括突合し、解消済み疑い項目を抽出する。
    - `candidates` モードは第一走査候補の JSON 配列を `plan_worker_autonomous` や `plan_worker_discussion` などへ振り分け、低信頼度や要協議疑いを `needs_parent_review: true` へ上げる。
    - `.env` 系（雛形を除く）や秘密鍵ヘッダおよび主要 API トークンの混入時、また入力文字数や 1,000 問の上限超過時は API 送信前に終了コード `2` で遮断される。
@@ -53,13 +53,13 @@ description: リポジトリの文書、スキル、テスト資産とコード�
 ```powershell
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
 # 1. キー不要のドライラン（docs / backlog / candidates）
-python ~/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --repo . --dry-run --format table
-python ~/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py backlog --backlog docs/BACKLOG.md --repo . --dry-run --format table
-python ~/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py candidates --input candidates.json --dry-run --format table
+python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py" docs --repo . --dry-run --format table
+python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py" backlog --backlog docs/BACKLOG.md --repo . --dry-run --format table
+python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py" candidates --input candidates.json --dry-run --format table
 
 # 2. 実 API による一次スクリーニング（GEMINI_API_KEY を参照）
-python ~/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --repo . --format table
-python ~/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py backlog --backlog docs/BACKLOG.md --repo . --format table
+python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py" docs --repo . --format table
+python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py" backlog --backlog docs/BACKLOG.md --repo . --format table
 ```
 
 2. 計画フェーズとして、`run_workflow` の `parallel()`（または `invoke_subagent` の `research`）で各項目を 1 ワーカーへ割り当てる。

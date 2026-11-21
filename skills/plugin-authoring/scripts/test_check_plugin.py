@@ -333,6 +333,7 @@ class TestCheckPluginStructure(unittest.TestCase):
         self.assertEqual([], check_plugin.check_readme(root))
         self.assertEqual([], check_plugin.check_docs(root))
         self.assertEqual([], check_plugin.check_plugin_json(root))
+        self.assertEqual([], check_plugin.check_hooks_json(root))
 
     def test_cp_14_ルール規約違反とPOSIXパス表記を検出する(self):
         root = self.make_repo()
@@ -505,6 +506,235 @@ class TestCheckPluginStructure(unittest.TestCase):
         self.run_git(root, "commit", "-qm", "rm doc")
         write_plugin_json(root, valid_manifest(version="1.2.4"))
         self.assertEqual([], check_plugin.check_version_bump("base2", root))
+
+
+class TestHooksJsonValidation(unittest.TestCase):
+    """hooks.json のスキーマ検査・スクリプト実在検査・バンプ検査(CP-23〜CP-29)"""
+
+    def make_repo(self, *, init_git: bool = False) -> Path:
+        root = make_valid_repo(init_git=init_git)
+        self.addCleanup(shutil.rmtree, root, True)
+        return root
+
+    def run_git(self, root: Path, *args: str) -> None:
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+    def write_hooks(self, root: Path, data: object) -> None:
+        (root / "hooks.json").write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+    def test_cp_23_有効なhooks_jsonのグループ形式とフラット形式とmatcherが通過する(self):
+        root = self.make_repo()
+        (root / "hooks").mkdir()
+        (root / "hooks" / "guard.py").write_text("print('ok')\n", encoding="utf-8")
+        (root / "hooks" / "post.sh").write_text("echo ok\n", encoding="utf-8")
+        (root / "hooks" / "session.py").write_text("print('hi')\n", encoding="utf-8")
+        data = {
+            "guard-hook": {
+                "enabled": True,
+                "PreToolUse": [
+                    {
+                        "matcher": "*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "python hooks/guard.py",
+                                "timeout": 15,
+                            }
+                        ],
+                    },
+                    {
+                        "matcher": "",
+                        "hooks": [{"command": "python hooks/guard.py"}],
+                    },
+                ],
+                "PostToolUse": [
+                    {
+                        "matcher": "run_command|view_file",
+                        "hooks": [{"type": "command", "command": "./hooks/post.sh"}],
+                    }
+                ],
+            },
+            "lifecycle-hook": {
+                "SessionStart": [{"command": "python hooks/session.py"}],
+                "PreInvocation": [{"command": "echo pre"}],
+                "PostInvocation": [{"command": "echo post", "timeout": 5}],
+                "Stop": [{"command": "echo stop"}],
+            },
+        }
+        self.write_hooks(root, data)
+        self.assertEqual([], check_plugin.check_hooks_json(root))
+
+    def test_cp_24_不正なJSONとトップレベル型違反と空フック名を検出する(self):
+        root = self.make_repo()
+        (root / "hooks.json").write_text("{invalid json", encoding="utf-8")
+        errors = check_plugin.check_hooks_json(root)
+        self.assertTrue(any("JSON として解釈できません" in e for e in errors), errors)
+
+        for bad in ([], "hooks"):
+            with self.subTest(data=bad):
+                errors = check_plugin.validate_hooks_json(bad)
+                self.assertTrue(
+                    any("トップレベルがオブジェクトではありません" in e for e in errors),
+                    errors,
+                )
+
+        errors = check_plugin.validate_hooks_json({"": {}, "bad-spec": []})
+        self.assertTrue(any("フック名は空でない文字列" in e for e in errors), errors)
+        self.assertTrue(any("hooks.json.bad-spec はオブジェクト" in e for e in errors), errors)
+
+    def test_cp_25_未知イベントと未知キーとグループフラット誤用を検出する(self):
+        data = {
+            "bad-hook": {
+                "enabled": "true",
+                "UnknownEvent": [],
+                "PreToolUse": [
+                    {"type": "command", "command": "echo flat-in-grouped"},
+                    {"matcher": "*", "hooks": [{"command": "echo ok", "async": True}], "extra": 1},
+                ],
+                "SessionStart": [
+                    {"matcher": "*", "hooks": [{"command": "echo grouped-in-flat"}]}
+                ],
+            }
+        }
+        errors = check_plugin.validate_hooks_json(data)
+        for needle in (
+            "enabled は真偽値である必要があります",
+            "未知のキー 'UnknownEvent'",
+            "PreToolUse[0] に未知のキー 'command'",
+            "PreToolUse[0].matcher は文字列",
+            "PreToolUse[0].hooks は配列",
+            "PreToolUse[1] に未知のキー 'extra'",
+            "PreToolUse[1].hooks[0] に未知のキー 'async'",
+            "SessionStart[0] に未知のキー 'matcher'",
+            "SessionStart[0].command は空でない文字列",
+        ):
+            self.assertTrue(any(needle in e for e in errors), f"{needle!r} missing in {errors}")
+
+    def test_cp_26_ハンドラのtypeとcommandとtimeoutの型違反を検出する(self):
+        data = {
+            "h": {
+                "PreInvocation": [
+                    {"type": "http", "command": "   ", "timeout": True},
+                    {"command": "echo ok", "timeout": 0},
+                    {"command": "echo ok", "timeout": -3},
+                    {"command": "echo ok", "timeout": "10"},
+                ]
+            }
+        }
+        errors = check_plugin.validate_hooks_json(data)
+        self.assertTrue(any("type は 'command' のみ" in e for e in errors), errors)
+        self.assertTrue(any("command は空でない文字列" in e for e in errors), errors)
+        self.assertEqual(
+            4, sum(1 for e in errors if "timeout は正の整数である必要があります" in e), errors
+        )
+
+    def test_cp_27_コマンド文字列内のスクリプト実在検査と誤検出防止を確認する(self):
+        root = self.make_repo()
+        (root / "hooks").mkdir()
+        (root / "hooks" / "ok.py").write_text("print('ok')\n", encoding="utf-8")
+
+        valid_data = {
+            "ok-commands": {
+                "PreInvocation": [
+                    {"command": "python hooks/ok.py || exit 0"},
+                    {"command": "python -m unittest"},
+                    {"command": 'python -c "print(1)"'},
+                    {"command": 'python -Bc "print(1)"'},
+                    {"command": "echo ok"},
+                ]
+            }
+        }
+        self.write_hooks(root, valid_data)
+        self.assertEqual([], check_plugin.check_hooks_json(root))
+
+        bad_commands = [
+            ("python hooks/missing.py", "参照スクリプトが見つかりません"),
+            ("python ../outside.py", "プラグインディレクトリ外を参照しています"),
+            (r"python hooks\ok.py", "バックスラッシュ"),
+            ("python $PLUGIN_ROOT/hooks/ok.py", "$PLUGIN_ROOT"),
+            ("python %PLUGIN_ROOT%/hooks/ok.py", "%PLUGIN_ROOT%"),
+            ('python "hooks/ok.py', "引用符が閉じられていません"),
+        ]
+        for cmd, needle in bad_commands:
+            with self.subTest(command=cmd):
+                self.write_hooks(
+                    root, {"bad": {"PreInvocation": [{"command": cmd}]}}
+                )
+                errors = check_plugin.check_hooks_json(root)
+                self.assertTrue(
+                    any(needle in e for e in errors),
+                    f"{needle!r} missing for {cmd!r}: {errors}",
+                )
+
+    def test_cp_28_無効化フックでも構文違反とスクリプト欠損を検出する(self):
+        root = self.make_repo()
+        data = {
+            "disabled-hook": {
+                "enabled": False,
+                "PreToolUse": [
+                    {
+                        "matcher": "run_command",
+                        "hooks": [
+                            {
+                                "type": "invalid",
+                                "command": "python hooks/missing.py",
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+        self.write_hooks(root, data)
+        errors = check_plugin.check_hooks_json(root)
+        self.assertTrue(any("type は 'command' のみ" in e for e in errors), errors)
+        self.assertTrue(any("参照スクリプトが見つかりません" in e for e in errors), errors)
+
+    def test_cp_29_hooks_json削除改名時のマイナーバンプ要求と実リポジトリ検査を確認する(self):
+        self.assertEqual([], check_plugin.check_hooks_json(check_plugin.REPO_ROOT))
+
+        root = self.make_repo(init_git=True)
+        (root / "hooks").mkdir()
+        (root / "hooks" / "guard.py").write_text("print('ok')\n", encoding="utf-8")
+        self.write_hooks(
+            root,
+            {"g": {"PreInvocation": [{"command": "python hooks/guard.py"}]}},
+        )
+        self.run_git(root, "add", "-A")
+        self.run_git(root, "commit", "-qm", "add hooks")
+        self.run_git(root, "tag", "base-hooks")
+
+        # 削除時はパッチバンプを拒否し、マイナーバンプで通過する
+        removed_repo = root
+        self.run_git(removed_repo, "rm", "-q", "hooks.json")
+        self.run_git(removed_repo, "commit", "-qm", "remove hooks")
+        write_plugin_json(removed_repo, valid_manifest(version="1.2.4"))
+        errors = check_plugin.check_version_bump("base-hooks", removed_repo)
+        self.assertTrue(any("マイナー以上を上げてください" in e for e in errors), errors)
+
+        write_plugin_json(removed_repo, valid_manifest(version="1.3.0"))
+        self.assertEqual([], check_plugin.check_version_bump("base-hooks", removed_repo))
+
+        # 改名時も同様にマイナーバンプを要求する
+        renamed_repo = self.make_repo(init_git=True)
+        (renamed_repo / "hooks").mkdir()
+        (renamed_repo / "hooks" / "guard.py").write_text("print('ok')\n", encoding="utf-8")
+        self.write_hooks(
+            renamed_repo,
+            {"g": {"PreInvocation": [{"command": "python hooks/guard.py"}]}},
+        )
+        self.run_git(renamed_repo, "add", "-A")
+        self.run_git(renamed_repo, "commit", "-qm", "add hooks")
+        self.run_git(renamed_repo, "tag", "base-hooks-mv")
+        self.run_git(renamed_repo, "mv", "hooks.json", "hooks.bak.json")
+        self.run_git(renamed_repo, "commit", "-qm", "rename hooks")
+        write_plugin_json(renamed_repo, valid_manifest(version="1.2.4"))
+        errors = check_plugin.check_version_bump("base-hooks-mv", renamed_repo)
+        self.assertTrue(any("マイナー以上を上げてください" in e for e in errors), errors)
+
+        write_plugin_json(renamed_repo, valid_manifest(version="1.3.0"))
+        self.assertEqual([], check_plugin.check_version_bump("base-hooks-mv", renamed_repo))
 
 
 if __name__ == "__main__":
