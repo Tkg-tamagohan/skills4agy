@@ -1,0 +1,93 @@
+{
+  "states_clear_objectives": {
+    "type": "noul",
+    "instructions": "Does the document state concrete goals and expected outcomes in plain, understandable terms?",
+    "criteria": {
+      "true_description": "The document clearly states what the proposal aims to achieve and its expected outcomes in plain language.",
+      "false_description": "Goals are vague, missing, or buried in unexplained jargon."
+    }
+  },
+  "identifies_current_limits": {
+    "type": "noul",
+    "instructions": "Does the document describe how the current system behaves and which concrete limitations or problems exist today?",
+    "criteria": {
+      "true_description": "Current behavior and specific limitations or pain points motivating the change are explicitly described.",
+      "false_description": "Current system behavior or the concrete problems with the status quo are omitted or vague."
+    }
+  },
+  "explains_new_approach": {
+    "type": "noul",
+    "instructions": "Does the document explain the proposed approach and why it will succeed where current mechanisms fall short?",
+    "criteria": {
+      "true_description": "The new mechanism and the rationale for why it solves the stated limitations are clearly explained.",
+      "false_description": "The proposal jumps to conclusions or lists changes while omitting the rationale for why the approach works."
+    }
+  },
+  "specifies_risks_and_tradeoffs": {
+    "type": "noul",
+    "instructions": "Does the document identify key technical or operational risks, failure modes, and design tradeoffs?",
+    "criteria": {
+      "true_description": "Key risks, failure scenarios, and secondary tradeoffs of the chosen design are documented.",
+      "false_description": "Risks, failure modes, or design tradeoffs are omitted or treated as purely upside."
+    }
+  },
+  "estimates_cost_and_timeline": {
+    "type": "noul",
+    "instructions": "Does the document specify estimated effort, resource costs, rollout scope, or delivery milestones?",
+    "criteria": {
+      "true_description": "Implementation cost, operational overhead, rollout phases, or target milestones are stated.",
+      "false_description": "Effort, resource costs, rollout scope, and timeline expectations are left unspecified."
+    }
+  },
+  "defines_success_metrics": {
+    "type": "noul",
+    "instructions": "Does the document define measurable acceptance criteria, midterm checks, or final success metrics?",
+    "criteria": {
+      "true_description": "Concrete acceptance thresholds, interim checkpoints, or measurable success metrics are defined.",
+      "false_description": "Success is described only qualitatively or lacks verifiable completion criteria."
+    }
+  },
+  "has_undefined_project_terms": {
+    "type": "noul",
+    "instructions": "Does the document use project-specific acronyms, internal component names, or domain terms that lack definitions in the text?",
+    "criteria": {
+      "true_description": "Internal acronyms, project codenames, or domain terms appear before or without clear definition in the document.",
+      "false_description": "All project-specific terms and acronyms are defined or self-explanatory to a cold reader."
+    }
+  },
+  "has_ambiguous_boundary_rules": {
+    "type": "noul",
+    "instructions": "Does the document leave edge cases, error handling, ownership boundaries, or precedence rules open to multiple interpretations?",
+    "criteria": {
+      "true_description": "Boundary conditions, error paths, ownership splits, or conflict precedence rules allow multiple interpretations.",
+      "false_description": "Edge cases, error handling, ownership boundaries, and precedence rules are explicitly specified."
+    }
+  },
+  "leaves_design_decisions_to_implementer": {
+    "type": "noul",
+    "instructions": "Does the document defer concrete schema, API, state-transition, or architectural choices to the implementer?",
+    "criteria": {
+      "true_description": "Data schemas, API contracts, state transitions, or architectural choices remain unmade and deferred to implementation.",
+      "false_description": "Core schemas, contracts, state transitions, and architectural decisions are resolved in the document."
+    }
+  },
+  "specifies_concrete_verification_plan": {
+    "type": "noul",
+    "instructions": "Does the document specify concrete test cases, validation checks, or acceptance tests to confirm the change works?",
+    "criteria": {
+      "true_description": "Specific test scenarios, verification commands, or acceptance checks are listed for validating the implementation.",
+      "false_description": "Verification steps are omitted or reduced to a generic statement such as testing later."
+    }
+  },
+  "spec_readiness_score": {
+    "type": "score",
+    "instructions": "Rate the overall readiness of this specification for independent review and implementation.",
+    "criteria": [
+      "0: missing core objectives, context, and actionable design details",
+      "1: states high-level goals while leaving major constraints, boundaries, and verification unspecified",
+      "2: covers basic approach and scope while leaving key tradeoffs, edge cases, or design choices unresolved",
+      "3: clearly specifies objectives, approach, boundaries, and risks with only minor clarifications remaining",
+      "4: complete, unambiguous, self-contained specification with concrete verification criteria"
+    ]
+  }
+}

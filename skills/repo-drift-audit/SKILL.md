@@ -1,6 +1,6 @@
 ---
 name: repo-drift-audit
-description: リポジトリの文書、スキル、テスト資産とコードの乖離や重複、手順の機械化余地を網羅的に洗い出し、Gemini Decision 1 による一次スクリーニングから計画と実装の 2 段サブエージェント（`run_workflow` または `invoke_subagent`）へ振る手順。走査観点のカタログ、一次スクリーニング CLI（`docs`、`backlog`、`candidates`）、計画ファンアウトと実装ファンアウトの構成、排他ファイル境界とトラック分割、集約書の形式、リファクタ系の検証技法を扱う。リポジトリ全体のドリフト監査や大掛かりな構造整理を計画するときに使用する。不要テストの判定基準と一次フィルタは test-suite-pruning、Decisions API の一般仕様は gemini-decisions-api、実装差分の不変条件検査は invariant-gate、要協議の提示形式は requirements-definition、動的ワークフローの記法は builtin の run-workflow に委ねる。
+description: リポジトリの文書、スキル、テスト資産とコードの乖離や重複、手順の機械化余地を網羅的に洗い出し、Gemini Decision 1 による一次スクリーニングから計画と実装の 2 段サブエージェント（`run_workflow` または `invoke_subagent`）へ振る手順。走査観点のカタログ、一次スクリーニング CLI（`docs`、`backlog`、`candidates`）、計画ファンアウトと実装ファンアウトの構成、排他ファイル境界とトラック分割、集約書の形式、リファクタ系の検証技法を扱う。リポジトリ全体のドリフト監査や大掛かりな構造整理を計画するときに使用する。不要テストの判定基準と一次フィルタは test-suite-pruning、Decisions API の一般仕様は gemini-decisions-api、実装差分の不変条件検査は invariant-gate、要協議の提示形式は requirements-definition、既存設計文書を持たないコードベースからの単発契約抽出は codebase-contract-extract、動的ワークフローの記法は builtin の run-workflow に委ねる。
 ---
 
 # リポジトリの網羅的ドリフト監査と 2 段ファンアウト
@@ -18,6 +18,7 @@ description: リポジトリの文書、スキル、テスト資産とコード�
 - **要協議の提示形式**：自律適用と要協議の切り分け、推奨案つき選択肢の形式は `requirements-definition` に従う。
 - **並列実行と監視**：ワーカーの起動、ワークスペース分離、進捗待機、構造化出力の回収は builtin の `run-workflow`（`agent`、`parallel`、`phase`）または `invoke_subagent` に委ねる。
 - **トラック分割と排他ファイル境界**：実装フェーズにおけるファイルの排他割り当てとファサード化の規則は本スキル内で定める。
+- **既存設計文書がないコードベースの契約抽出**：文書との乖離監査ではなく未知ディレクトリから公開シンボル、不変条件、副作用を単発で把握したい場合は `codebase-contract-extract` に委ねる。
 
 ## 走査観点
 
