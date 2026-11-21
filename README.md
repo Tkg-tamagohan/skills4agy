@@ -37,7 +37,7 @@ Antigravity セッション全体で共有するルールとスキルをまと�
 | `japanese-tech-writing` | 日本語の技術文書と書籍原稿の文章規範、差分検査、スロップリンター |
 | `output-format-escalation` | 説明、調査、分析の成果物における表現形式（文章、図、HTML）の選択基準と納品方法 |
 | `plugin-authoring` | `shared-skills` プラグインにルールやスキルを追加、変更、構造検査する手順 |
-| `pr-review-triage` | PR レビュー指摘の実物照合トリアージ、Decision 1 一次プリラベル CLI、複数セッション分別、未 Resolve スレッド整理と事後検証の手順 |
+| `pr-review-triage` | PR レビュー指摘の実物照合トリアージ、Decision 1 一次プリラベル CLI、PR 内再発防止策の引き継ぎと `invariant-gate` 連携 CLI、複数セッション分別、未 Resolve スレッド整理と事後検証の手順 |
 | `repo-drift-audit` | リポジトリの文書、スキル、テストとコードの乖離や重複を Decision 1 一次スクリーニングと 2 段サブエージェントで監査する手順 |
 | `requirements-definition` | 要件定義書や仕様書のレビュー、協議、決定記録、実装計画への分解を進める手順 |
 | `session-handoff` | 現在のセッションを軽量に区切り、Decision 1 による重要ステップ事前選別 CLI を使い、引き継ぎメモと再開プロンプトで次セッションへ渡す手順 |
