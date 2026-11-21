@@ -1,0 +1,61 @@
+{
+  "has_layout_breakage": {
+    "type": "noul",
+    "instructions": "Does the UI show overlapping elements, content overflowing outside the screen or container bounds, or visible layout breakage?",
+    "criteria": {
+      "true_description": "Elements overlap, overflow past container or viewport boundaries, or appear visibly misaligned.",
+      "false_description": "All UI elements remain properly aligned, separated, and contained within their layout bounds."
+    }
+  },
+  "has_text_truncation": {
+    "type": "noul",
+    "instructions": "Do button labels, headings, or UI labels show unexpected text truncation, clipped characters, or broken line wrapping?",
+    "criteria": {
+      "true_description": "Labels or headings are unexpectedly cut off, clipped by containers, or wrapped awkwardly across lines.",
+      "false_description": "All labels and headings fit cleanly within their controls with intentional line breaks."
+    }
+  },
+  "has_redundant_lead_copy": {
+    "type": "noul",
+    "instructions": "Are there explanatory lead sentences or descriptions directly below headings or cards that merely repeat what the heading or control already conveys?",
+    "criteria": {
+      "true_description": "Explanatory sentences below headings or cards simply paraphrase the heading or self-evident purpose.",
+      "false_description": "Descriptions are omitted or convey only essential constraints, irreversible impacts, or non-obvious side effects."
+    }
+  },
+  "has_welcome_or_guide_banner": {
+    "type": "noul",
+    "instructions": "Does the interface include a welcome banner, feature introduction box, or persistent usage guide explaining how to use the screen?",
+    "criteria": {
+      "true_description": "A greeting banner, tool overview box, or persistent step-by-step usage guide is displayed.",
+      "false_description": "The interface leads directly with actionable controls and content, reserving banners for active status alerts."
+    }
+  },
+  "has_redundant_secondary_label": {
+    "type": "noul",
+    "instructions": "Does the UI contain redundant secondary labels such as subtitles paraphrasing headings, obvious helper captions beneath values, or explicit field names where the value format makes the meaning obvious?",
+    "criteria": {
+      "true_description": "Subtitles, captions, or field labels duplicate the main label or state an obvious value format.",
+      "false_description": "Secondary labels are omitted or appear only where needed to distinguish similar fields."
+    }
+  },
+  "has_verbose_dialog_or_empty_state": {
+    "type": "noul",
+    "instructions": "Do empty states or confirmation dialogs contain feature introductions, lengthy usage instructions, or overly polite preambles beyond stating the status, target, irreversible impact, and next action?",
+    "criteria": {
+      "true_description": "Empty states or confirmation dialogs include feature pitches, tutorial steps, or wordy preambles.",
+      "false_description": "Empty states and confirmation dialogs state only the current status, target, irreversible impact, and action."
+    }
+  },
+  "visual_clarity": {
+    "type": "score",
+    "instructions": "Rate the overall visual clarity, layout alignment, and copy conciseness of this UI.",
+    "criteria": [
+      "0: severe layout or legibility defects",
+      "1: cluttered with excessive redundant copy",
+      "2: usable but noticeable redundant labels or spacing issues",
+      "3: clean layout with minor copy redundancy",
+      "4: concise, well-aligned, and scannable UI"
+    ]
+  }
+}

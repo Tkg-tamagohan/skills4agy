@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""triage_transcript_decision1.py のユニットテスト（T01–T10）。"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
+
+import triage_transcript_decision1 as mod  # noqa: E402
+import run_decisions  # noqa: E402
+
+
+def _make_row(
+    step_index: int,
+    *,
+    step_type: str = "PLANNER_RESPONSE",
+    source: str = "MODEL",
+    status: str = "DONE",
+    content: str = "",
+    thinking: str = "",
+    tool_calls: list[dict] | None = None,
+) -> dict:
+    row: dict = {
+        "step_index": step_index,
+        "source": source,
+        "type": step_type,
+        "status": status,
+        "created_at": "2026-11-21T01:00:00Z",
+    }
+    if content:
+        row["content"] = content
+    if thinking:
+        row["thinking"] = thinking
+    if tool_calls is not None:
+        row["tool_calls"] = tool_calls
+    return row
+
+
+class TestTriageTranscriptDecision1(unittest.TestCase):
+    """T01–T10 の仕様検証テスト。"""
+
+    def test_T01_load_jsonl_skips_blank_and_broken_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "transcript.jsonl"
+            lines = [
+                json.dumps(_make_row(0, step_type="USER_INPUT", content="hello")),
+                "",
+                "not a json line {",
+                json.dumps(["array-not-object"]),
+                json.dumps(_make_row(1, content="world")),
+            ]
+            p.write_text("\n".join(lines), encoding="utf-8")
+            rows, warnings = mod.load_transcript_raw_rows(p)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual([r["step_index"] for r in rows], [0, 1])
+            self.assertEqual(len(warnings), 2)
+
+    def test_T02_user_input_extracts_request_and_strips_boilerplate(self) -> None:
+        raw = _make_row(
+            0,
+            step_type="USER_INPUT",
+            source="USER_EXPLICIT",
+            content=(
+                "<USER_REQUEST>\n本番実装の前提を確認してください。\n</USER_REQUEST>\n"
+                "<ADDITIONAL_METADATA>\nlocal time: 2026-11-21\n<PLAN>huge plan</PLAN>\n</ADDITIONAL_METADATA>\n"
+                "<USER_SETTINGS_CHANGE>Model changed</USER_SETTINGS_CHANGE>"
+            ),
+        )
+        step = mod.normalize_step(raw)
+        assert step is not None
+        self.assertEqual(step.normalized_text, "本番実装の前提を確認してください。")
+        self.assertNotIn("ADDITIONAL_METADATA", step.normalized_text)
+        self.assertNotIn("huge plan", step.normalized_text)
+
+    def test_T03_planner_response_excludes_thinking_by_default_and_summarizes_tools(self) -> None:
+        raw = _make_row(
+            3,
+            step_type="PLANNER_RESPONSE",
+            content="設定ファイルを確認します。",
+            thinking="Internal secret chain of thought",
+            tool_calls=[
+                {"name": "read_file", "args": {"Path": '"C:\\repo\\plugin.json"'}},
+                {"name": "run_command", "args": {"CommandLine": "git status -s"}},
+            ],
+        )
+        step_default = mod.normalize_step(raw, include_thinking=False)
+        assert step_default is not None
+        self.assertIn("設定ファイルを確認します。", step_default.normalized_text)
+        self.assertIn("read_file(Path=C:\\repo\\plugin.json)", step_default.normalized_text)
+        self.assertIn("run_command(CommandLine=git status -s)", step_default.normalized_text)
+        self.assertNotIn("Internal secret chain of thought", step_default.normalized_text)
+
+        step_with_thinking = mod.normalize_step(raw, include_thinking=True)
+        assert step_with_thinking is not None
+        self.assertIn("[thinking] Internal secret chain of thought", step_with_thinking.normalized_text)
+
+    def test_T04_generic_prioritizes_error_signals_and_truncates_normal_output(self) -> None:
+        long_normal = "Created At: 2026-11-21\n" + ("normal line\n" * 100)
+        long_error = (
+            "Created At: 2026-11-21\n"
+            "Command exited with code 1\n"
+            + ("stack frame detail\n" * 60)
+            + "AssertionError: expected 200 got 500"
+        )
+        normal_step = mod.normalize_step(_make_row(4, step_type="GENERIC", content=long_normal))
+        error_step = mod.normalize_step(_make_row(5, step_type="GENERIC", content=long_error))
+        assert normal_step is not None and error_step is not None
+
+        self.assertFalse(normal_step.is_error_signal)
+        self.assertTrue(error_step.is_error_signal)
+        self.assertLessEqual(len(normal_step.normalized_text), mod.DEFAULT_GENERIC_NORMAL_CHARS + 20)
+        self.assertGreater(len(error_step.normalized_text), len(normal_step.normalized_text))
+        self.assertIn("AssertionError: expected 200 got 500", error_step.normalized_text)
+
+    def test_T05_secret_masking_removes_credentials_before_payload(self) -> None:
+        secret_content = (
+            "google=AIzaSyDummyKeyValue1234567890abcd\n"
+            "github=ghp_1234567890abcdefghijklmnop\n"
+            "openai=sk-proj1234567890abcdefghijklmnop\n"
+            "aws=AKIAIOSFODNN7EXAMPLE\n"
+            "auth=Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload\n"
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
+        )
+        step = mod.normalize_step(_make_row(2, step_type="GENERIC", content=secret_content))
+        assert step is not None
+        payload = mod.build_decision_payload([step])
+        serialized = json.dumps(payload, ensure_ascii=False)
+        for leaked in (
+            "AIzaSyDummy",
+            "ghp_123456",
+            "sk-proj123",
+            "AKIAIOSFODNN7EXAMPLE",
+            "eyJhbGci",
+            "MIIEpAIBAAKCAQEA",
+        ):
+            self.assertNotIn(leaked, serialized)
+        self.assertIn("[REDACTED]", serialized)
+
+    def test_T06_keep_recent_protects_tail_steps(self) -> None:
+        rows = [_make_row(i, content=f"step body {i}") for i in range(10)]
+        chunks, recent, warnings, truncated = mod.build_chunks(
+            rows,
+            keep_recent=4,
+            max_chars=240_000,
+            max_chunks=4,
+            max_step_chars=1200,
+            include_thinking=False,
+        )
+        self.assertEqual([s.step_index for s in recent], [6, 7, 8, 9])
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual([s.step_index for s in chunks[0]], [0, 1, 2, 3, 4, 5])
+        self.assertEqual(truncated, 0)
+        self.assertEqual(warnings, [])
+
+    def test_T07_budget_compression_and_chunk_splitting(self) -> None:
+        rows = [
+            _make_row(i, step_type="GENERIC", content=f"step {i} " + ("x" * 600))
+            for i in range(30)
+        ]
+        chunks, recent, warnings, truncated = mod.build_chunks(
+            rows,
+            keep_recent=2,
+            max_chars=1000,
+            max_chunks=2,
+            max_step_chars=1200,
+            include_thinking=False,
+        )
+        self.assertEqual(len(recent), 2)
+        self.assertEqual(len(chunks), 2)
+        self.assertGreater(truncated, 0)
+        self.assertTrue(any("チャンク数が上限" in w for w in warnings))
+        for ch in chunks:
+            self.assertLessEqual(len(ch), mod.MAX_QUESTIONS_PER_REQUEST)
+
+    def test_T08_generated_payload_passes_run_decisions_validation(self) -> None:
+        rows = [
+            _make_row(0, step_type="USER_INPUT", content="<USER_REQUEST>要件確認</USER_REQUEST>"),
+            _make_row(1, step_type="PLANNER_RESPONSE", content="方針を確定しました。"),
+            _make_row(2, step_type="GENERIC", content="Command exited with code 1\nFAILED"),
+        ]
+        steps = [s for r in rows if (s := mod.normalize_step(r)) is not None]
+        payload = mod.build_decision_payload(steps)
+        errors = run_decisions.validate_payload(payload)
+        self.assertEqual(errors, [])
+        self.assertEqual(set(payload["questions"].keys()), {"step_0000", "step_0001", "step_0002"})
+
+    def test_T09_classify_and_render_with_mock_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "transcript.jsonl"
+            rows = [
+                _make_row(0, step_type="USER_INPUT", content="<USER_REQUEST>仕様を決めたい</USER_REQUEST>"),
+                _make_row(1, content="仕様 A を採用します。"),
+                _make_row(2, step_type="GENERIC", content="Command exited with code 1\nmissing env"),
+                _make_row(3, content="src/app.py を修正済み。次はテスト追加。"),
+                _make_row(4, step_type="GENERIC", content="README の中身..."),
+                _make_row(5, content="曖昧な中間メモ"),
+                _make_row(6, content="直近の応答"),
+            ]
+            p.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
+
+            def fake_api(payload: dict, **_kwargs) -> dict:
+                return {
+                    "answers": {
+                        "step_0000": {"type": "choice", "choice": "drop_noise", "confidence": 0.90},
+                        "step_0001": {"type": "choice", "choice": "keep_decision", "confidence": 0.92},
+                        "step_0002": {"type": "choice", "choice": "keep_gotcha", "confidence": 0.88},
+                        "step_0003": {"type": "choice", "choice": "keep_state", "confidence": 0.85},
+                        "step_0004": {"type": "choice", "choice": "drop_noise", "confidence": 0.95},
+                        "step_0005": {"type": "choice", "choice": "drop_noise", "confidence": 0.55},
+                    }
+                }
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = mod.main(
+                    ["--transcript", str(p), "--keep-recent", "1", "--format", "json"],
+                    api_caller=fake_api,
+                )
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+            self.assertEqual(data["meta"]["kept_steps"], 3)
+            self.assertEqual(data["meta"]["borderline_steps"], 1)
+            self.assertEqual(data["meta"]["dropped_steps"], 2)
+            self.assertEqual(data["meta"]["recent_steps"], 1)
+            self.assertEqual([x["step_index"] for x in data["borderline"]], [5])
+
+    def test_T10_dry_run_and_error_exit_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "transcript.jsonl"
+            rows = [_make_row(i, content=f"message {i}") for i in range(4)]
+            p.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+
+            # dry-run は API キー不要で exit 0
+            out_buf = io.StringIO()
+            with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out_buf):
+                rc_dry = mod.main(["--transcript", str(p), "--keep-recent", "1", "--dry-run"])
+            self.assertEqual(rc_dry, 0)
+            self.assertIn("ペイロード検証: OK", out_buf.getvalue())
+
+            # API キー未設定時は exit 3
+            err_buf = io.StringIO()
+            with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stderr(err_buf):
+                rc_nokey = mod.main(["--transcript", str(p), "--keep-recent", "1"])
+            self.assertEqual(rc_nokey, 3)
+            self.assertIn("GEMINI_API_KEY", err_buf.getvalue())
+
+            # SafetyBlockError 時は exit 3
+            def raise_safety(*_args, **_kwargs):
+                raise run_decisions.SafetyBlockError("prompt_feedback", "SAFETY", "blocked")
+
+            err_buf2 = io.StringIO()
+            with contextlib.redirect_stderr(err_buf2):
+                rc_safety = mod.main(
+                    ["--transcript", str(p), "--keep-recent", "1"],
+                    api_caller=raise_safety,
+                )
+            self.assertEqual(rc_safety, 3)
+            self.assertIn("安全フィルタ", err_buf2.getvalue())
+
+            # ApiRequestError 時は exit 3
+            def raise_api(*_args, **_kwargs):
+                raise run_decisions.ApiRequestError(503, "service unavailable")
+
+            err_buf3 = io.StringIO()
+            with contextlib.redirect_stderr(err_buf3):
+                rc_api = mod.main(
+                    ["--transcript", str(p), "--keep-recent", "1"],
+                    api_caller=raise_api,
+                )
+            self.assertEqual(rc_api, 3)
+            self.assertIn("呼び出しに失敗", err_buf3.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

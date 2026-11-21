@@ -1,0 +1,104 @@
+---
+name: repo-drift-audit
+description: リポジトリの文書、スキル、テスト資産とコードの乖離や重複、手順の機械化余地を網羅的に洗い出し、Gemini Decision 1 による一次スクリーニングから計画と実装の 2 段サブエージェント（`run_workflow` または `invoke_subagent`）へ振る手順。走査観点のカタログ、一次スクリーニング CLI（`docs`、`backlog`、`candidates`）、計画ファンアウトと実装ファンアウトの構成、排他ファイル境界とトラック分割、集約書の形式、リファクタ系の検証技法を扱う。リポジトリ全体のドリフト監査や大掛かりな構造整理を計画するときに使用する。不要テストの判定基準と一次フィルタは test-suite-pruning、Decisions API の一般仕様は gemini-decisions-api、実装差分の不変条件検査は invariant-gate、要協議の提示形式は requirements-definition、動的ワークフローの記法は builtin の run-workflow に委ねる。
+---
+
+# リポジトリの網羅的ドリフト監査と 2 段ファンアウト
+
+リポジトリの文書、スキル、テスト資産がコードからずれていないか、重複や構造上の問題がないかを網羅的に洗い出す作業は、サブエージェントへの 2 段の振り分けで進める。
+計画フェーズで各項目の計画書を集めてユーザーに採択させ、実装フェーズで採択項目を並列に実装させる。
+ゴールは、洗い出しから修正までを一連の流れとして進めつつ、採否の判定をユーザーへ返す地点を一箇所に集約することである。
+
+## 責任範囲の境界
+
+- **Decisions API の一般仕様と汎用バッチ CLI**：`gemini-decisions-api` に委ねる。
+  - 本スキルではリポジトリの文書、残課題帳簿、第一走査候補の一次スクリーニングに特化した `scripts/screen_drift_decision1.py` だけを提供する。
+- **実装差分の不変条件検査**：実装フェーズおよび統合後の `git diff` とリポジトリ内ルール文書の突合は `invariant-gate` に委ねる。
+- **不要テストの判定と整理**：テスト資産の棚卸しにおける不要テストや重複テストの判定基準、Decision 1 保護対象フィルタ（`scripts/screen_tests_decision1.py`）、統合、孤立補助コードの掃除は `test-suite-pruning` に委ねる。
+- **要協議の提示形式**：自律適用と要協議の切り分け、推奨案つき選択肢の形式は `requirements-definition` に従う。
+- **並列実行と監視**：ワーカーの起動、ワークスペース分離、進捗待機、構造化出力の回収は builtin の `run-workflow`（`agent`、`parallel`、`phase`）または `invoke_subagent` に委ねる。
+- **トラック分割と排他ファイル境界**：実装フェーズにおけるファイルの排他割り当てとファサード化の規則は本スキル内で定める。
+
+## 走査観点
+
+監査の第一走査で見る領域は次の 8 群である。
+リポジトリの構成に合わせて取捨選択する。
+
+- **文書ドリフト**：状況記述行の陳腐化、構造図と節番号参照のずれ、廃止用語、README の不一致。
+- **残課題帳簿との突合**：解消済みの項目と、直近の作業で未記録になった項目。
+- **仕様 ID と実装の機械照合**：文書側の仕様 ID とコード側の ID トークンを正規表現で両方向に抽出し、死んだ仕様行、未登録 ID、同名衝突、改番に分類する。
+  - 決定論的照合で完結するため、確率判定には回さない。
+- **スキル陳腐化**：`.agents/skills`、`.gemini/config`、プラグインスキル、ルール文書の記述と現行コードの比較。
+  UI や運用が変わった箇所を重点的に見る。
+- **重複**：ファイル単位の重複、スケルトン構造の類似、CSS セレクタなどの共有化余地。
+  - ハッシュ比較や静的解析で先に検出し、全ファイル対を確率判定へ送らない。
+- **構造**：大きいファイルの責務評価。
+  1 PR や 1 トラックに収まる分割だけを項目化し、全面再設計が要るものは項目にしない。
+- **機械化の検討**：スキルや手順書に文書化された作業手順を工程単位で点検し、出力が入力と規約から一意に決まる決定論的な工程をスクリプト化の候補として洗い出す。
+  内容の判断や執筆が要る工程はモデル側に残す分離を目安とし、配置、記帳、採番のように規約どおりに定まる作業だけを項目化する。
+- **テスト資産の棚卸し**：廃止仕様のテスト、空アサーション、実装密結合、重複テスト、孤立したテスト補助コード。
+  判定基準と一次フィルタ、削除や統合の手順は `test-suite-pruning` に従う。
+
+## 手順
+
+1. 親エージェントが第一走査を自分で行い、各候補項目に根拠となる証拠（ファイル、行番号、観測した症状）を添えて列挙する。
+   - 対象となる文書、スキル、残課題項目、または第一走査候補が多い場合（目安 10 件以上）は、任意で同梱の `scripts/screen_drift_decision1.py` を使い、Gemini Decision 1（`gemini-decision-1`、出力トークン 0）で優先順位付けや事前分類を行える。
+   - `docs` モードはリポジトリ構成、直近の履歴要約、文書内パスの不在ヒントを添えて各文書を評価し、`prioritize_for_audit`、`mechanization_candidate`、`low_priority_clean` へ仕分ける（非 Git 環境ではファイル走査へ切り替える）。
+   - `backlog` モードは残課題帳簿の未完了項目（`- [ ]` または JSON）を共有スナップショットへ 1 リクエスト（最大 1,000 問）で一括突合し、解消済み疑い項目を抽出する。
+   - `candidates` モードは第一走査候補の JSON 配列を `plan_worker_autonomous` や `plan_worker_discussion` などへ振り分け、低信頼度や要協議疑いを `needs_parent_review: true` へ上げる。
+   - `.env` 系（雛形を除く）や秘密鍵ヘッダおよび主要 API トークンの混入時、また入力文字数や 1,000 問の上限超過時は API 送信前に終了コード `2` で遮断される。
+   - Decision 1 は確率に基づく一次スクリーニングであり、出力だけで乖離の有無や行番号を断定せず、`low_priority_clean` もゼロ乖離の保証としては扱わない。
+   - 証拠の行番号と症状は親エージェントまたは計画ワーカーが実ファイルから確定する。
+
+```powershell
+$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
+# 1. キー不要のドライラン（docs / backlog / candidates）
+python ~/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --repo . --dry-run --format table
+python ~/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py backlog --backlog docs/BACKLOG.md --repo . --dry-run --format table
+python ~/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py candidates --input candidates.json --dry-run --format table
+
+# 2. 実 API による一次スクリーニング（GEMINI_API_KEY を参照）
+python ~/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --repo . --format table
+python ~/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py backlog --backlog docs/BACKLOG.md --repo . --format table
+```
+
+2. 計画フェーズとして、`run_workflow` の `parallel()`（または `invoke_subagent` の `research`）で各項目を 1 ワーカーへ割り当てる。
+   - プロンプトは同ディレクトリの `child-prompts.md` の計画ワーカー定型を使い、現行ブランチで証拠を再検証させたうえで計画書を `<Artifact Directory Path>/scratch/plans/<slug>.md` に書かせる。
+   - `finish` スキーマ（`{summary, plan_path, recommendation, requires_discussion, out_of_scope_findings}`）で構造化出力を回収する。
+3. ワーカーから返った計画書を集約書 Artifact（`<Artifact Directory Path>/drift-audit-summary.md`）1 文書にまとめる。
+   - 総表、推奨案つき要協議一覧、自律適用一覧、ワーカーの新規発見、実施順序と競合予測を含める。
+4. ユーザーに採択を仰ぎ、採択された項目だけを実装フェーズへ進める。
+5. 実装フェーズでは排他ファイル境界を設計してから、採択項目を 1 ワーカー 1 トラックで並列に実装させる。
+   - 触るファイルを列挙し、同一ファイルを触る変更は同一トラックへ集約する。
+   - 他トラック所有のファイルを変更せずに済むか検討し、避けられない呼び出しは公開シグネチャを維持したファサード化（薄い委譲層の追加）で吸収する指定を計画へ入れる。
+   - `run_workflow` の `parallel()` で `agent(..., workspace="share")`（PR 単位で独立クローンする場合は `workspace="branch"`）として割り当てる。
+   - 計画書の絶対パスをプロンプトで渡し、`child-prompts.md` の実装ワーカー定型に沿って lint、typecheck、test の全パス、ブランチコミットまたは PR 作成、`finish` スキーマ（`{summary, branch_or_pr, test_status, notes, blockers}`）での報告を完了条件にする。
+   - 各トラックのコミットや PR 作成前には、任意で `invariant-gate`（`check_invariants_decision1.py`）を併用して実装差分の規約違反を確認できる。
+6. 各ワーカーの出力を回収し、ブランチの統合（または PR 一覧）と、見送った事項に先送り理由と再検討条件を添えた残課題をユーザーへ報告する。
+
+## 設計の要点
+
+- 渡した証拠はワーカーに必ず再検証させる。
+  親の走査は行番号ずれや誤検出を含みうるため、ワーカーが証拠を訂正したり新規発見を加えたりすることを前提にする。
+- Decision 1 による一次スクリーニングは探索順とワーカー配分の最適化に使い、行番号や実態の確認を省略しない。
+- 範囲外の発見は潰さず `out_of_scope_findings` で集約へ返させ、計画フェーズの副産物として拾う。
+- Phase 番号、仕様決定 ID、テスト ID などの採番は計画書では仮採番と明記し、先行ブランチや先行 PR のマージ後に確定する。
+- 複数トラックが同じファイルの別箇所を触る必要がある場合は、同一トラックへまとめるか、集約書に統合順と競合予測を添える。
+- PR やコード変更以外の作業（プラグイン設定の更新、外部サービスの設定変更、ユーザー確認が必要な作業）はワーカーに振らず親エージェントが直接行う。
+- 計画書と集約書はリポジトリ外（`<Artifact Directory Path>/scratch/plans/` および `<Artifact Directory Path>/`）に置き、作業対象リポジトリに一時計画書を残さない。
+- ワーカーが `run_workflow` の `workspace="share"` や `"branch"` で変更したブランチは、親が差分やテスト結果を確認してから作業コピーへ統合するか PR 化する。
+
+## リファクタ系トラックの検証技法
+
+挙動不変を前提とする構造整理は、移動のみであることを機械的に示せると確認が早い。
+
+- **行多重集合照合**：新旧ファイルの全行をソートした多重集合で diff を取り、追加行と削除行がないことを示す。
+  行の増減がないことの確認にとどまり、行の並べ替えによる挙動変更は検出できないため、移動単位の内部順序が保たれていることは別途差分で確認する。
+- **A/B 実機比較**：ブランチ版と基準ブランチの作業コピーを並べ、同じ操作を通して出力が完全一致することを確認する。
+
+## 原則
+
+- 監査は証拠つきの候補列挙であり、第一走査で結論を確定せず、確定はワーカーの再検証とユーザーの採択に任せる。
+- 2 段構成で洗い出しと掘り下げを分離し、ユーザーが採否を決める地点を一箇所に集約する。
+- ワーカーが親の証拠を訂正することは設計どおりの動作であり、訂正と新規発見は集約書の「ワーカーの発見」節に集める。
+- 並列実装は「このワーカーだけが触る」ファイル集合が重ならないことを前提とし、分割は機能ではなくファイル所有で行う。
