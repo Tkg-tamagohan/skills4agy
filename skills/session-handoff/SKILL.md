@@ -17,16 +17,27 @@ description: 現在のセッションを安全に区切り、新しいセッシ�
 
 ## 手順
 
-1. 軽量な現状確認だけを行う。
-   - `git status -s` や `git diff --stat`、直近の会話で確定した事項の確認にとどめる。
+1. 軽量な現状確認と長大履歴の事前選別を行う。
+   - `git status -s` と `git diff --stat` を実行し、直近の会話で確定した事項を確認する。
    - この段階で新たな大規模ファイル探索、長時間のビルド、重いテスト実行は行わない。
-   - 会話が長大で過去の決定事項や失敗パターンの取りこぼしを防ぎたい場合は、同梱 CLI で `transcript.jsonl` を事前選別して素材を得てよい。
+   - 次の省略条件に該当する場合を除き、同梱の Decision 1 事前選別 CLI を 1 回実行して `transcript.jsonl` から重要ステップを抽出する。
+     - 直前に要件定義書、計画書、決定記録 Artifact 等へ確定仕様、対象ファイル、次の一手のすべてを総括済みであり、その後に新たな調査や試行錯誤が発生していない場合。
+     - 開始から数ターン以内の明白な短会話で、過去の決定事項や失敗パターンの取りこぼし余地がない場合（判断に迷う場合は CLI 側のしきい値判定へ委ねる）。
+     - ユーザーが手動要約のみを指定した場合。
+   - 通常時は `--min-steps 80 --min-bytes 150000` を付けて実行し、80 ステップ以上または 150 KB 以上の会話を選別対象にする（両方未満の短会話では API を呼ばず 0 コストで自動スキップされるため、そのまま手動確認のみで次手順へ進む）。
+   - コンテキスト圧縮（`/compact` や自動圧縮）の発生後はステップ数やサイズにかかわらず前半の決定事項が欠落しているため、`--min-steps` と `--min-bytes` を外して強制実行する。
+   - `--conversation-id` には `<user_information>` の `Conversation ID` を指定し、並列セッションやサブエージェント稼働時に別会話を誤認するおそれがある `--latest` は使用しない。
+   - 作業ディレクトリに依存しないよう `"$HOME/.gemini/config/plugins/shared-skills/..."` 形式で呼び出すか、`Available skills` に提示される本スキルの絶対パスから同階層の `scripts/triage_transcript_decision1.py` を解決する。
+   - `App Data Directory` が既定の `~/.gemini/antigravity` と異なる環境では `--app-data-dir <path>` を併用する。
      ```powershell
      $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-     python skills/session-handoff/scripts/triage_transcript_decision1.py --conversation-id <conversation-id>
+     # 通常実行（80 ステップ以上または 150 KB 以上なら選別し、両方未満なら API 非呼び出しでスキップ）
+     python "$HOME/.gemini/config/plugins/shared-skills/skills/session-handoff/scripts/triage_transcript_decision1.py" --conversation-id <conversation-id> --min-steps 80 --min-bytes 150000
+     # コンテキスト圧縮発生後の強制実行（しきい値なし）
+     python "$HOME/.gemini/config/plugins/shared-skills/skills/session-handoff/scripts/triage_transcript_decision1.py" --conversation-id <conversation-id>
      ```
-   - CLI はシークレットをマスクした上で 1 回の Decision 1 呼び出しにより各ステップを `keep_decision`、`keep_gotcha`、`keep_state`、`drop_noise` へ分類し、末尾の直近ステップを無条件保護して Markdown で出力する。
-   - `GEMINI_API_KEY` 未設定や通信エラー・安全フィルタ遮断（終了コード `3`）のときは、そのまま従来の手動確認へフォールバックする。
+   - CLI はシークレットをマスクした上で 1 回の Decision 1 呼び出し（出力トークン 0）により各ステップを `keep_decision`、`keep_gotcha`、`keep_state`、`drop_noise` へ分類し、末尾の直近ステップを無条件保護して Markdown で出力する。
+   - `GEMINI_API_KEY` 未設定、通信エラー、安全フィルタ遮断（終了コード `3`）、またはしきい値未満スキップのときは、そのまま従来の手動確認へフォールバックする。
    - API キー不要で前処理結果とペイロードを点検するときは `--dry-run` を付ける。
 2. 次の圧縮ルールに従って引き継ぎメモを作成する。
    - 出力全体は 1,500〜2,500 トークン程度を目安に簡潔にまとめる。
@@ -103,6 +114,6 @@ description: 現在のセッションを安全に区切り、新しいセッシ�
 
 ## 原則
 
-- 引き継ぎメモの作成自体でコンテキストや時間を浪費しない。
+- 引き継ぎメモの作成自体でコンテキストや時間を浪費しないため、大規模なコード再探索や重いテストは避け、長大履歴の振り返りは出力トークン 0 の同梱 CLI に委ねる。
 - 未指定で作業リポジトリ内に一時ファイルを残さない。
 - 一時対応の数値目安やモデル名は恒久手順と分離し、事象解消後に撤去できる形を保つ。

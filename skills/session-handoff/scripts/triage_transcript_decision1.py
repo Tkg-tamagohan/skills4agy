@@ -554,6 +554,51 @@ def render_markdown(
     return "\n".join(lines) + "\n"
 
 
+def should_skip_below_threshold(
+    *,
+    row_count: int,
+    file_bytes: int,
+    min_steps: int,
+    min_bytes: int,
+) -> bool:
+    """--min-steps と --min-bytes の設定に基づきスキップ対象かを判定する。"""
+    if min_steps <= 0 and min_bytes <= 0:
+        return False
+    below_steps = True if min_steps <= 0 else row_count < min_steps
+    below_bytes = True if min_bytes <= 0 else file_bytes < min_bytes
+    return below_steps and below_bytes
+
+
+def render_skipped_markdown(
+    *,
+    transcript_path: Path,
+    row_count: int,
+    file_bytes: int,
+    min_steps: int,
+    min_bytes: int,
+    warnings: list[str],
+    dry_run: bool = False,
+) -> str:
+    """しきい値未満スキップ時の構造化 Markdown を生成する。"""
+    step_cond = f"{min_steps} 件未満" if min_steps > 0 else "未指定"
+    byte_cond = f"{min_bytes} バイト未満" if min_bytes > 0 else "未指定"
+    lines: list[str] = [
+        "# Transcript Triage Result (Skipped Below Threshold)",
+        "",
+        "## Summary",
+        f"- transcript: `{transcript_path}`",
+        f"- 有効ステップ数: {row_count} 件（しきい値: {step_cond}）",
+        f"- ファイルサイズ: {file_bytes} バイト（しきい値: {byte_cond}）",
+        "- 判定: しきい値を下回ったため Decisions API 呼び出しをスキップしました（API 呼び出し: 0 回）",
+        "- 次の一手: 通常の軽量確認のみで引き継ぎメモを作成してください（コンテキスト圧縮後などで強制選別する場合は `--min-steps` と `--min-bytes` を外して再実行してください）。",
+    ]
+    if dry_run:
+        lines.append("- dry_run: true（前処理とペイロード構築前にスキップしました）")
+    for warn in warnings:
+        lines.append(f"- 警告: {warn}")
+    return "\n".join(lines) + "\n"
+
+
 def render_json_result(
     *,
     transcript_path: Path,
@@ -565,6 +610,11 @@ def render_json_result(
     truncated_old_steps: int,
     dry_run: bool = False,
     chunk_stats: list[dict[str, Any]] | None = None,
+    skipped_below_threshold: bool = False,
+    transcript_steps: int | None = None,
+    transcript_bytes: int | None = None,
+    min_steps: int = 0,
+    min_bytes: int = 0,
 ) -> dict[str, Any]:
     """機械処理用の構造化 JSON 辞書を生成する。"""
 
@@ -593,20 +643,30 @@ def render_json_result(
     borderline = [c for c in classified if c.is_borderline]
     dropped = [c for c in classified if c.choice == "drop_noise" and not c.is_borderline]
 
+    meta: dict[str, Any] = {
+        "transcript_path": str(transcript_path),
+        "dry_run": dry_run,
+        "skipped_below_threshold": skipped_below_threshold,
+        "api_calls": api_calls,
+        "evaluated_steps": len(classified),
+        "kept_steps": len(kept),
+        "borderline_steps": len(borderline),
+        "dropped_steps": len(dropped),
+        "recent_steps": len(recent_steps),
+        "truncated_old_steps": truncated_old_steps,
+        "drop_borderline": drop_borderline,
+        "warnings": warnings,
+    }
+    if transcript_steps is not None:
+        meta["transcript_steps"] = transcript_steps
+    if transcript_bytes is not None:
+        meta["transcript_bytes"] = transcript_bytes
+    if min_steps > 0 or min_bytes > 0:
+        meta["min_steps"] = min_steps
+        meta["min_bytes"] = min_bytes
+
     result: dict[str, Any] = {
-        "meta": {
-            "transcript_path": str(transcript_path),
-            "dry_run": dry_run,
-            "api_calls": api_calls,
-            "evaluated_steps": len(classified),
-            "kept_steps": len(kept),
-            "borderline_steps": len(borderline),
-            "dropped_steps": len(dropped),
-            "recent_steps": len(recent_steps),
-            "truncated_old_steps": truncated_old_steps,
-            "drop_borderline": drop_borderline,
-            "warnings": warnings,
-        },
+        "meta": meta,
         "kept": [serialize_classified(c) for c in kept],
         "borderline": [] if drop_borderline else [serialize_classified(c) for c in borderline],
         "dropped": [serialize_classified(c) for c in dropped],
@@ -697,6 +757,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"API タイムアウト秒数（既定: {DEFAULT_TIMEOUT}）",
     )
     parser.add_argument(
+        "--min-steps",
+        type=int,
+        default=0,
+        help="評価を実行する最小有効ステップ行数（--min-bytes も未達なら API 非呼び出しでスキップ、既定: 0 で無効）",
+    )
+    parser.add_argument(
+        "--min-bytes",
+        type=int,
+        default=0,
+        help="評価を実行する transcript.jsonl の最小バイト数（--min-steps も未達なら API 非呼び出しでスキップ、既定: 0 で無効）",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="API 呼び出しを行わず前処理とペイロード検証のみ実行する",
@@ -714,6 +786,9 @@ def main(
 
     if args.keep_recent < 0:
         print("エラー: --keep-recent は 0 以上を指定してください。", file=sys.stderr)
+        return 2
+    if args.min_steps < 0 or args.min_bytes < 0:
+        print("エラー: --min-steps と --min-bytes は 0 以上を指定してください。", file=sys.stderr)
         return 2
     if not (0.0 <= args.min_confidence <= 1.0):
         print("エラー: --min-confidence は 0.0 から 1.0 の範囲で指定してください。", file=sys.stderr)
@@ -738,7 +813,49 @@ def main(
         print(f"エラー: {exc}", file=sys.stderr)
         return 2
 
+    file_bytes = transcript_path.stat().st_size
     raw_rows, parse_warnings = load_transcript_raw_rows(transcript_path)
+    json_meta_kwargs: dict[str, Any] = {
+        "transcript_path": transcript_path,
+        "drop_borderline": args.drop_borderline,
+        "transcript_steps": len(raw_rows),
+        "transcript_bytes": file_bytes,
+        "min_steps": args.min_steps,
+        "min_bytes": args.min_bytes,
+    }
+    if should_skip_below_threshold(
+        row_count=len(raw_rows),
+        file_bytes=file_bytes,
+        min_steps=args.min_steps,
+        min_bytes=args.min_bytes,
+    ):
+        if args.format == "json":
+            out = render_json_result(
+                **json_meta_kwargs,
+                classified=[],
+                recent_steps=[],
+                warnings=parse_warnings,
+                api_calls=0,
+                truncated_old_steps=0,
+                dry_run=args.dry_run,
+                skipped_below_threshold=True,
+            )
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        else:
+            print(
+                render_skipped_markdown(
+                    transcript_path=transcript_path,
+                    row_count=len(raw_rows),
+                    file_bytes=file_bytes,
+                    min_steps=args.min_steps,
+                    min_bytes=args.min_bytes,
+                    warnings=parse_warnings,
+                    dry_run=args.dry_run,
+                ),
+                end="",
+            )
+        return 0
+
     chunks, recent_steps, chunk_warnings, truncated_old = build_chunks(
         raw_rows,
         keep_recent=args.keep_recent,
@@ -775,11 +892,10 @@ def main(
     if args.dry_run:
         if args.format == "json":
             out = render_json_result(
-                transcript_path=transcript_path,
+                **json_meta_kwargs,
                 classified=[],
                 recent_steps=recent_steps,
                 warnings=warnings,
-                drop_borderline=args.drop_borderline,
                 api_calls=0,
                 truncated_old_steps=truncated_old,
                 dry_run=True,
@@ -791,7 +907,7 @@ def main(
             total_chars = sum(c["input_chars"] for c in chunk_stats)
             print("# Transcript Triage Dry-Run")
             print(f"- transcript: `{transcript_path}`")
-            print(f"- 総行数（有効 JSON）: {len(raw_rows)} 件")
+            print(f"- 総行数（有効 JSON）: {len(raw_rows)} 件（サイズ: {file_bytes} バイト）")
             print(f"- 評価対象ステップ: {total_eval} 件（チャンク数: {len(chunk_stats)}、合計入力文字数: {total_chars}）")
             print(f"- 直近保護ステップ: {len(recent_steps)} 件")
             for stat in chunk_stats:
@@ -808,11 +924,10 @@ def main(
     if not chunks:
         if args.format == "json":
             out = render_json_result(
-                transcript_path=transcript_path,
+                **json_meta_kwargs,
                 classified=[],
                 recent_steps=recent_steps,
                 warnings=warnings,
-                drop_borderline=args.drop_borderline,
                 api_calls=0,
                 truncated_old_steps=truncated_old,
             )
@@ -874,11 +989,10 @@ def main(
 
     if args.format == "json":
         out = render_json_result(
-            transcript_path=transcript_path,
+            **json_meta_kwargs,
             classified=all_classified,
             recent_steps=recent_steps,
             warnings=warnings,
-            drop_borderline=args.drop_borderline,
             api_calls=api_calls,
             truncated_old_steps=truncated_old,
         )
