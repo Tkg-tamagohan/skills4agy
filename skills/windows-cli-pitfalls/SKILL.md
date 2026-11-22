@@ -191,6 +191,6 @@ Git Bash と Windows プロセスを併用する場合、Git Bash では `$TEMP`
 - 文字化けや `Bad unicode escape` はシェル引数やパイプの文字コードを疑い、`--body-file` や `git commit -F` にはリポジトリ外へ作成した BOM なし UTF-8 一時ファイルを渡して実行後に削除し、GraphQL ミューテーションは Python の `subprocess.run` へ逃がす。
 - 短いワンライナーは外側を二重引用、内側を単一引用にし、シングルクォート内に二重引用符を含む `--jq` 式や `$`、`\"`、バックスラッシュを含む処理は `scratch/*.py` へ保存して `json.loads` 等で処理する。
 - Python 由来の decode と encode のエラーは `$env:PYTHONUTF8="1"` と `$env:PYTHONIOENCODING="utf-8"` で環境側を直す（共有スクリプト自体に環境依存の差分を入れない）。
-- 状態変更コマンド（`git commit` 等）と読み取り確認コマンドや一般の制御構文は 1 回の `run_command` に連結せず別呼び出しに分け、確認判定とコマンド許可の粒度を保つ（ワークツリーへのローカル `Set-Location`、`origin` の非保護ブランチへの通常 `git push`、`if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` の定型連結は `pretool_guard.py` の第 1 段ホワイトリスト対象）。
+- 状態変更コマンド（`git commit` 等）と読み取り確認コマンドや一般の制御構文は 1 回の `run_command` に連結せず別呼び出しに分け、確認判定とコマンド許可の粒度を保つ（ワークツリーへのローカル `Set-Location`、`origin` の非保護ブランチを明示した通常 `git push origin <branch>`、`if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` の定型連結は `pretool_guard.py` の第 1 段ホワイトリスト対象）。
 - PowerShell 5.1 で BOM なし UTF-8 を読むときは `Get-Content -Encoding UTF8` または `[System.IO.File]::ReadAllText` を使い、`Start-Process -ArgumentList` の空白パスは内側ダブルクォートで囲む。
 - PowerShell 5.1 の `-Command` 等で `.NET` メソッドを呼ぶときは `$ErrorActionPreference = 'Stop'` と `try/finally` で例外時に失敗終了させる。

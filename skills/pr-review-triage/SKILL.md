@@ -72,7 +72,7 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts
 1. コミットと push の前に作成する返信ドラフトでは、「既コミット分のみで完結する本文」と「未コミット変更を push した後に `<次コミットハッシュ>` を差し替えて追記する本文」を厳密に区別する。
 2. ユーザーから反映指示を受けたら、次の順序で実行する（`git push --force` と既定ブランチへの直接 push は行わない）。
    1. `git branch --show-current` と `git status -sb` で対象ブランチと変更ファイル集合が想定どおりであることを確認し、対象ファイルのみ明示的に `git add` する。
-   2. リポジトリ外（`$env:TEMP` や `scratch/`）へ UTF-8（BOM なし）の一時ファイルを作成して `git commit -F` でコミットし、通常 `git push` して新コミットハッシュ（短縮とフル）を確定させる。
+   2. リポジトリ外（`$env:TEMP` や `scratch/`）へ UTF-8（BOM なし）の一時ファイルを作成して `git commit -F` でコミットし、`git push origin <branch>` でリモートと対象ブランチを明示して push し、新コミットハッシュ（短縮とフル）を確定させる。
    3. 確定ハッシュを差し替えた日本語返信を Python の `subprocess.run(..., encoding="utf-8")` から GraphQL `addPullRequestReviewThreadReply` で投稿し、対応スレッドを `resolveReviewThread` で Resolve する。
    4. 今回解決または合意した指摘から再発防止策（新規、`active` 改訂、不要化した `retired`）を抽出し、`pr_guardrails.py render --items guardrails.json --existing pr.json` で検証済みマーカーブロックを生成して、新コミットハッシュ、対応指摘（diff 外総評指摘を含む）、追加または改訂したテスト ID 一覧、標準検証コマンドの実測結果、未検証範囲をまとめた日本語サマリコメント末尾へ含め、`gh pr comment --body-file` で投稿する。
    5. PR マージ後もリポジトリ全体で守るべき恒久化候補がある場合は、リポジトリ内ファイルを勝手に編集せず、Stage 3 の完了報告で反映先案（`AGENTS.md`、`.agents/rules/`、`.agents/invariants.json` 等）を提案のみ提示する。
