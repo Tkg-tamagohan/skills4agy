@@ -426,6 +426,12 @@ def validate_plugin_json(data: object) -> List[str]:
         elif not value.strip():
             errors.append(f"{PLUGIN_JSON_LABEL}: {key} がありません")
 
+    version = data.get("version")
+    if isinstance(version, str) and version.strip() and semver_tuple(version) is None:
+        errors.append(
+            f"{PLUGIN_JSON_LABEL}: version が SemVer(X.Y.Z) ではありません({version})"
+        )
+
     for key in PLUGIN_JSON_OPTIONAL_STRING_FIELDS:
         if key not in data:
             continue

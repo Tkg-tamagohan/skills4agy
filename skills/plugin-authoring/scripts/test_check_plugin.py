@@ -30,7 +30,7 @@ def valid_manifest(**overrides):
 
 
 class TestPluginJsonValidation(unittest.TestCase):
-    """plugin.json の型検査(CP-01〜CP-12)"""
+    """plugin.json の型検査(CP-01〜CP-12, CP-30)"""
 
     def assert_valid(self, data):
         self.assertEqual([], check_plugin.validate_plugin_json(data))
@@ -241,6 +241,14 @@ class TestPluginJsonValidation(unittest.TestCase):
         for data in ([], "plugin.json", None):
             with self.subTest(data=data):
                 self.assert_invalid(data, "JSON のトップレベルがオブジェクトではありません")
+
+    def test_cp_30_versionがSemVer形式でない場合は検出する(self):
+        for bad in ("0.4.14-beta", "1.2", "1.2.x", "v1.2.3", " 1.2.3 "):
+            with self.subTest(bad=bad):
+                self.assert_invalid(valid_manifest(version=bad), "SemVer(X.Y.Z)")
+        for good in ("0.4.14", "1.0.0"):
+            with self.subTest(good=good):
+                self.assert_valid(valid_manifest(version=good))
 
 
 SAMPLE_README = """# test plugin

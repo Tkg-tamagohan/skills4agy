@@ -39,6 +39,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           python - <<'PY'
+          import json
           import os
           import subprocess
 
@@ -51,6 +52,31 @@ jobs:
               with open(output_path, "a", encoding="utf-8") as f:
                   f.write(f"require_version_bump={'true' if require_bump else 'false'}\n")
                   f.write(f"base_sha={base}\n")
+
+          def reject_non_json_constant(value: str) -> None:
+              raise ValueError(f"Invalid JSON constant: {value}")
+
+          def load_plugin_version(rev: str) -> tuple[bool, str | None]:
+              res = subprocess.run(
+                  ["git", "show", f"{rev}:plugin.json"],
+                  capture_output=True,
+                  check=False,
+              )
+              if res.returncode != 0:
+                  return False, None
+              try:
+                  data = json.loads(
+                      res.stdout.decode("utf-8"),
+                      parse_constant=reject_non_json_constant,
+                  )
+              except (UnicodeDecodeError, ValueError):
+                  return False, None
+              if not isinstance(data, dict):
+                  return False, None
+              ver = data.get("version")
+              if not isinstance(ver, str):
+                  return False, None
+              return True, ver
 
           if event_name != "pull_request":
               write_outputs(False, "")
@@ -82,6 +108,11 @@ jobs:
               path in versioned_exact or path.startswith(versioned_prefixes)
               for path in raw_paths
           )
+          if not require_bump and "plugin.json" in raw_paths:
+              base_ok, base_ver = load_plugin_version(base_sha)
+              head_ok, head_ver = load_plugin_version(head_sha)
+              if not base_ok or not head_ok or base_ver != head_ver:
+                  require_bump = True
           print("Changed files:", raw_paths)
           print("require_version_bump:", require_bump)
           write_outputs(require_bump, base_sha)
@@ -151,13 +182,19 @@ jobs:
               py_compile.compile(rel, doraise=True)
           print(f"[PASS] py_compile: {len(py_files)} files")
 
+          def reject_non_json_constant(value: str) -> None:
+              raise ValueError(f"Invalid JSON constant: {value}")
+
           json_files = ls_files("*.json")
           if not json_files:
               print("ERROR: no JSON files found")
               sys.exit(1)
           for rel in json_files:
               text = pathlib.Path(rel).read_text(encoding="utf-8")
-              json.loads(text)
+              try:
+                  json.loads(text, parse_constant=reject_non_json_constant)
+              except ValueError as exc:
+                  sys.exit(f"[FAIL] {rel}: {exc}")
           print(f"[PASS] json.loads: {len(json_files)} files")
 
           text_exts = {".md", ".py", ".json", ".yml", ".yaml", ".txt"}
