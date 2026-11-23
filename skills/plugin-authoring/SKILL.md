@@ -1,6 +1,6 @@
 ---
 name: plugin-authoring
-description: shared-skills プラグインにルールやスキルを追加または変更する手順。置き場所(rules/AGENTS.md、rules/、skills/)の判断、粒度と構成の指針、テンプレートからの作成、plugin.json のバージョン更新、構造検査、全スキル横断の単体テスト実行を扱う。共有すべきルールやスキルを新規作成する、既存のものを統合または分離する、または shared-skills プラグインを編集するときに使用する。日本語の文体規範は japanese-tech-writing に委ねる。
+description: shared-skills プラグインにルールやスキルを追加または変更する手順。置き場所(rules/AGENTS.md、rules/、skills/)の判断、粒度と構成の指針、テンプレートからの作成、plugin.json のバージョン更新、構造検査、全スキル横断の単体テスト実行を扱う。共有すべきルールやスキルを新規作成する、既存のものを統合または分離する、または shared-skills プラグインを編集するときに使用する。日本語の文体規範は japanese-tech-writing に、コンテキスト制御ルール改訂前後の定量計測は session-context-audit に委ねる。
 ---
 
 # shared-skills へのルールとスキルの追加と変更
@@ -20,6 +20,7 @@ description: shared-skills プラグインにルールやスキルを追加ま�
   - 置き場所と粒度の判断、description と本文の執筆だけがモデルの仕事である。
 - **全スキル横断の単体テスト**：`skills/` 配下には `__init__.py` を置かず、各スキルのスクリプトが自身のディレクトリ前提のインポートを使う構成となっている。
   - 一括実行と 0 件通過の抑止は `scripts/run_all_tests.py` が担う。
+- **コンテキスト制御の効果測定**：`rules/AGENTS.md` などコンテキスト制御ルール改訂前後の定量計測は `session-context-audit` に委ねる。
 
 ## 手順
 
@@ -47,3 +48,16 @@ description: shared-skills プラグインにルールやスキルを追加ま�
 
 統合や分離を判断するときも `guidelines.md` の基準に従う。
 改名や移動を含む変更では、README、他ファイルからの参照、および `plugin.json` のバージョンをあわせて更新する。
+
+### コンテキスト制御ルール改訂時の PDCA 判定チェックリスト（任意）
+
+`rules/AGENTS.md` などセッション全体の読込や出力制御に関わるルールを改訂するときは、感覚に頼らず前後比較で効果を確かめる。
+具体的な CLI 引数と指標定義は `session-context-audit` に従う。
+
+1. 改訂コミットの時刻（TZ 付き ISO 8601）を `--cutoff` 基準点として控える。
+2. 改訂後に `[low-n]` が解消される程度のセッション数が溜まった段階で、`session-context-audit`（`--scope parent`、必要に応じて `--only-with-edits` と `--scope subagent`）を実行する。
+3. 次の 4 点を点検してから、ルールの追加修正や緩和を判断する。
+   - [ ] 狙った行動指標（`blind_large_code_read_rate`、`search_before_read_rate` など）が改善したか
+   - [ ] 対価指標（`turns_to_first_edit`、`redundant_reread_rate`、`edit_error_rate`）に許容外の悪化がないか
+   - [ ] 主要モデル別表（必要時は `--classify-decision1` のタスク種別層別）でモデル構成比やタスク重量化の交絡を除いても同傾向か
+   - [ ] 対価指標の悪化が計測スクリプト側の定義バイアスではなく実挙動の変化によるものか

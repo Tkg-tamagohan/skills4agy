@@ -1,6 +1,6 @@
 ---
 name: pr-review-triage
-description: PR のレビュー指摘を現行コードとコミット履歴、GitHub GraphQL スレッドおよびレビュー総評本文と照合して 3 区分へトリアージし、一次照合の完了時点で調査を打ち切り、PR 内再発防止策の回収と複数セッション（`/boost`、`/swarm`）のブリーフ引き継ぎ、`invariant-gate` 連携による退行一次検査、既コミットと未コミットを厳密分離した返信、コミットと push、GraphQL によるスレッド Resolve、Stage 3 サマリコメントへの再発防止策累積記録と恒久ルール昇格候補の提示、および機械的事後検証までを進める手順。PR レビュー指摘の一括トリアージ、修正計画の分別、未 Resolve スレッド整理を行うときに使用する。仕様判断と要協議提示は requirements-definition、別セッション移行と承認誤着工防止は session-phase-split、実装および PR 更新前へ分離する常駐システム境界監査は systems-pre-pr-audit、実装差分との機械突合は invariant-gate、Windows 環境での gh と git 実行は windows-cli-pitfalls に委ねる。
+description: PR のレビュー指摘を現行コードとコミット履歴、GitHub GraphQL スレッドおよびレビュー総評本文と照合して 3 区分へトリアージし、一次照合の完了時点で調査を打ち切り、PR 内再発防止策の回収と複数セッション（`/boost`、`/swarm`）のブリーフ引き継ぎ、`invariant-gate` 連携による退行一次検査、既コミットと未コミットを厳密分離した返信、コミットと push、GraphQL によるスレッド Resolve、Stage 3 サマリコメントへの再発防止策累積記録と恒久ルール昇格候補の提示、Stage 3 後の Devin Review 状態確認および条件付き再トリガによる「0 件完了 vs 解析中 vs 未実行」の機械判定、および機械的事後検証までを進める手順。PR レビュー指摘の一括トリアージ、修正計画の分別、未 Resolve スレッド整理、push 後の Devin Review 完了判定を行うときに使用する。仕様判断と要協議提示は requirements-definition、別セッション移行と承認誤着工防止は session-phase-split、実装および PR 更新前へ分離する常駐システム境界監査は systems-pre-pr-audit、実装差分との機械突合は invariant-gate、シークレットの新規発行と登録案内は scoped-secret-provisioning、Windows 環境での gh と git 実行は windows-cli-pitfalls に委ねる。
 ---
 
 # PR レビュー指摘のトリアージとスレッド整理
@@ -15,6 +15,7 @@ description: PR のレビュー指摘を現行コードとコミット履歴、G
 - **常駐システムの境界監査**：実装および PR 更新前の境界条件点検は `systems-pre-pr-audit` に委ね、トリアージと修正計画の段階（Stage 1 と Stage 2）では実施しない。
 - **実装差分の不変条件検査**：実装差分とルール Markdown の機械突合および二次精査手順は `invariant-gate` に委ね、本スキルは PR 内再発防止策の抽出とルール Markdown 生成までを担う。
 - **テスト規約と Windows CLI**：テスト同期要件はルール `test-conventions`、文字化け検査はルール `verify-file-writes`、PowerShell と `gh` の引用や UTF-8 扱いは `windows-cli-pitfalls` に委ねる。
+- **Devin API シークレット登録**：`DEVIN_API_KEY` と `DEVIN_ORG_ID` の新規発行および環境変数登録の案内は、ルール `scoped-secret-provisioning` に委ねる。
 
 ## Stage 1：実物照合トリアージ
 
@@ -81,6 +82,31 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts
    - 投稿後の PR JSON（`gh pr view <num> --json body,comments`）に対して `pr_guardrails.py extract --input pr-after.json --strict --format json` を実行し、終了コード `0` で意図した ID とステータスが復元できることを確認する。
    - 投稿した全スレッド返信と PR サマリコメントに `U+FFFD` や文字化けがないことを確認する。
    - `git status -sb` がクリーンであること、および一時ファイルが残存していないことを確認する。
+
+## Stage 3 後：Devin Review 状態確認と再レビューループ
+
+PR 改善ループ（`/goal` 等）でコミットを push した直後は、GitHub GraphQL だけでは「0 件完了」と「解析中または未実行」を区別できない。
+`scripts/check_devin_review.py` を呼び出し、Devin API の完了状態と GitHub GraphQL の未 Resolve スレッド件数を突き合わせて次手を決める。
+
+前提として、2026 年 11 月時点の Devin API v3（Pro プラン実機確認済み）では組織スコープの `/v3/organizations/{org_id}/pr-reviews` を使用し、エンタープライズ専用の `/v3/enterprise/pr-reviews` は使わない。
+このエンドポイントは指摘件数を返さないため、0 件完了の確定には GitHub GraphQL との併用が必須である。
+また、`DEVIN_API_KEY` と `DEVIN_ORG_ID` は環境変数のみから読み取り、チャット、ログ、CLI 引数へ実値を出力しない。
+
+```powershell
+$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
+python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/check_devin_review.py" --pr-url "https://github.com/<owner>/<repo>/pull/<num>" --commit-sha "<head_sha>" --dry-run
+python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/check_devin_review.py" --pr-url "https://github.com/<owner>/<repo>/pull/<num>" --commit-sha "<head_sha>"
+# 自動起動待ち後も not_found のとき、またはユーザー明示指示時のみ（同一 commit_sha あたり最大 1 回）
+python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/check_devin_review.py" --pr-url "https://github.com/<owner>/<repo>/pull/<num>" --commit-sha "<head_sha>" --trigger
+```
+
+出力 JSON の `decision` フィールドに基づき、次のとおり分岐する。
+
+1. **`completed`（`can_conclude_clean: true`）**：GitHub GraphQL の未 Resolve スレッドが 0 件であれば「0 件完了」として改善ループを終了し、1 件以上あれば次ラウンドの Stage 1 へ進む。
+2. **`in_progress` または `stale_commit`**：解析中または前コミットの結果が残っている状態のため、一定時間待機して同じ `--commit-sha` で再照会する。
+3. **`not_found`（HTTP 404）**：push 後の自動起動待ち（30 秒から 60 秒）ののち再照会しても `not_found` が解消しない場合、またはユーザーから明示指示がある場合に限り、同一 `commit_sha` あたり最大 1 回だけ `--trigger` を実行してよい。
+4. **`fallback_github_only`（環境変数未設定）**：Devin API キーまたは組織 ID が未登録のため終了コード `0` でフォールバックし、従来の GitHub GraphQL 監視のみを継続する。
+5. **`auth_error`、`rate_limited`、`api_error`**：非ゼロ終了コードになるため、認証情報や `retry_after_seconds` を確認して再試行または中断を判断する。
 
 ## PR 内再発防止策の記述形式と運用基準
 

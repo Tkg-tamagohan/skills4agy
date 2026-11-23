@@ -40,6 +40,7 @@ GITHUB_TOKEN_RE = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")
 GITHUB_PAT_RE = re.compile(r"github_pat_[A-Za-z0-9_]{20,}")
 SECRET_KEY_PREFIX_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}")
 AWS_ACCESS_KEY_RE = re.compile(r"AKIA[0-9A-Z]{16}")
+DEVIN_API_KEY_RE = re.compile(r"(?<![A-Za-z0-9_])cog_[A-Za-z0-9_-]{20,}")
 BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}")
 
 SECRET_DETECT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -49,6 +50,7 @@ SECRET_DETECT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("GitHub Fine-grained PAT (github_pat_...)", GITHUB_PAT_RE),
     ("API シークレットキー (sk-...)", SECRET_KEY_PREFIX_RE),
     ("AWS アクセスキー (AKIA...)", AWS_ACCESS_KEY_RE),
+    ("Devin API キー (cog_...)", DEVIN_API_KEY_RE),
 )
 
 # 複数行ブロックを単独ヘッダより先に置換し、中間行や閉じ行の残留を防ぐ
@@ -60,6 +62,7 @@ SECRET_REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
     GITHUB_PAT_RE,
     SECRET_KEY_PREFIX_RE,
     AWS_ACCESS_KEY_RE,
+    DEVIN_API_KEY_RE,
 )
 
 

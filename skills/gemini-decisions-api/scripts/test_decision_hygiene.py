@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""decision_hygiene.py の単体テスト（テスト ID: DH-01–DH-05）。
+"""decision_hygiene.py の単体テスト（テスト ID: DH-01–DH-06）。
 
 境界条件、複数行 PEM ブロックと単独ヘッダのマスク、生値と URL エンコード値のマスク、
 Windows/POSIX 両パスの .env 判定、および stdio UTF-8 再設定を検証する。
@@ -169,6 +169,24 @@ class TestDecisionHygiene(unittest.TestCase):
             sys.stdin = orig_in
             sys.stdout = orig_out
             sys.stderr = orig_err
+
+    def test_dh06_devin_api_key_cog_pattern(self) -> None:
+        """DH-06: cog_ プレフィックスの Devin API キーを検知・マスクし、識別子途中や短尺を誤検知しない。"""
+        safe_identifiers = [
+            "my_cog_worker_service_1234567890",
+            "a_cog_12345678901234567890",
+            "cog_" + "short12345678901234",  # 19 文字は未達
+        ]
+        for ident in safe_identifiers:
+            with self.subTest(safe_ident=ident):
+                self.assertEqual(dh.scan_text_for_secrets(ident), [])
+                self.assertEqual(dh.mask_secrets(ident), ident)
+
+        dummy_cog_key = "cog_" + "AbCdEf0123456789_-XyZ" + "9876543210abcdefghij" + "12345678901"  # 56 文字相当
+        self.assertEqual(dh.scan_text_for_secrets(f"token={dummy_cog_key}"), ["Devin API キー (cog_...)"])
+        masked = dh.mask_secrets(f"Authorization: Bearer {dummy_cog_key}")
+        self.assertNotIn(dummy_cog_key, masked)
+        self.assertEqual(masked, "Authorization: Bearer [REDACTED]")
 
 
 if __name__ == "__main__":
