@@ -38,7 +38,7 @@ from typing import List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
-SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+SEMVER_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 RULE_LINE_LIMIT = 30
 SKILL_LINE_LIMIT = 200
 AGENTS_SECTION_LINE_LIMIT = 5
@@ -93,7 +93,7 @@ def semver_tuple(version: str) -> Optional[Tuple[int, int, int]]:
     """X.Y.Z 形式の SemVer を整数タプルに変換する。不一致時は None を返す。"""
     if not isinstance(version, str):
         return None
-    m = SEMVER_PATTERN.match(version)
+    m = SEMVER_PATTERN.fullmatch(version)
     if not m:
         return None
     return tuple(int(g) for g in m.groups())

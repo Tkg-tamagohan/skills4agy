@@ -243,10 +243,22 @@ class TestPluginJsonValidation(unittest.TestCase):
                 self.assert_invalid(data, "JSON のトップレベルがオブジェクトではありません")
 
     def test_cp_30_versionがSemVer形式でない場合は検出する(self):
-        for bad in ("0.4.14-beta", "1.2", "1.2.x", "v1.2.3", " 1.2.3 "):
+        for bad in (
+            "0.4.14-beta",
+            "1.2",
+            "1.2.x",
+            "v1.2.3",
+            " 1.2.3 ",
+            "0.4.015",
+            "01.2.3",
+            "0.04.14",
+            "０.4.14",
+            "0.４.14",
+            "0.4.14\n",
+        ):
             with self.subTest(bad=bad):
                 self.assert_invalid(valid_manifest(version=bad), "SemVer(X.Y.Z)")
-        for good in ("0.4.14", "1.0.0"):
+        for good in ("0.0.0", "0.4.14", "1.0.0", "10.20.30"):
             with self.subTest(good=good):
                 self.assert_valid(valid_manifest(version=good))
 
@@ -469,9 +481,13 @@ class TestCheckPluginStructure(unittest.TestCase):
         downgrade = check_plugin.check_version_bump("base", root)
         self.assertTrue(any("下がっています" in e for e in downgrade), downgrade)
 
-        write_plugin_json(root, valid_manifest(version="1.2.x"))
-        non_semver = check_plugin.check_version_bump("base", root)
-        self.assertTrue(any("SemVer ではありません" in e for e in non_semver), non_semver)
+        for bad_ver in ("1.2.x", "1.2.04", "1.2.４", "1.2.4\n"):
+            with self.subTest(bad_ver=bad_ver):
+                write_plugin_json(root, valid_manifest(version=bad_ver))
+                non_semver = check_plugin.check_version_bump("base", root)
+                self.assertTrue(
+                    any("SemVer ではありません" in e for e in non_semver), non_semver
+                )
 
         missing_ref = check_plugin.check_version_bump("no-such-ref", root)
         self.assertTrue(any("取得できません" in e for e in missing_ref), missing_ref)

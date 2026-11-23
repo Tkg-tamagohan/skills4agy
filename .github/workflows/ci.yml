@@ -110,8 +110,8 @@ jobs:
           )
           if not require_bump and "plugin.json" in raw_paths:
               base_ok, base_ver = load_plugin_version(base_sha)
-              head_ok, head_ver = load_plugin_version(head_sha)
-              if not base_ok or not head_ok or base_ver != head_ver:
+              merged_ok, merged_ver = load_plugin_version("HEAD")
+              if not base_ok or not merged_ok or base_ver != merged_ver:
                   require_bump = True
           print("Changed files:", raw_paths)
           print("require_version_bump:", require_bump)
