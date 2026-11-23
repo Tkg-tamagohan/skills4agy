@@ -15,12 +15,12 @@
 1. `E:\Documents\code\skills4agy` で `main` ブランチを最新化する（`git checkout main` → `git pull --ff-only origin main`）。
 2. 作業ブランチを作成する（`git checkout -b <branch>`）。
 3. ルールやスキルの追加・変更時はスキル `plugin-authoring` に従い、`plugin.json` の `version` と `README.md` の収録一覧を同期する。
-4. コミット前に UTF-8 環境変数を設定して検証スクリプトを実行し、全項目と全テストの通過を確認する（プラグイン中身〔`rules/`、`skills/`、`AGENTS.md`、`README.md`、`hooks.json`〕または `plugin.json` の `version` を変更する場合は `--version-base origin/main` を付与し、`.github/`・`.gitignore` のみや `plugin.json` の `version` を変えないメタデータ更新のみの場合は省略する）。
+4. コミット前に UTF-8 環境変数を設定して検証スクリプトを実行し、全項目と全テストの通過を確認する（プラグイン中身〔`rules/`、`skills/`、`AGENTS.md`、`README.md`、`hooks.json`〕または `plugin.json` の `version` を変更する場合は `--version-base origin/main` を付与し、それ以外の変更〔`.github/`、`.gitignore`、`version` を変えない `plugin.json` メタデータ、およびそれらの組み合わせ〕のみの場合は省略する）。
    ```powershell
    $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-   # プラグイン中身または plugin.json の version を変更する場合
+   # プラグイン中身（rules/、skills/、AGENTS.md、README.md、hooks.json）または plugin.json の version を変更する場合
    python skills/plugin-authoring/scripts/check_plugin.py --version-base origin/main
-   # .github/・.gitignore のみ、または version を変えない plugin.json メタデータ更新のみの場合
+   # 上記以外の変更（.github/、.gitignore、version を変えない plugin.json メタデータ等の組み合わせ）のみの場合
    python skills/plugin-authoring/scripts/check_plugin.py
    python skills/plugin-authoring/scripts/run_all_tests.py
    ```
