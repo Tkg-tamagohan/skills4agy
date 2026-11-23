@@ -38,7 +38,7 @@ from typing import List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
-SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+SEMVER_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 RULE_LINE_LIMIT = 30
 SKILL_LINE_LIMIT = 200
 AGENTS_SECTION_LINE_LIMIT = 5
@@ -93,7 +93,7 @@ def semver_tuple(version: str) -> Optional[Tuple[int, int, int]]:
     """X.Y.Z 形式の SemVer を整数タプルに変換する。不一致時は None を返す。"""
     if not isinstance(version, str):
         return None
-    m = SEMVER_PATTERN.match(version)
+    m = SEMVER_PATTERN.fullmatch(version)
     if not m:
         return None
     return tuple(int(g) for g in m.groups())
@@ -425,6 +425,12 @@ def validate_plugin_json(data: object) -> List[str]:
             errors.append(f"{PLUGIN_JSON_LABEL}: {key} は文字列である必要があります")
         elif not value.strip():
             errors.append(f"{PLUGIN_JSON_LABEL}: {key} がありません")
+
+    version = data.get("version")
+    if isinstance(version, str) and version.strip() and semver_tuple(version) is None:
+        errors.append(
+            f"{PLUGIN_JSON_LABEL}: version が SemVer(X.Y.Z) ではありません({version})"
+        )
 
     for key in PLUGIN_JSON_OPTIONAL_STRING_FIELDS:
         if key not in data:
