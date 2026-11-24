@@ -142,7 +142,8 @@ def _generic_step(
 class TestAuditContextMetrics(unittest.TestCase):
     """SCA-01〜SCA-18 の仕様検証テスト。"""
 
-    def test_SCA01_token_and_cache_calculation_and_zero_div(self) -> None:
+    def test_SCA_01_token_and_cache_calculation_and_zero_div(self) -> None:
+        """SCA-01: 初回編集前トークン、ピークコンテキスト、キャッシュヒット率とゼロ除算回避を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             t1 = _write_session(
@@ -188,7 +189,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             self.assertIsNone(mz.cache_hit_rate)
             self.assertEqual(mz.peak_context_tokens, 0)
 
-    def test_SCA02_five_class_tree_scope_and_session_id_priority(self) -> None:
+    def test_SCA_02_five_class_tree_scope_and_session_id_priority(self) -> None:
+        """SCA-02: セッション 5 分類、--scope 絞り込み、および --session-id 優先適用を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             _write_session(
@@ -255,7 +257,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             rep_sid = json.loads(buf_sid.getvalue())
             self.assertEqual(rep_sid["meta"]["included_sessions"], 1)
 
-    def test_SCA03_json_args_classification_priority_and_oversized(self) -> None:
+    def test_SCA_03_json_args_classification_priority_and_oversized(self) -> None:
+        """SCA-03: read_file 引数解析とコード、ロック、免除ファイルの大規模読込分類を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             t = _write_session(
@@ -289,7 +292,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             self.assertEqual(m.large_exempt_reads, 1)
             self.assertEqual(m.blind_large_exempt_reads, 1)
 
-    def test_SCA04_redundant_reread_vs_forward_chunking_and_windows_path(self) -> None:
+    def test_SCA_04_redundant_reread_vs_forward_chunking_and_windows_path(self) -> None:
+        """SCA-04: 順方向分割や編集後再読を除外し、Windows パス正規化込みで重複再読のみ計上する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             # 順方向 200 行分割および非重複の前方ジャンプは 0
@@ -363,7 +367,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             m_edit = mod.analyze_session("chunk-edit-reset", t_edit, is_subagent=False)
             self.assertEqual(m_edit.redundant_rereads, 1)
 
-    def test_SCA05_parallel_burst_search_before_read_and_pipe_violation(self) -> None:
+    def test_SCA_05_parallel_burst_search_before_read_and_pipe_violation(self) -> None:
+        """SCA-05: 検索先行率、並列読込バースト、およびパイプ切り詰め違反の検出と非誤検知を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             t = _write_session(
@@ -407,7 +412,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             self.assertFalse(bool(mod.SEARCH_CMD_RE.search("cat target/rg_cache.txt")))
             self.assertFalse(bool(mod.PIPE_TRUNCATE_RE.search("cat target/head_notes.txt")))
 
-    def test_SCA06_full_lookup_fallback_unpaired_and_malformed_json(self) -> None:
+    def test_SCA_06_full_lookup_fallback_unpaired_and_malformed_json(self) -> None:
+        """SCA-06: transcript_full.jsonl 遅延参照、不在時フォールバック、破損 JSON 行耐性を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             big_text = "x" * 11_000
@@ -452,7 +458,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             self.assertEqual(m_miss.large_cmd_outputs, 0)
             self.assertEqual(m_miss.full_lookup_misses, 1)
 
-    def test_SCA07_cutoff_spanning_since_until_low_sample_and_zero_delta(self) -> None:
+    def test_SCA_07_cutoff_spanning_since_until_low_sample_and_zero_delta(self) -> None:
+        """SCA-07: --cutoff 境界帰属、期間フィルタ、[low-n] 判定、およびゼロ基準変化率を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             # Before (1 件、カットオフ跨ぎ)
@@ -509,7 +516,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             # Before の cache_hit_rate P50 == 0 のため変化率は None (N/A)
             self.assertIsNone(rep["comparison"]["delta_pct"]["cache_hit_rate"]["p50"])
 
-    def test_SCA08_adaptive_digest_secret_mask_and_dry_run(self) -> None:
+    def test_SCA_08_adaptive_digest_secret_mask_and_dry_run(self) -> None:
+        """SCA-08: Decision 1 用ダイジェストの機密マスク、タグ無害化、および --dry-run を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             _write_session(
@@ -544,7 +552,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             self.assertEqual(rep["decision1"]["questions"], 3)
             self.assertGreaterEqual(rep["decision1"]["redactions"], 1)
 
-    def test_SCA09_decision1_mock_stratification_and_uncertain(self) -> None:
+    def test_SCA_09_decision1_mock_stratification_and_uncertain(self) -> None:
+        """SCA-09: Decision 1 モック応答によるタスク種別層別比較と低信頼度 uncertain 計上を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             _write_session(
@@ -603,7 +612,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             self.assertEqual(rep["decision1"]["uncertain_counts"]["context_starvation"], 1)
             self.assertIn("bugfix_or_small_edit", rep["comparison"]["by_task_type"])
 
-    def test_SCA10_safety_block_bisect_and_api_error_fallback(self) -> None:
+    def test_SCA_10_safety_block_bisect_and_api_error_fallback(self) -> None:
+        """SCA-10: 安全フィルタ遮断時の二分再送（HTTP 200 と 400）および通信失敗フォールバックを検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             for i in range(40):
@@ -695,7 +705,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             self.assertEqual(rep3["meta"]["decision1_status"], "partial")
             self.assertEqual(rep3["decision1"]["blocked_sessions"], 10)
 
-    def test_SCA11_exit_codes_zero_empty_max_chunks_and_missing_dir(self) -> None:
+    def test_SCA_11_exit_codes_zero_empty_max_chunks_and_missing_dir(self) -> None:
+        """SCA-11: 空対象、不在パス、不正日時、閾値やチャンク範囲外の終了コード規約を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             (app_dir / "brain").mkdir()
@@ -796,7 +807,8 @@ class TestAuditContextMetrics(unittest.TestCase):
                 if saved is not None:
                     mod.os.environ["GEMINI_API_KEY"] = saved
 
-    def test_SCA12_canary_privacy_isolation(self) -> None:
+    def test_SCA_12_canary_privacy_isolation(self) -> None:
+        """SCA-12: 生プロンプト、thinking、ファイル本文、絶対パス、秘密値が外部出力へ漏れないことを検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             canary_prompt = "CANARY_RAW_PROMPT_TOKEN_TEXT"
@@ -867,7 +879,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             for c in (canary_thinking, canary_content, canary_path, canary_file_uri, "secret_workspace", canary_secret):
                 self.assertNotIn(c, payload_str)
 
-    def test_SCA13_digest_structure_final_assistant_handoff_and_sanitize_first(self) -> None:
+    def test_SCA_13_digest_structure_final_assistant_handoff_and_sanitize_first(self) -> None:
+        """SCA-13: 単一および複数ターンのダイジェスト構造、定型前置き除去、孤立閉じタグ除去を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             head_part = "HEAD_TASK_ANCHOR " + ("a" * 260)
@@ -944,7 +957,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             empty_after_trunc = "<USER_REQUEST>\n<truncated 100 bytes>\n</ADDITIONAL_METADATA>"
             self.assertTrue(bool(mod.extract_user_text(empty_after_trunc)))
 
-    def test_SCA14_stats_deterministic_signals(self) -> None:
+    def test_SCA_14_stats_deterministic_signals(self) -> None:
+        """SCA-14: 編集種別、スラッシュコマンド、実行コマンド分類、終了形態シグナル抽出を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             # 1) edits 種別カウント・slash 最大 3 件・cmd 4 カテゴリ・assistant_text
@@ -995,6 +1009,7 @@ class TestAuditContextMetrics(unittest.TestCase):
             self.assertIn("trailing_q=0", d_rich)
             self.assertIn("slash=/plan,/boost,/swarm", d_rich)
             self.assertIn("cmd=test_run,pr_gh,git_write,lint_check", d_rich)
+            self.assertIsNotNone(mod.CMD_LINT_CHECK_RE.search("python skills/plugin-authoring/scripts/check_hygiene.py"))
 
             # 2) ended_with の残り 4 区分 + edits=none + git status 非該当 + trailing_q
             cases = [
@@ -1044,7 +1059,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             self.assertFalse(mod.has_trailing_question("本当ですか？" + ("あ" * 90)))
             self.assertTrue(mod.has_trailing_question(("あ" * 90) + "進めてよいですか？"))
 
-    def test_SCA15_criteria_priority_and_payload_validation(self) -> None:
+    def test_SCA_15_criteria_priority_and_payload_validation(self) -> None:
+        """SCA-15: タスク種別と完了状態の選択肢定義および生成ペイロードのスキーマ適合を検証する。"""
         self.assertEqual(
             list(mod.TASK_TYPE_CRITERIA.keys()),
             ["review_or_audit", "research_or_plan", "feature_or_refactor", "bugfix_or_small_edit", "other"],
@@ -1063,7 +1079,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             self.assertIn("review_or_audit → research_or_plan", payload["questions"]["s0001_task_type"]["instructions"])
             self.assertIn("[FINAL_ASSISTANT]", payload["questions"]["s0001_outcome"]["instructions"])
 
-    def test_SCA16_chunk_size_and_continuous_bisect_min_leaf(self) -> None:
+    def test_SCA_16_chunk_size_and_continuous_bisect_min_leaf(self) -> None:
+        """SCA-16: --chunk-size 分割、連続二分再送の最小葉サイズ、総ペイロード文字数分割を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             for i in range(25):
@@ -1161,7 +1178,8 @@ class TestAuditContextMetrics(unittest.TestCase):
         self.assertGreater(len(split_chunks), 1)
         self.assertEqual(sum(len(c) for c in split_chunks), 10)
 
-    def test_SCA17_by_subagent_type_aggregation_and_markdown(self) -> None:
+    def test_SCA_17_by_subagent_type_aggregation_and_markdown(self) -> None:
+        """SCA-17: サブエージェント種別ごとのトークン占有率、加重キャッシュ率、Markdown 表出力を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             _write_session(
@@ -1230,7 +1248,8 @@ class TestAuditContextMetrics(unittest.TestCase):
             rep_par = json.loads(out_par.getvalue())
             self.assertEqual(rep_par["by_subagent_type"], {})
 
-    def test_SCA18_task_type_threshold_separation_precedence_bisect_and_compat(self) -> None:
+    def test_SCA_18_task_type_threshold_separation_precedence_bisect_and_compat(self) -> None:
+        """SCA-18: --task-type-min-confidence の優先順位、二分再送への伝播、オフライン互換を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             _write_session(app_dir, "s-1", [_user_step(0, "PR 修正"), _planner_step(1, content="完了")])

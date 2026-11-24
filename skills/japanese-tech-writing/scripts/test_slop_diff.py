@@ -437,6 +437,51 @@ class TestSlopDiffReviewFixes(unittest.TestCase):
         self.assertEqual(quiet["heading_shapes"], [])
         self.assertFalse(any("見出し" in s for s in quiet["structure"]))
 
+    def test_diff_36_作業フォルダ外と隠しパス引数は終了コード2で拒否し標準入力ハイフン1箇所は許可する(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside.md"
+            outside.write_text("外部ファイル。\n", encoding="utf-8")
+            work = root / "work"
+            work.mkdir()
+            (work / ".hidden").mkdir()
+            (work / ".hidden" / "doc.md").write_text("隠しファイル。\n", encoding="utf-8")
+            (work / ".env").write_text("SECRET=1\n", encoding="utf-8")
+            (work / "orig.md").write_text("設定ファイルを確認してください。\n", encoding="utf-8")
+            (work / "rewrite.md").write_text("設定ファイルを確認する。\n", encoding="utf-8")
+            env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+
+            def run_in_work(args: list[str], stdin_text: str | None = None) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [sys.executable, str(SCRIPT), *args],
+                    cwd=str(work),
+                    input=stdin_text,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    env=env,
+                    timeout=10,
+                )
+
+            for bad_args in (
+                ["../outside.md", "rewrite.md"],
+                ["orig.md", ".hidden/doc.md"],
+                ["orig.md", ".env"],
+                ["--endings", "../outside.md"],
+                ["--endings", ".env"],
+                ["-", "-"],
+            ):
+                with self.subTest(bad_args=bad_args):
+                    res = run_in_work(bad_args)
+                    self.assertEqual(res.returncode, 2)
+                    self.assertTrue(res.stderr.strip())
+
+            res_stdin = run_in_work(["-", "rewrite.md", "--json"], stdin_text="設定ファイルを確認してください。\n")
+            self.assertEqual(res_stdin.returncode, 0, res_stdin.stderr)
+            data = json.loads(res_stdin.stdout)
+            self.assertEqual(data["endings"]["changes"][0]["orig_kind"], "依頼")
+            self.assertEqual(data["endings"]["changes"][0]["rewrite_kind"], "常体")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

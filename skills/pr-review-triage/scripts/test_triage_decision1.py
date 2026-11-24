@@ -17,7 +17,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -461,16 +460,23 @@ class TestTriageDecision1(unittest.TestCase):
             {"id": "ITEM_2", "source": "review_thread", "path": "f2.py", "line": 3, "comment_body": "two"},
             {"id": "ITEM_3", "source": "review_body", "path": None, "line": None, "comment_body": "three"},
         ]
-        delays = {"ITEM_0": 0.08, "ITEM_1": 0.04, "ITEM_2": 0.01, "ITEM_3": 0.0}
+        done_events = {f"ITEM_{i}": threading.Event() for i in range(4)}
+        wait_for = {"ITEM_0": "ITEM_1", "ITEM_1": "ITEM_2", "ITEM_2": "ITEM_3"}
         seen_keys: list[str] = []
+        completion_order: list[str] = []
         lock = threading.Lock()
 
         def staggered_opener(req: object, timeout: float = 30.0) -> _FakeHTTPResponse:
             with lock:
                 seen_keys.append(req.get_header("X-goog-api-key"))  # type: ignore[attr-defined]
             text = json.loads(req.data.decode("utf-8"))["input"][0]["text"]  # type: ignore[attr-defined]
-            matched_id = next(item_id for item_id in delays if f"Review Item ID: {item_id}\n" in text)
-            time.sleep(delays[matched_id])
+            matched_id = next(item_id for item_id in done_events if f"Review Item ID: {item_id}\n" in text)
+            dep_id = wait_for.get(matched_id)
+            if dep_id is not None and not done_events[dep_id].wait(timeout=2.0):
+                raise TimeoutError(f"{dep_id} did not complete concurrently within timeout")
+            with lock:
+                completion_order.append(matched_id)
+            done_events[matched_id].set()
             return _FakeHTTPResponse(_make_decision_response("partial_followup", 0.86, 0.20, 1.0))
 
         code, out, err = _run_cli(
@@ -481,6 +487,7 @@ class TestTriageDecision1(unittest.TestCase):
         )
         self.assertEqual(code, 0, msg=err)
         report = json.loads(out)
+        self.assertEqual(completion_order, ["ITEM_3", "ITEM_2", "ITEM_1", "ITEM_0"])
         self.assertEqual([entry["id"] for entry in report["items"]], ["ITEM_0", "ITEM_1", "ITEM_2", "ITEM_3"])
         self.assertEqual(seen_keys, ["parallel-test-key"] * 4)
 

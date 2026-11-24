@@ -23,7 +23,7 @@ yomiyasu_lint.py を基に、shared-skills:japanese-tech-writing の
 - 同一文末の連続検出は段落(隣接する地の文)の内側に限定する
 - 「A ではなく B」構文は上流の正確な字句走査で判定する
 - v3.0.0 追従: calque(直訳語)の型1〜3を info で検出する
-  (型4・型5と translated_term は不採用。docs/decision-records.md Y-21)
+  (型4・型5と translated_term は上流 yomiyasu v3.0.0 移植時に不採用。利用法は references/slop-lint-usage.md を参照)
 - 太字の印(**)が表示されない書き方の検査を markdown_bold.py から
   呼び出す(上流の判定機械を共通モジュールへ切り出したもの)
 - 行ごとの正規表現走査を markdown_visibility.py の構造解析へ移行。
@@ -43,7 +43,7 @@ yomiyasu_lint.py を基に、shared-skills:japanese-tech-writing の
   終了コードを再定義し(0: --strict/--fail-on の条件非該当、
   1: 条件該当、2: 使い方・入力の誤り、3: 内部エラー)、--fail-on を
   追加した。通常出力も上流の形式へ揃えた
-  (docs/decision-records.md Y-19。--doc-type/--reader は導入しない。Y-20)
+  (上流 yomiyasu v3.0.0 Phase 4 移植に準拠。--doc-type/--reader は導入せず、利用法は references/slop-lint-usage.md を参照)
 
 検出結果は機械的な見直し候補であり、SKILL.md の規範で正当な
 記述と判断できるものはそのまま保持する。
@@ -896,7 +896,7 @@ _DOCUMENT_RULE_WEIGHTS = {"excess_bold": 2, "excess_list": 2, "bold_label_list":
 _SUMMARY_RULES = ("negative_parallelism_density",)
 # info の「見直しのきっかけ」の規則。上流の _V220_RULES・_V230_RULES・_V250_RULES に
 # 対応し、点数を計算する前に除く(上流の _V240_RULES の slide_comma は --doc-type
-# 依存のため本スキルでは実装しない。docs/decision-records.md Y-20)
+# 依存で上流移植時に不採用のため本スキルでは実装しない。references/slop-lint-usage.md 参照)
 _SCORE_EXCLUDED_RULES = ("calque", "metaphor_label", "say_hedge", "thin_evaluation",
                          "katakana_term", "dialogue_period", "narrative_density",
                          "copy_comma_noun", "bare_verb_chain", "project_term",
