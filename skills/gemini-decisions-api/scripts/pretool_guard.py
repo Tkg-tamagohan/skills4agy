@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 from typing import Any, Callable
 
@@ -158,8 +159,71 @@ CODE_EXEC_SINKS = frozenset(
         "rundll32",
     }
 )
-PS_SAFE_ENCODINGS = frozenset({"utf8", "utf8nobom", "utf8bom", "ascii", "unicode", "default"})
-MAX_TEAMWORK_STATEMENTS = 30
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+TEAMWORK_SENDER_RE = re.compile(
+    r"\[Message\]\s+timestamp=\S+\s+sender="
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b"
+)
+MAX_TEAMWORK_PARENT_DEPTH = 8
+RG_VALUE_LONG_OPTS = frozenset(
+    {
+        "--regexp",
+        "--file",
+        "--glob",
+        "--iglob",
+        "--type",
+        "--type-not",
+        "--type-add",
+        "--type-clear",
+        "--max-count",
+        "--max-columns",
+        "--max-depth",
+        "--max-filesize",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--threads",
+        "--encoding",
+        "--color",
+        "--colors",
+        "--hostname-bin",
+        "--path-separator",
+        "--sort",
+        "--sortr",
+        "--engine",
+        "--context-separator",
+        "--field-context-separator",
+        "--field-match-separator",
+        "--replace",
+        "--dfa-size-limit",
+        "--regex-size-limit",
+    }
+)
+RG_VALUE_SHORT_CHARS = frozenset(
+    {"e", "f", "g", "t", "T", "m", "M", "d", "A", "B", "C", "j", "E", "r"}
+)
+SAFE_RELATIVE_TEMP_ROOTS = frozenset(
+    {
+        "tmp",
+        "temp",
+        ".tmp",
+        ".temp",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".cache",
+        "dist",
+        "build",
+        "coverage",
+    }
+)
+SAFE_CACHE_DIR_NAMES = frozenset(
+    {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tmp", ".temp"}
+)
+SAFE_TEMP_PARENT_NAMES = frozenset({"tmp", "temp", ".tmp", ".temp"})
 
 GIT_VALUE_GLOBAL_OPTS = frozenset(
     {"-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
@@ -393,6 +457,54 @@ def _split_unquoted_top_level(command: str) -> list[str] | None:
     return parts
 
 
+def _extract_rg_pre_info(args: list[str]) -> tuple[bool, list[str]]:
+    """rg 引数列をオプション境界（-- および値消費フラグ）に従って走査し (--pre/--pre-glob 有無, --pre コマンド列) を返す。"""
+    has_pre = False
+    pre_cmds: list[str] = []
+    i = 0
+    n = len(args)
+    while i < n:
+        arg = args[i]
+        low = arg.lower()
+        if arg == "--":
+            break
+        if low == "--pre":
+            has_pre = True
+            if i + 1 < n:
+                pre_cmds.append(args[i + 1])
+                i += 2
+                continue
+            i += 1
+            continue
+        if low.startswith("--pre="):
+            has_pre = True
+            pre_cmds.append(arg.split("=", 1)[1])
+            i += 1
+            continue
+        if low == "--pre-glob":
+            has_pre = True
+            i += 2 if i + 1 < n else 1
+            continue
+        if low.startswith("--pre-glob="):
+            has_pre = True
+            i += 1
+            continue
+        if low in RG_VALUE_LONG_OPTS:
+            i += 2 if i + 1 < n else 1
+            continue
+        if (
+            arg.startswith("-")
+            and not arg.startswith("--")
+            and len(arg) > 1
+            and arg[-1] in RG_VALUE_SHORT_CHARS
+            and not any(ch in RG_VALUE_SHORT_CHARS for ch in arg[1:-1])
+        ):
+            i += 2 if i + 1 < n else 1
+            continue
+        i += 1
+    return has_pre, pre_cmds
+
+
 def _is_safe_rg_segment(segment: str) -> bool:
     """--pre / --pre-glob を含まない単一の rg コマンドセグメントか判定する。"""
     try:
@@ -410,11 +522,8 @@ def _is_safe_rg_segment(segment: str) -> bool:
         break
     if idx >= len(tokens) or _command_basename(tokens[idx]) != "rg":
         return False
-    for arg in tokens[idx + 1 :]:
-        low = arg.lower()
-        if low in {"--pre", "--pre-glob"} or low.startswith(("--pre=", "--pre-glob=")):
-            return False
-    return True
+    has_pre, _ = _extract_rg_pre_info(tokens[idx + 1 :])
+    return not has_pre
 
 
 def _extract_paren_cmd_subst_bodies(text: str) -> list[str]:
@@ -445,9 +554,9 @@ def _extract_paren_cmd_subst_bodies(text: str) -> list[str]:
     return bodies
 
 
-def _extract_double_quoted_substitutions(segment: str) -> list[str]:
-    """ダブルクォート内のみから $(...) と `...` の中身を取り出し、サブセグメント列を返す。"""
-    dq_chunks: list[str] = []
+def _extract_rg_substitutions(segment: str) -> list[str]:
+    """単一引用外（未引用＋ダブルクォート内）から $(...) と `...` の中身を抽出しサブセグメント列を返す。"""
+    active_chunks: list[str] = []
     buf: list[str] = []
     quote: str | None = None
     i = 0
@@ -467,22 +576,35 @@ def _extract_double_quoted_substitutions(segment: str) -> list[str]:
                 i += 2
                 continue
             if ch == '"':
-                dq_chunks.append("".join(buf))
+                active_chunks.append("".join(buf))
                 buf = []
                 quote = None
             else:
                 buf.append(ch)
             i += 1
             continue
-        if ch in ("'", '"'):
-            quote = ch
+        if ch == "'":
+            if buf:
+                active_chunks.append("".join(buf))
+                buf = []
+            quote = "'"
+        elif ch == '"':
+            if buf:
+                active_chunks.append("".join(buf))
+                buf = []
+            quote = '"'
+        else:
+            buf.append(ch)
         i += 1
 
+    if buf:
+        active_chunks.append("".join(buf))
+
     subs: list[str] = []
-    for dq in dq_chunks:
-        for body in _extract_paren_cmd_subst_bodies(dq):
+    for chunk in active_chunks:
+        for body in _extract_paren_cmd_subst_bodies(chunk):
             subs.extend(_split_top_level_segments_raw(body))
-        for body in re.findall(r"`([^`]+)`", dq):
+        for body in re.findall(r"`([^`]+)`", chunk):
             subs.extend(_split_top_level_segments_raw(body))
     return subs
 
@@ -497,7 +619,7 @@ def _split_top_level_segments(command: str) -> list[str]:
     for part in unquoted_parts:
         if _is_safe_rg_segment(part):
             segments.append(part)
-            segments.extend(_extract_double_quoted_substitutions(part))
+            segments.extend(_extract_rg_substitutions(part))
         else:
             segments.extend(_split_top_level_segments_raw(part))
     return segments
@@ -550,20 +672,8 @@ def _unwrap_segment_tokens(tokens: list[str]) -> list[list[str]]:
                     results.extend(_unwrap_segment_tokens(_tokenize_lossy(seg)))
                 break
     elif head == "rg":
-        i = 1
-        while i < len(sub_tokens):
-            tok = sub_tokens[i]
-            low = tok.lower()
-            nested: str | None = None
-            if low == "--pre" and i + 1 < len(sub_tokens):
-                nested = sub_tokens[i + 1]
-                i += 2
-            elif low.startswith("--pre="):
-                nested = tok.split("=", 1)[1]
-                i += 1
-            else:
-                i += 1
-                continue
+        _, pre_cmds = _extract_rg_pre_info(sub_tokens[1:])
+        for nested in pre_cmds:
             if nested:
                 for seg in _split_top_level_segments(nested):
                     results.extend(_unwrap_segment_tokens(_tokenize_lossy(seg)))
@@ -761,7 +871,225 @@ def _has_recursive_flag(args: list[str], *, short_chars: str) -> bool:
     return False
 
 
-def _check_destructive_command(tokens: list[str]) -> str | None:
+def _is_reparse_or_symlink(path: Path) -> bool:
+    """パスがシンボリックリンクまたは Windows リパースポイント（ジャンクション等）か判定する。"""
+    try:
+        if os.path.islink(path):
+            return True
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if reparse_flag:
+            st = os.lstat(path)
+            if getattr(st, "st_file_attributes", 0) & reparse_flag:
+                return True
+        return False
+    except OSError:
+        return True
+
+
+def _has_unsafe_temp_reparse_or_escape(anchor_path: Path, check_parts: list[str]) -> bool:
+    """アンカー以降の既存コンポーネントにリンクや外部逸脱がないか検証する。"""
+    cur = anchor_path
+    existing_deepest = anchor_path if os.path.lexists(anchor_path) else None
+    for seg in check_parts:
+        cur = cur / seg
+        if os.path.lexists(cur):
+            if _is_reparse_or_symlink(cur):
+                return True
+            existing_deepest = cur
+    if existing_deepest is not None and os.path.lexists(anchor_path):
+        try:
+            real_anchor = Path(os.path.realpath(anchor_path))
+            real_deepest = Path(os.path.realpath(existing_deepest))
+            if not real_deepest.is_relative_to(real_anchor):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _is_safe_teamwork_temp_delete_target(target: str, *, cwd: str = "") -> bool:
+    """/teamwork 中の削除対象が安全な一時・キャッシュ・scratch 配下（リンクなし）か検証する。"""
+    raw = target.strip()
+    if not raw or any(ord(ch) < 32 for ch in raw):
+        return False
+    if raw.startswith(("\\\\", "//")):
+        return False
+    if any(ch in raw for ch in "*?[],`") or "$(" in raw:
+        return False
+
+    norm = raw.replace("\\", "/").rstrip("/")
+    if not norm:
+        return False
+    parts = [p for p in norm.split("/") if p]
+    if not parts:
+        return False
+    if ".." in parts:
+        return False
+    low_parts = [p.lower() for p in parts]
+    if any(part in (SENSITIVE_CD_DIR_NAMES | {".git"}) for part in low_parts):
+        return False
+
+    env_temp_m = re.match(r"^\$env:(TEMP|TMP)/(.+)$", norm, re.IGNORECASE)
+    if env_temp_m:
+        env_name = env_temp_m.group(1).upper()
+        tail = env_temp_m.group(2)
+        if "$" in tail or ":" in tail:
+            return False
+        tail_parts = [p for p in tail.split("/") if p]
+        if not tail_parts:
+            return False
+        env_root_val = os.environ.get(env_name, "").strip()
+        if env_root_val and _has_unsafe_temp_reparse_or_escape(Path(env_root_val), tail_parts):
+            return False
+        return True
+
+    if "$" in norm:
+        return False
+    if ":" in norm:
+        if norm.count(":") != 1 or not re.match(r"^[A-Za-z]:/", norm):
+            return False
+
+    is_unix_abs = norm.startswith("/")
+    is_win_abs = bool(re.match(r"^[A-Za-z]:/", norm))
+    is_abs = is_unix_abs or is_win_abs
+
+    anchor_index: int | None = None
+    rel_parts: list[str] = []
+
+    if is_unix_abs and len(parts) >= 2 and low_parts[0] == "tmp":
+        anchor_index = 1
+    elif is_unix_abs and len(parts) >= 3 and low_parts[:2] == ["var", "tmp"]:
+        anchor_index = 2
+    elif is_win_abs and len(parts) >= 3 and low_parts[1] in {"temp", "tmp"}:
+        anchor_index = 2
+    elif (
+        is_win_abs
+        and len(parts) >= 6
+        and low_parts[1] == "users"
+        and low_parts[3:6] == ["appdata", "local", "temp"]
+    ):
+        anchor_index = 6
+    else:
+        # Antigravity scratch/<uuid>/scratch/<child...>
+        for idx in range(len(low_parts) - 5):
+            if (
+                low_parts[idx : idx + 3] == [".gemini", "antigravity", "brain"]
+                and UUID_RE.fullmatch(parts[idx + 3])
+                and low_parts[idx + 4] == "scratch"
+            ):
+                anchor_index = idx + 5
+                break
+
+    if anchor_index is None:
+        if not is_abs:
+            rel_parts = list(parts)
+            while rel_parts and rel_parts[0] == ".":
+                rel_parts.pop(0)
+            if not rel_parts or rel_parts[0].lower() not in SAFE_RELATIVE_TEMP_ROOTS:
+                return False
+            anchor_index = 0
+        else:
+            if low_parts[-1] in SAFE_CACHE_DIR_NAMES and len(parts) >= 2:
+                anchor_index = len(parts) - 1
+            else:
+                for idx in range(1, len(parts) - 1):
+                    if low_parts[idx] in SAFE_TEMP_PARENT_NAMES:
+                        anchor_index = idx + 1
+                        break
+
+    if anchor_index is None:
+        return False
+
+    if not is_abs:
+        anchor_path = Path(cwd) if cwd else Path.cwd()
+        check_parts = rel_parts
+    elif is_unix_abs:
+        anchor_path = Path("/" + "/".join(parts[:anchor_index]))
+        check_parts = parts[anchor_index:]
+    else:
+        anchor_path = Path(parts[0] + "/" + "/".join(parts[1:anchor_index]))
+        check_parts = parts[anchor_index:]
+
+    if not check_parts:
+        return False
+    if _has_unsafe_temp_reparse_or_escape(anchor_path, check_parts):
+        return False
+    return True
+
+
+def _extract_safe_temp_delete_targets(head: str, args: list[str]) -> list[str] | None:
+    """rm / Remove-Item / del 系から許容フラグ以外を除いた削除対象パス一覧を返す。"""
+    targets: list[str] = []
+    if head == "rm":
+        seen_dd = False
+        for arg in args:
+            if not seen_dd and arg == "--":
+                seen_dd = True
+                continue
+            if not seen_dd and arg.startswith("-"):
+                low = arg.lower()
+                if low in {"--recursive", "--force", "--verbose", "--dir"}:
+                    continue
+                if not low.startswith("--") and len(arg) > 1 and all(ch in "rRfvd" for ch in arg[1:]):
+                    continue
+                return None
+            targets.append(arg)
+        return targets or None
+
+    if head in {"remove-item", "ri"}:
+        i = 0
+        n = len(args)
+        while i < n:
+            arg = args[i]
+            low = arg.lower()
+            if arg.startswith("-"):
+                flag, has_colon, inline_val = low.partition(":")
+                if (
+                    ("-recurse".startswith(flag) and len(flag) >= 4)
+                    or ("-force".startswith(flag) and len(flag) >= 3)
+                    or ("-verbose".startswith(flag) and len(flag) >= 2)
+                ) and not has_colon:
+                    i += 1
+                    continue
+                if flag == "-confirm" and inline_val in {"$false", "false"}:
+                    i += 1
+                    continue
+                if flag in {"-erroraction", "-ea"}:
+                    i += 1 if has_colon else (2 if i + 1 < n else 1)
+                    continue
+                if flag in {"-path", "-literalpath"}:
+                    if has_colon:
+                        if not inline_val:
+                            return None
+                        targets.append(arg.split(":", 1)[1])
+                        i += 1
+                    elif i + 1 < n:
+                        targets.append(args[i + 1])
+                        i += 2
+                    else:
+                        return None
+                    continue
+                return None
+            targets.append(arg)
+            i += 1
+        return targets or None
+
+    if head in {"del", "erase", "rmdir", "rd"}:
+        for arg in args:
+            low = arg.lower()
+            if arg.startswith("/"):
+                if low in {"/s", "/q", "/f"}:
+                    continue
+                return None
+            targets.append(arg)
+        return targets or None
+
+    return None
+
+
+def _check_destructive_command(
+    tokens: list[str], *, is_teamwork: bool = False, cwd: str = ""
+) -> str | None:
     if not tokens:
         return None
     head = _command_basename(tokens[0])
@@ -782,6 +1110,12 @@ def _check_destructive_command(tokens: list[str]) -> str | None:
             elif arg.startswith("-") and not arg.startswith("--"):
                 short_flags.update(arg[1:])
         if _has_recursive_flag(args, short_chars="rR") and (has_force or "f" in short_flags):
+            if is_teamwork:
+                targets = _extract_safe_temp_delete_targets(head, args)
+                if targets and all(
+                    _is_safe_teamwork_temp_delete_target(t, cwd=cwd) for t in targets
+                ):
+                    return None
             return "rm recursive force"
         return None
 
@@ -793,11 +1127,23 @@ def _check_destructive_command(tokens: list[str]) -> str | None:
             "-force".startswith(a) and len(a) >= 3 for a in low_args
         )
         if has_recurse and has_force:
+            if is_teamwork:
+                targets = _extract_safe_temp_delete_targets(head, args)
+                if targets and all(
+                    _is_safe_teamwork_temp_delete_target(t, cwd=cwd) for t in targets
+                ):
+                    return None
             return "Remove-Item -Recurse -Force"
         return None
 
     if head in {"del", "erase", "rmdir", "rd"}:
         if "/s" in low_args and "/q" in low_args:
+            if is_teamwork:
+                targets = _extract_safe_temp_delete_targets(head, args)
+                if targets and all(
+                    _is_safe_teamwork_temp_delete_target(t, cwd=cwd) for t in targets
+                ):
+                    return None
             return f"{head} /s /q"
         return None
 
@@ -976,10 +1322,14 @@ def _split_whitelist_segments(command: str) -> list[str] | None:
             if ch == quote:
                 quote = None
                 buf.append(ch)
-            elif quote == '"' and ch == "\\" and i + 1 < n and command[i + 1] in ('"', "\\"):
-                buf.append(ch)
-                buf.append(command[i + 1])
-                i += 2
+            elif quote == '"' and ch == "\\":
+                j = i
+                while j < n and command[j] == "\\":
+                    j += 1
+                if j < n and command[j] == '"' and (j - i) % 2 == 1:
+                    return None
+                buf.append(command[i:j])
+                i = j
                 continue
             else:
                 buf.append(ch)
@@ -1138,11 +1488,8 @@ def _classify_whitelisted_single_command(segment: str) -> tuple[bool, bool]:
         return True, False
 
     if head == "rg":
-        for arg in args:
-            low = arg.lower()
-            if low in {"--pre", "--pre-glob"} or low.startswith(("--pre=", "--pre-glob=")):
-                return False, False
-        return True, False
+        has_pre, _ = _extract_rg_pre_info(args)
+        return (not has_pre), False
 
     if head == "pytest":
         return True, False
@@ -1308,7 +1655,10 @@ def _find_single_quoted_heredoc_opener(line_no_eol: str) -> tuple[bool, bool, st
     if not offsets:
         return False, False, ""
 
-    match = re.match(r"<<(-?)\s*'([A-Za-z_][A-Za-z0-9_]*)'", line_no_eol[offsets[0] :])
+    match = re.match(
+        r"<<(-?)\s*'([A-Za-z_][A-Za-z0-9_]*)'(?=$|[ \t;|&<>#)])",
+        line_no_eol[offsets[0] :],
+    )
     if not match:
         return False, False, ""
     return True, bool(match.group(1)), match.group(2)
@@ -1425,15 +1775,79 @@ def _strip_verbatim_herestrings(command: str) -> tuple[str, list[str]]:
     return "".join(out_parts), bodies
 
 
+def _extract_executable_text_chunks(stripped_command: str) -> str:
+    """単一/二重引用リテラルを除外し、クォート外および二重引用内の $(...) / `...` 本体のみを返す。"""
+    chunks: list[str] = []
+    buf: list[str] = []
+    dq_buf: list[str] = []
+    in_quote: str | None = None
+    i = 0
+    n = len(stripped_command)
+
+    while i < n:
+        ch = stripped_command[i]
+        if in_quote == "'":
+            if ch == "'":
+                if i + 1 < n and stripped_command[i + 1] == "'":
+                    i += 2
+                    continue
+                in_quote = None
+            i += 1
+            continue
+        if in_quote == '"':
+            if ch == "`" and i + 1 < n:
+                dq_buf.append(ch)
+                dq_buf.append(stripped_command[i + 1])
+                i += 2
+                continue
+            if ch == "\\" and i + 1 < n and stripped_command[i + 1] in ('"', "\\"):
+                dq_buf.append(ch)
+                dq_buf.append(stripped_command[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                dq_text = "".join(dq_buf)
+                dq_buf = []
+                for body in _extract_paren_cmd_subst_bodies(dq_text):
+                    chunks.append(" " + body + " ")
+                for body in re.findall(r"`([^`]+)`", dq_text):
+                    chunks.append(" " + body + " ")
+                in_quote = None
+            else:
+                dq_buf.append(ch)
+            i += 1
+            continue
+        if ch == "'":
+            if buf:
+                chunks.append("".join(buf))
+                buf = []
+            in_quote = "'"
+        elif ch == '"':
+            if buf:
+                chunks.append("".join(buf))
+                buf = []
+            in_quote = '"'
+        else:
+            buf.append(ch)
+        i += 1
+
+    if buf:
+        chunks.append("".join(buf))
+    if dq_buf:
+        chunks.append("".join(dq_buf))
+    return "".join(chunks)
+
+
 def _has_code_exec_sink(stripped_command: str, segments: list[list[str]]) -> bool:
     """コード実行シンク（シェル起動、eval/iex、呼び出し演算子 &、ドットソース等）を検出する。"""
     for tokens in segments:
         if tokens and _command_basename(tokens[0]) in CODE_EXEC_SINKS:
             return True
 
+    exec_text = _extract_executable_text_chunks(stripped_command)
     if re.search(
         r"\b(?:scriptblock|invoke-expression|iex|invoke-command|icm)\b",
-        stripped_command,
+        exec_text,
         re.IGNORECASE,
     ):
         return True
@@ -1493,1262 +1907,112 @@ def _has_code_exec_sink(stripped_command: str, segments: list[list[str]]) -> boo
     return False
 
 
-def _is_safe_teamwork_dir(path: str) -> bool:
-    """ローカル FS パスかつ .agents/teamwork 配下（.. なし）であることを検証する。"""
-    if not _is_safe_filesystem_cd_target(path):
-        return False
-    norm = path.strip().replace("\\", "/")
-    parts = [p for p in norm.split("/") if p]
-    if ".." in parts:
-        return False
-    low_parts = [p.lower() for p in parts]
-    return any(
-        low_parts[i] == ".agents" and low_parts[i + 1] == "teamwork"
-        for i in range(len(low_parts) - 1)
-    )
-
-
-def _is_safe_teamwork_md_file(path: str) -> bool:
-    """パスが .agents/teamwork 配下の .md ファイル（.env 系除外）であることを検証する。"""
-    if not _is_safe_teamwork_dir(path):
-        return False
-    norm = path.strip().replace("\\", "/")
-    if norm.endswith("/"):
-        return False
-    parts = [p for p in norm.split("/") if p]
-    low_parts = [p.lower() for p in parts]
-    tw_idx = next(
-        (
-            i
-            for i in range(len(low_parts) - 1)
-            if low_parts[i] == ".agents" and low_parts[i + 1] == "teamwork"
-        ),
-        None,
-    )
-    if tw_idx is None or tw_idx + 2 >= len(low_parts):
-        return False
-    base = low_parts[-1]
-    if not base.endswith(".md") or len(base) <= 3:
-        return False
-    if dh.is_blocked_env_path(base):
-        return False
-    return True
-
-
-def _strip_outer_parens(expr: str) -> str | None:
-    """式の外側の対応する丸括弧を剥がす。括弧不整合時は None を返す。"""
-    cur = expr.strip()
-    while cur.startswith("(") and cur.endswith(")"):
-        depth = 0
-        in_quote: str | None = None
-        matched_end = False
-        i = 0
-        n = len(cur)
-        while i < n:
-            ch = cur[i]
-            if in_quote == "'":
-                if ch == "'":
-                    if i + 1 < n and cur[i + 1] == "'":
-                        i += 2
-                        continue
-                    in_quote = None
-                i += 1
-                continue
-            if in_quote == '"':
-                if ch == "`" and i + 1 < n:
-                    i += 2
-                    continue
-                if ch == "\\" and i + 1 < n and cur[i + 1] in ('"', "\\"):
-                    i += 2
-                    continue
-                if ch == '"':
-                    in_quote = None
-                i += 1
-                continue
-            if ch in ("'", '"'):
-                in_quote = ch
-            elif ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    if i == n - 1:
-                        matched_end = True
-                    break
-                if depth < 0:
-                    return None
-            i += 1
-        if in_quote is not None or depth != 0 or not matched_end:
-            return None
-        cur = cur[1:-1].strip()
-    return cur
-
-
-def _extract_single_quoted_literal(expr: str) -> str | None:
-    """単一引用リテラル '...'（'' エスケープ対応）から中身を取り出す。"""
-    s = expr.strip()
-    if len(s) < 2 or not s.startswith("'") or not s.endswith("'"):
+def _resolve_brain_root(
+    conversation_id: str,
+    transcript_path: str = "",
+    artifact_dir: str = "",
+) -> Path | None:
+    """会話 ID とフックメタデータのパスから brain ルートディレクトリを特定する。"""
+    if not UUID_RE.fullmatch(conversation_id):
         return None
-    buf: list[str] = []
-    i = 1
-    n = len(s)
-    while i < n:
-        ch = s[i]
-        if ch == "'":
-            if i + 1 < n and s[i + 1] == "'":
-                buf.append("'")
-                i += 2
-                continue
-            if i == n - 1:
-                return "".join(buf)
-            return None
-        buf.append(ch)
-        i += 1
-    return None
+    low_id = conversation_id.lower()
 
+    if artifact_dir:
+        art = Path(artifact_dir)
+        if art.name.lower() == low_id:
+            return art.parent
+        for parent in art.parents:
+            if parent.name.lower() == low_id:
+                return parent.parent
 
-def _extract_double_quoted_inner(expr: str) -> str | None:
-    """二重引用リテラル "..." 全体が単一文字列リテラルなら中身を返す。"""
-    s = expr.strip()
-    if len(s) < 2 or not s.startswith('"') or not s.endswith('"'):
-        return None
-    i = 1
-    n = len(s)
-    while i < n:
-        ch = s[i]
-        if ch == "`" and i + 1 < n:
-            i += 2
-            continue
-        if ch == "\\" and i + 1 < n and s[i + 1] in ('"', "\\"):
-            i += 2
-            continue
-        if ch == '"':
-            if i == n - 1:
-                return s[1:-1]
-            return None
-        i += 1
-    return None
-
-
-def _split_ps_args(text: str) -> list[str] | None:
-    """PowerShell 引数列を引用符と丸括弧を保持したまま空白で分割する。"""
-    tokens: list[str] = []
-    buf: list[str] = []
-    in_quote: str | None = None
-    paren_depth = 0
-    i = 0
-    n = len(text)
-
-    while i < n:
-        ch = text[i]
-        if in_quote == "'":
-            buf.append(ch)
-            if ch == "'":
-                if i + 1 < n and text[i + 1] == "'":
-                    buf.append("'")
-                    i += 2
-                    continue
-                in_quote = None
-            i += 1
-            continue
-        if in_quote == '"':
-            buf.append(ch)
-            if ch == "`" and i + 1 < n:
-                buf.append(text[i + 1])
-                i += 2
-                continue
-            if ch == "\\" and i + 1 < n and text[i + 1] in ('"', "\\"):
-                buf.append(text[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                in_quote = None
-            i += 1
-            continue
-
-        if ch in ("'", '"'):
-            in_quote = ch
-            buf.append(ch)
-        elif ch == "(":
-            paren_depth += 1
-            buf.append(ch)
-        elif ch == ")":
-            paren_depth -= 1
-            if paren_depth < 0:
-                return None
-            buf.append(ch)
-        elif ch in ("{", "}"):
-            return None
-        elif ch.isspace() and paren_depth == 0:
-            if buf:
-                tokens.append("".join(buf))
-                buf = []
-        else:
-            buf.append(ch)
-        i += 1
-
-    if in_quote is not None or paren_depth != 0:
-        return None
-    if buf:
-        tokens.append("".join(buf))
-    return tokens
-
-
-def _split_top_level_char(text: str, sep: str, *, allow_empty: bool = False) -> list[str] | None:
-    """引用符・丸括弧・波括弧の外側で単一区切り文字により分割する。"""
-    parts: list[str] = []
-    buf: list[str] = []
-    in_quote: str | None = None
-    paren_depth = 0
-    brace_depth = 0
-    i = 0
-    n = len(text)
-
-    while i < n:
-        ch = text[i]
-        if in_quote == "'":
-            buf.append(ch)
-            if ch == "'":
-                if i + 1 < n and text[i + 1] == "'":
-                    buf.append("'")
-                    i += 2
-                    continue
-                in_quote = None
-            i += 1
-            continue
-        if in_quote == '"':
-            buf.append(ch)
-            if ch == "`" and i + 1 < n:
-                buf.append(text[i + 1])
-                i += 2
-                continue
-            if ch == "\\" and i + 1 < n and text[i + 1] in ('"', "\\"):
-                buf.append(text[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                in_quote = None
-            i += 1
-            continue
-
-        if ch in ("'", '"'):
-            in_quote = ch
-            buf.append(ch)
-        elif ch == "(":
-            paren_depth += 1
-            buf.append(ch)
-        elif ch == ")":
-            paren_depth -= 1
-            if paren_depth < 0:
-                return None
-            buf.append(ch)
-        elif ch == "{":
-            brace_depth += 1
-            buf.append(ch)
-        elif ch == "}":
-            brace_depth -= 1
-            if brace_depth < 0:
-                return None
-            buf.append(ch)
-        elif ch == sep and paren_depth == 0 and brace_depth == 0:
-            part = "".join(buf).strip()
-            if not part and not allow_empty:
-                return None
-            parts.append(part)
-            buf = []
-        else:
-            buf.append(ch)
-        i += 1
-
-    if in_quote is not None or paren_depth != 0 or brace_depth != 0:
-        return None
-    tail = "".join(buf).strip()
-    if not tail and not allow_empty:
-        return None
-    parts.append(tail)
-    return parts
-
-
-def _split_ps_statements(text: str) -> list[str] | None:
-    """PowerShell 文を改行およびトップレベル ; で分割する（単一階層 {} 内は保持）。"""
-    stmts: list[str] = []
-    buf: list[str] = []
-    in_quote: str | None = None
-    paren_depth = 0
-    brace_depth = 0
-    i = 0
-    n = len(text)
-
-    while i < n:
-        ch = text[i]
-        if in_quote == "'":
-            buf.append(ch)
-            if ch == "'":
-                if i + 1 < n and text[i + 1] == "'":
-                    buf.append("'")
-                    i += 2
-                    continue
-                in_quote = None
-            i += 1
-            continue
-        if in_quote == '"':
-            buf.append(ch)
-            if ch == "`" and i + 1 < n:
-                buf.append(text[i + 1])
-                i += 2
-                continue
-            if ch == "\\" and i + 1 < n and text[i + 1] in ('"', "\\"):
-                buf.append(text[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                in_quote = None
-            i += 1
-            continue
-
-        if ch in ("'", '"'):
-            in_quote = ch
-            buf.append(ch)
-        elif ch == "(":
-            paren_depth += 1
-            buf.append(ch)
-        elif ch == ")":
-            paren_depth -= 1
-            if paren_depth < 0:
-                return None
-            buf.append(ch)
-        elif ch == "{":
-            brace_depth += 1
-            if brace_depth > 1:
-                return None
-            buf.append(ch)
-        elif ch == "}":
-            brace_depth -= 1
-            if brace_depth < 0:
-                return None
-            buf.append(ch)
-        elif ch in ";\r\n" and paren_depth == 0 and brace_depth == 0:
-            stmt = "".join(buf).strip()
-            if stmt:
-                stmts.append(stmt)
-                if len(stmts) > MAX_TEAMWORK_STATEMENTS:
-                    return None
-            buf = []
-        else:
-            buf.append(ch)
-        i += 1
-
-    if in_quote is not None or paren_depth != 0 or brace_depth != 0:
-        return None
-    tail = "".join(buf).strip()
-    if tail:
-        stmts.append(tail)
-        if len(stmts) > MAX_TEAMWORK_STATEMENTS:
-            return None
-    return stmts or None
-
-
-def _parse_ps_double_quoted_text(
-    inner: str, known_vars: dict[str, str] | set[str], *, allow_backtick_escapes: bool
-) -> str | None:
-    """二重引用文字列内の展開が既知変数のみであることを検証し、解決済み文字列（または空でない値）を返す。"""
-    if "$(" in inner:
-        return None
-    out: list[str] = []
-    j = 0
-    m = len(inner)
-    while j < m:
-        ch = inner[j]
-        if ch == "`":
-            if not allow_backtick_escapes or j + 1 >= m or inner[j + 1] not in "nrt\"'`$":
-                return None
-            out.append(inner[j + 1])
-            j += 2
-            continue
-        if ch == "$":
-            if j + 1 >= m:
-                return None
-            if inner[j + 1] == "{":
-                var_m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\}", inner[j + 2 :])
-                if not var_m:
-                    return None
-                vname = var_m.group(1).lower()
-                if vname not in known_vars:
-                    return None
-                if isinstance(known_vars, dict):
-                    out.append(known_vars[vname])
-                else:
-                    out.append(f"${{{vname}}}")
-                j += 2 + len(var_m.group(0))
-                continue
-            var_m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)", inner[j + 1 :])
-            if not var_m:
-                return None
-            after_idx = j + 1 + len(var_m.group(1))
-            if after_idx < m and inner[after_idx] in ":([.":
-                return None
-            vname = var_m.group(1).lower()
-            if vname not in known_vars:
-                return None
-            if isinstance(known_vars, dict):
-                out.append(known_vars[vname])
-            else:
-                out.append(f"${vname}")
-            j = after_idx
-            continue
-        out.append(ch)
-        j += 1
-    return "".join(out)
-
-
-def _resolve_ps_path_expr(expr: str, path_vars: dict[str, str]) -> str | None:
-    """PowerShell のパス式を静的評価して文字列パスへ解決する。安全でない場合は None。"""
-    inner = _strip_outer_parens(expr)
-    if inner is None or not inner:
-        return None
-
-    sq = _extract_single_quoted_literal(inner)
-    if sq is not None:
-        return sq
-
-    var_m = re.fullmatch(r"\$([A-Za-z_][A-Za-z0-9_]*)", inner)
-    if var_m:
-        return path_vars.get(var_m.group(1).lower())
-
-    dq = _extract_double_quoted_inner(inner)
-    if dq is not None:
-        return _parse_ps_double_quoted_text(dq, path_vars, allow_backtick_escapes=False)
-
-    jp_m = re.match(r"^Join-Path\s+(.+)$", inner, re.IGNORECASE)
-    if jp_m:
-        args = _split_ps_args(jp_m.group(1))
-        if args is None:
-            return None
-        base_expr: str | None = None
-        child_expr: str | None = None
-        pos: list[str] = []
-        idx = 0
-        while idx < len(args):
-            tok = args[idx]
-            if tok.startswith("-"):
-                flag, has_colon, inline_val = tok.partition(":")
-                low_flag = flag.lower()
-                if low_flag in {"-path", "-childpath"}:
-                    if has_colon:
-                        val = inline_val
-                    elif idx + 1 < len(args):
-                        idx += 1
-                        val = args[idx]
-                    else:
-                        return None
-                    if low_flag == "-path":
-                        if base_expr is not None:
-                            return None
-                        base_expr = val
-                    else:
-                        if child_expr is not None:
-                            return None
-                        child_expr = val
-                else:
-                    return None
-            else:
-                pos.append(tok)
-            idx += 1
-        for p in pos:
-            if base_expr is None:
-                base_expr = p
-            elif child_expr is None:
-                child_expr = p
-            else:
-                return None
-        if base_expr is None or child_expr is None:
-            return None
-        base = _resolve_ps_path_expr(base_expr, path_vars)
-        child = _resolve_ps_path_expr(child_expr, path_vars)
-        if not base or not child:
-            return None
-        if child.startswith(("/", "\\")) or ".." in child.replace("\\", "/").split("/"):
-            return None
-        if any(ch in child for ch in ":*?[]") or any(ord(ch) < 32 for ch in child):
-            return None
-        return base.rstrip("/\\") + "/" + child.replace("\\", "/").lstrip("/")
-
-    sp_m = re.match(r"^Split-Path\s+(.+)$", inner, re.IGNORECASE)
-    if sp_m:
-        args = _split_ps_args(sp_m.group(1))
-        if args is None:
-            return None
-        target_expr: str | None = None
-        idx = 0
-        while idx < len(args):
-            tok = args[idx]
-            if tok.startswith("-"):
-                flag, has_colon, inline_val = tok.partition(":")
-                low_flag = flag.lower()
-                if low_flag == "-parent" and not has_colon:
-                    idx += 1
-                    continue
-                if low_flag in {"-path", "-literalpath"}:
-                    if has_colon:
-                        val = inline_val
-                    elif idx + 1 < len(args):
-                        idx += 1
-                        val = args[idx]
-                    else:
-                        return None
-                    if target_expr is not None:
-                        return None
-                    target_expr = val
-                else:
-                    return None
-            else:
-                if target_expr is not None:
-                    return None
-                target_expr = tok
-            idx += 1
-        if target_expr is None:
-            return None
-        resolved = _resolve_ps_path_expr(target_expr, path_vars)
-        if not resolved:
-            return None
-        norm = resolved.replace("\\", "/").rstrip("/")
-        if "/" not in norm:
-            return None
-        return norm.rsplit("/", 1)[0]
+    if transcript_path:
+        tr = Path(transcript_path)
+        for parent in tr.parents:
+            if parent.name.lower() == low_id:
+                return parent.parent
 
     return None
 
 
-def _is_safe_ps_text_expr(
-    expr: str, text_vars: set[str], path_vars: dict[str, str]
-) -> bool:
-    """文字列式が静的リテラル・既知変数・+ 連結のみで構成されているか検証する。"""
-    inner = _strip_outer_parens(expr)
-    if inner is None or not inner:
-        return False
-
-    parts = _split_top_level_char(inner, "+")
-    if parts is None:
-        return False
-
-    known_vars = text_vars | set(path_vars.keys())
-    for part in parts:
-        p = _strip_outer_parens(part)
-        if p is None or not p:
-            return False
-        if _extract_single_quoted_literal(p) is not None:
-            continue
-        var_m = re.fullmatch(r"\$([A-Za-z_][A-Za-z0-9_]*)", p)
-        if var_m:
-            if var_m.group(1).lower() not in known_vars:
-                return False
-            continue
-        dq = _extract_double_quoted_inner(p)
-        if dq is not None:
-            if _parse_ps_double_quoted_text(dq, known_vars, allow_backtick_escapes=True) is None:
-                return False
-            continue
-        return False
-    return True
-
-
-def _is_safe_ps_encoding_expr(expr: str, enc_vars: set[str]) -> bool:
-    """PowerShell エンコーディング指定式が許可パターンに一致するか検証する。"""
-    inner = _strip_outer_parens(expr)
-    if inner is None or not inner:
-        return False
-    var_m = re.fullmatch(r"\$([A-Za-z_][A-Za-z0-9_]*)", inner)
-    if var_m:
-        return var_m.group(1).lower() in enc_vars
-    patterns = (
-        r"^\[(?:System\.)?Text\.UTF8Encoding\]::new\(\s*(?:\$false|\$true)?\s*\)$",
-        r"^New-Object\s+(?:-TypeName\s+)?(?:System\.)?Text\.UTF8Encoding(?:\s+(?:\$false|\$true)|\s*\(\s*(?:\$false|\$true)\s*\))?$",
-        r"^\[(?:System\.)?Text\.Encoding\]::(?:UTF8|Unicode|ASCII)$",
-    )
-    return any(re.fullmatch(pat, inner, re.IGNORECASE) for pat in patterns)
-
-
-def _extract_ps_single_path_arg(
-    rest: str, path_vars: dict[str, str], *, allow_flags: frozenset[str] = frozenset()
-) -> str | None:
-    """-Path / -LiteralPath または位置引数 1 件のパス式を解決して返す。"""
-    args = _split_ps_args(rest)
-    if args is None:
-        return None
-    target_expr: str | None = None
-    idx = 0
-    while idx < len(args):
-        tok = args[idx]
-        if tok.startswith("-"):
-            flag, has_colon, inline_val = tok.partition(":")
-            low_flag = flag.lower()
-            if low_flag in allow_flags and not has_colon:
-                idx += 1
-                continue
-            if low_flag in {"-path", "-literalpath"}:
-                if has_colon:
-                    val = inline_val
-                elif idx + 1 < len(args):
-                    idx += 1
-                    val = args[idx]
-                else:
-                    return None
-                if target_expr is not None:
-                    return None
-                target_expr = val
-            else:
-                return None
-        else:
-            if target_expr is not None:
-                return None
-            target_expr = tok
-        idx += 1
-    if target_expr is None:
-        return None
-    return _resolve_ps_path_expr(target_expr, path_vars)
-
-
-def _is_safe_ps_dir_create_stmt(stmt: str, path_vars: dict[str, str]) -> bool:
-    """ディレクトリ作成文が .agents/teamwork 配下のみを対象としているか検証する。"""
-    pipe_parts = _split_top_level_char(stmt, "|")
-    if pipe_parts is None:
-        return False
-    if len(pipe_parts) == 2:
-        if pipe_parts[1].strip().lower() != "out-null":
-            return False
-        head_stmt = pipe_parts[0].strip()
-    elif len(pipe_parts) == 1:
-        head_stmt = pipe_parts[0].strip()
-    else:
-        return False
-
-    dir_method_m = re.fullmatch(
-        r"\[(?:System\.)?IO\.Directory\]::CreateDirectory\((.+)\)",
-        head_stmt,
-        re.IGNORECASE,
-    )
-    if dir_method_m:
-        resolved = _resolve_ps_path_expr(dir_method_m.group(1), path_vars)
-        return resolved is not None and _is_safe_teamwork_dir(resolved)
-
-    args = _split_ps_args(head_stmt)
-    if not args:
-        return False
-    cmd = args[0].lower()
-    if cmd in {"mkdir", "md"}:
-        resolved = _extract_ps_single_path_arg(
-            " ".join(args[1:]), path_vars, allow_flags=frozenset({"-force"})
-        )
-        return resolved is not None and _is_safe_teamwork_dir(resolved)
-
-    if cmd == "new-item":
-        item_type: str | None = None
-        target_expr: str | None = None
-        idx = 1
-        while idx < len(args):
-            tok = args[idx]
-            if tok.startswith("-"):
-                flag, has_colon, inline_val = tok.partition(":")
-                low_flag = flag.lower()
-                if low_flag == "-force" and not has_colon:
-                    idx += 1
-                    continue
-                if low_flag in {"-itemtype", "-type", "-path", "-literalpath"}:
-                    if has_colon:
-                        val = inline_val
-                    elif idx + 1 < len(args):
-                        idx += 1
-                        val = args[idx]
-                    else:
-                        return False
-                    if low_flag in {"-itemtype", "-type"}:
-                        if item_type is not None:
-                            return False
-                        item_type = val
-                    else:
-                        if target_expr is not None:
-                            return False
-                        target_expr = val
-                else:
-                    return False
-            else:
-                if target_expr is not None:
-                    return False
-                target_expr = tok
-            idx += 1
-        if item_type is None or target_expr is None:
-            return False
-        item_unq = _extract_single_quoted_literal(item_type)
-        if item_unq is None:
-            item_unq = item_type.strip().strip('"')
-        if item_unq.lower() not in {"directory", "d"}:
-            return False
-        resolved = _resolve_ps_path_expr(target_expr, path_vars)
-        return resolved is not None and _is_safe_teamwork_dir(resolved)
-
-    return False
-
-
-def _is_safe_ps_test_path_expr(expr: str, path_vars: dict[str, str]) -> bool:
-    inner = _strip_outer_parens(expr)
-    if inner is None:
-        return False
-    m = re.match(r"^Test-Path\s+(.+)$", inner, re.IGNORECASE)
-    if not m:
-        return False
-    resolved = _extract_ps_single_path_arg(m.group(1), path_vars)
-    return resolved is not None and _is_safe_teamwork_dir(resolved)
-
-
-def _is_safe_ps_get_item_expr(expr: str, path_vars: dict[str, str]) -> bool:
-    inner = _strip_outer_parens(expr)
-    if inner is None:
-        return False
-    m = re.match(r"^Get-Item\s+(.+)$", inner, re.IGNORECASE)
-    if not m:
-        return False
-    resolved = _extract_ps_single_path_arg(m.group(1), path_vars)
-    return resolved is not None and _is_safe_teamwork_dir(resolved)
-
-
-def _match_ps_if_dir_create(stmt: str) -> tuple[str, str] | None:
-    """if (-not (Test-Path ...)) { <body_stmt> } 形式から (cond_inner, body_stmt) を抽出する。"""
-    m = re.match(r"^if\s*\(", stmt, re.IGNORECASE)
-    if not m:
-        return None
-    i = m.end()
-    n = len(stmt)
-    depth = 1
-    in_quote: str | None = None
-    cond_start = i
-    while i < n and depth > 0:
-        ch = stmt[i]
-        if in_quote == "'":
-            if ch == "'":
-                if i + 1 < n and stmt[i + 1] == "'":
-                    i += 2
-                    continue
-                in_quote = None
-            i += 1
-            continue
-        if in_quote == '"':
-            if ch == "`" and i + 1 < n:
-                i += 2
-                continue
-            if ch == "\\" and i + 1 < n and stmt[i + 1] in ('"', "\\"):
-                i += 2
-                continue
-            if ch == '"':
-                in_quote = None
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            in_quote = ch
-        elif ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                break
-        i += 1
-    if depth != 0 or in_quote is not None:
-        return None
-    cond_str = stmt[cond_start:i].strip()
-    rest = stmt[i + 1 :].strip()
-    if not rest.startswith("{") or not rest.endswith("}"):
-        return None
-    body_str = rest[1:-1].strip()
-    if not body_str:
-        return None
-    return cond_str, body_str
-
-
-def _is_whitelisted_ps_teamwork_md_write(stripped: str) -> bool:
-    """PowerShell の .agents/teamwork 配下 .md 作成・更新スクリプトを厳格に記号検証する。"""
-    stmts = _split_ps_statements(stripped)
-    if stmts is None:
-        return False
-
-    path_vars: dict[str, str] = {}
-    text_vars: set[str] = set()
-    enc_vars: set[str] = set()
-    md_write_count = 0
-    last_was_cmd = False
-
-    for stmt in stmts:
-        if PS_FAILFAST_GUARD_RE.fullmatch(stmt):
-            if not last_was_cmd:
-                return False
-            last_was_cmd = False
-            continue
-
-        ps_env_m = PS_ENV_ASSIGN_RE.fullmatch(stmt)
-        if ps_env_m:
-            name = ps_env_m.group(1)
-            val = next(g for g in ps_env_m.groups()[1:] if g is not None)
-            if not _is_safe_env_assignment(name, val, case_insensitive=True):
-                return False
-            last_was_cmd = False
-            continue
-
-        assign_m = re.match(r"^\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$", stmt, re.DOTALL)
-        if assign_m and not stmt.lstrip().lower().startswith("if"):
-            vname = assign_m.group(1).lower()
-            rhs = assign_m.group(2).strip()
-            if _is_safe_ps_encoding_expr(rhs, enc_vars):
-                enc_vars.add(vname)
-                path_vars.pop(vname, None)
-                text_vars.discard(vname)
-                last_was_cmd = False
-                continue
-            resolved_path = _resolve_ps_path_expr(rhs, path_vars)
-            if resolved_path is not None and _is_safe_teamwork_dir(resolved_path):
-                path_vars[vname] = resolved_path
-                text_vars.discard(vname)
-                enc_vars.discard(vname)
-                last_was_cmd = False
-                continue
-            if _is_safe_ps_text_expr(rhs, text_vars, path_vars):
-                text_vars.add(vname)
-                path_vars.pop(vname, None)
-                enc_vars.discard(vname)
-                last_was_cmd = False
-                continue
-            return False
-
-        if_pair = _match_ps_if_dir_create(stmt)
-        if if_pair is not None:
-            cond_str, body_str = if_pair
-            cond_m = re.match(r"^(?:-not\s+|!\s*)(.+)$", cond_str, re.IGNORECASE)
-            if not cond_m or not _is_safe_ps_test_path_expr(cond_m.group(1), path_vars):
-                return False
-            if not _is_safe_ps_dir_create_stmt(body_str, path_vars):
-                return False
-            last_was_cmd = True
-            continue
-
-        if _is_safe_ps_dir_create_stmt(stmt, path_vars):
-            last_was_cmd = True
-            continue
-
-        file_write_m = re.fullmatch(
-            r"\[(?:System\.)?IO\.File\]::(?:WriteAllText|AppendAllText)\((.+)\)",
-            stmt,
-            re.IGNORECASE,
-        )
-        if file_write_m:
-            call_args = _split_top_level_char(file_write_m.group(1), ",")
-            if call_args is None or len(call_args) not in {2, 3}:
-                return False
-            target_path = _resolve_ps_path_expr(call_args[0], path_vars)
-            if target_path is None or not _is_safe_teamwork_md_file(target_path):
-                return False
-            if not _is_safe_ps_text_expr(call_args[1], text_vars, path_vars):
-                return False
-            if len(call_args) == 3 and not _is_safe_ps_encoding_expr(call_args[2], enc_vars):
-                return False
-            md_write_count += 1
-            last_was_cmd = True
-            continue
-
-        pipe_parts = _split_top_level_char(stmt, "|")
-        if pipe_parts is None:
-            return False
-
-        # <textExpr> | Set-Content / Add-Content / Out-File ...
-        if len(pipe_parts) == 2:
-            cmd_args = _split_ps_args(pipe_parts[1])
-            if cmd_args and cmd_args[0].lower() in {"set-content", "add-content", "out-file"}:
-                if not _is_safe_ps_text_expr(pipe_parts[0], text_vars, path_vars):
-                    return False
-                if not _validate_ps_content_write(
-                    cmd_args, path_vars, text_vars, has_piped_value=True
-                ):
-                    return False
-                md_write_count += 1
-                last_was_cmd = True
-                continue
-
-            # Get-Item ... | Select-Object <ident-list>
-            if (
-                _is_safe_ps_get_item_expr(pipe_parts[0], path_vars)
-                and re.fullmatch(
-                    r"Select-Object\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*",
-                    pipe_parts[1].strip(),
-                    re.IGNORECASE,
-                )
-            ):
-                last_was_cmd = True
-                continue
-
-            return False
-
-        if len(pipe_parts) != 1:
-            return False
-
-        single = pipe_parts[0]
-
-        prop_m = re.fullmatch(r"(.+)\.([A-Za-z_][A-Za-z0-9_]*)", single)
-        if prop_m and _is_safe_ps_get_item_expr(prop_m.group(1), path_vars):
-            last_was_cmd = True
-            continue
-
-        if _is_safe_ps_test_path_expr(single, path_vars) or _is_safe_ps_get_item_expr(
-            single, path_vars
-        ):
-            last_was_cmd = True
-            continue
-
-        args = _split_ps_args(single)
-        if not args:
-            return False
-        cmd_low = args[0].lower()
-
-        if cmd_low in {"set-content", "add-content", "out-file"}:
-            if not _validate_ps_content_write(args, path_vars, text_vars, has_piped_value=False):
-                return False
-            md_write_count += 1
-            last_was_cmd = True
-            continue
-
-        if cmd_low == "copy-item":
-            if not _validate_ps_copy_md(args[1:], path_vars):
-                return False
-            md_write_count += 1
-            last_was_cmd = True
-            continue
-
-        if cmd_low == "write-output":
-            if len(args) < 2 or not all(
-                _is_safe_ps_text_expr(arg, text_vars, path_vars) for arg in args[1:]
-            ):
-                return False
-            last_was_cmd = True
-            continue
-
-        return False
-
-    return md_write_count >= 1
-
-
-def _validate_ps_content_write(
-    args: list[str],
-    path_vars: dict[str, str],
-    text_vars: set[str],
+def _is_teamwork_conversation(
+    conversation_id: str,
     *,
-    has_piped_value: bool,
+    transcript_path: str = "",
+    artifact_dir: str = "",
+    brain_root: Path | None = None,
+    max_depth: int = MAX_TEAMWORK_PARENT_DEPTH,
 ) -> bool:
-    """Set-Content / Add-Content / Out-File 引数検証。"""
-    cmd_low = args[0].lower()
-    path_expr: str | None = None
-    value_expr: str | None = None
-    pos: list[str] = []
-    idx = 1
-    while idx < len(args):
-        tok = args[idx]
-        if tok.startswith("-"):
-            flag, has_colon, inline_val = tok.partition(":")
-            low_flag = flag.lower()
-            if low_flag in {"-nonewline", "-force"} and not has_colon:
-                idx += 1
-                continue
-            path_flags = {"-path", "-literalpath"}
-            if cmd_low == "out-file":
-                path_flags = path_flags | {"-filepath"}
-            if low_flag in path_flags:
-                val = inline_val if has_colon else (args[idx + 1] if idx + 1 < len(args) else None)
-                if val is None or path_expr is not None:
-                    return False
-                if not has_colon:
-                    idx += 1
-                path_expr = val
-            elif low_flag in {"-value", "-inputobject"}:
-                if has_piped_value:
-                    return False
-                val = inline_val if has_colon else (args[idx + 1] if idx + 1 < len(args) else None)
-                if val is None or value_expr is not None:
-                    return False
-                if not has_colon:
-                    idx += 1
-                value_expr = val
-            elif low_flag == "-encoding":
-                val = inline_val if has_colon else (args[idx + 1] if idx + 1 < len(args) else None)
-                if val is None:
-                    return False
-                if not has_colon:
-                    idx += 1
-                unq = _extract_single_quoted_literal(val)
-                if unq is None:
-                    unq = val.strip().strip('"')
-                if unq.lower() not in PS_SAFE_ENCODINGS:
-                    return False
-            else:
-                return False
-        else:
-            pos.append(tok)
-        idx += 1
+    """ランタイム生成の親チェーン（sender と subagents/<id>.json）から /teamwork 配下か判定する。"""
+    if not UUID_RE.fullmatch(conversation_id):
+        return False
+    root = brain_root or _resolve_brain_root(conversation_id, transcript_path, artifact_dir)
+    if root is None:
+        return False
 
-    for p in pos:
-        if path_expr is None:
-            path_expr = p
-        elif value_expr is None and not has_piped_value:
-            value_expr = p
-        else:
+    visited: set[str] = set()
+    cur = conversation_id
+    for _ in range(max_depth):
+        low_cur = cur.lower()
+        if low_cur in visited:
             return False
+        visited.add(low_cur)
 
-    if path_expr is None or (not has_piped_value and value_expr is None):
-        return False
-    resolved = _resolve_ps_path_expr(path_expr, path_vars)
-    if resolved is None or not _is_safe_teamwork_md_file(resolved):
-        return False
-    if value_expr is not None and not _is_safe_ps_text_expr(value_expr, text_vars, path_vars):
-        return False
-    return True
-
-
-def _validate_ps_copy_md(args: list[str], path_vars: dict[str, str]) -> bool:
-    """Copy-Item が .agents/teamwork 配下の .md 同士の複製に限定されているか検証する。"""
-    src_expr: str | None = None
-    dst_expr: str | None = None
-    pos: list[str] = []
-    idx = 0
-    while idx < len(args):
-        tok = args[idx]
-        if tok.startswith("-"):
-            flag, has_colon, inline_val = tok.partition(":")
-            low_flag = flag.lower()
-            if low_flag == "-force" and not has_colon:
-                idx += 1
-                continue
-            if low_flag in {"-path", "-literalpath", "-destination"}:
-                val = inline_val if has_colon else (args[idx + 1] if idx + 1 < len(args) else None)
-                if val is None:
-                    return False
-                if not has_colon:
-                    idx += 1
-                if low_flag == "-destination":
-                    if dst_expr is not None:
-                        return False
-                    dst_expr = val
-                else:
-                    if src_expr is not None:
-                        return False
-                    src_expr = val
-            else:
-                return False
-        else:
-            pos.append(tok)
-        idx += 1
-
-    for p in pos:
-        if src_expr is None:
-            src_expr = p
-        elif dst_expr is None:
-            dst_expr = p
-        else:
-            return False
-
-    if src_expr is None or dst_expr is None:
-        return False
-    src_path = _resolve_ps_path_expr(src_expr, path_vars)
-    dst_path = _resolve_ps_path_expr(dst_expr, path_vars)
-    return (
-        src_path is not None
-        and dst_path is not None
-        and _is_safe_teamwork_md_file(src_path)
-        and _is_safe_teamwork_md_file(dst_path)
-    )
-
-
-def _split_posix_teamwork_statements(stripped: str) -> list[str] | None:
-    """POSIX シェル文を改行・;・&& で分割し、パイプやサブシェル等の危険構文を拒否する。"""
-    if re.search(r"`|\$\(|\$\{", stripped):
-        return None
-    stmts: list[str] = []
-    buf: list[str] = []
-    quote: str | None = None
-    i = 0
-    n = len(stripped)
-
-    while i < n:
-        ch = stripped[i]
-        if quote == "'":
-            buf.append(ch)
-            if ch == "'":
-                quote = None
-            i += 1
-            continue
-        if quote == '"':
-            if ch == "\\" and i + 1 < n and stripped[i + 1] in ('"', "\\", "$", "`"):
-                buf.append(ch)
-                buf.append(stripped[i + 1])
-                i += 2
-                continue
-            if ch == "$":
-                return None
-            buf.append(ch)
-            if ch == '"':
-                quote = None
-            i += 1
-            continue
-
-        if ch in ("'", '"'):
-            quote = ch
-            buf.append(ch)
-            i += 1
-            continue
-
-        if ch == "|":
-            return None
-        if ch == "&":
-            if i + 1 < n and stripped[i + 1] == "&" and (i + 2 >= n or stripped[i + 2] != "&"):
-                stmt = "".join(buf).strip()
-                if not stmt:
-                    return None
-                stmts.append(stmt)
-                if len(stmts) > MAX_TEAMWORK_STATEMENTS:
-                    return None
-                buf = []
-                i += 2
-                continue
-            return None
-        if ch in ";\r\n":
-            stmt = "".join(buf).strip()
-            if stmt:
-                stmts.append(stmt)
-                if len(stmts) > MAX_TEAMWORK_STATEMENTS:
-                    return None
-            buf = []
-            i += 1
-            continue
-
-        buf.append(ch)
-        i += 1
-
-    if quote is not None:
-        return None
-    tail = "".join(buf).strip()
-    if tail:
-        stmts.append(tail)
-        if len(stmts) > MAX_TEAMWORK_STATEMENTS:
-            return None
-    return stmts or None
-
-
-def _unquote_posix_token(tok: str) -> str | None:
-    s = tok.strip()
-    if not s:
-        return None
-    if len(s) >= 2 and s[0] == "'" and s[-1] == "'":
-        return s[1:-1] if "'" not in s[1:-1] else None
-    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
-        inner = s[1:-1]
-        if "$" in inner or "`" in inner or '"' in inner:
-            return None
-        return inner
-    if any(ch in s for ch in "'\"$`*?<>|;&()"):
-        return None
-    return s
-
-
-def _is_whitelisted_posix_teamwork_md_write(stripped: str, *, has_heredoc: bool) -> bool:
-    """POSIX の単一引用 heredoc による .agents/teamwork 配下 .md 作成コマンドを検証する。"""
-    if not has_heredoc:
-        return False
-    stmts = _split_posix_teamwork_statements(stripped)
-    if stmts is None:
-        return False
-
-    md_write_count = 0
-    for stmt in stmts:
+        tpath = root / cur / ".system_generated" / "logs" / "transcript.jsonl"
         try:
-            tokens = _tokenize_command(stmt)
-        except ValueError:
+            with tpath.open("r", encoding="utf-8", errors="replace") as fh:
+                first_line = fh.readline()
+            if not first_line:
+                return False
+            first_obj = json.loads(first_line)
+        except (OSError, ValueError, json.JSONDecodeError):
             return False
-        if not tokens:
-            continue
-        head = _command_basename(tokens[0])
 
-        if head == "mkdir":
-            dirs = [t for t in tokens[1:] if t not in {"-p", "--parents"}]
-            if any(t.startswith("-") for t in dirs) or not dirs:
-                return False
-            if not all(_is_safe_teamwork_dir(d) for d in dirs):
-                return False
-            continue
+        if not isinstance(first_obj, dict):
+            return False
+        if first_obj.get("type") != "SYSTEM_MESSAGE" or first_obj.get("source") != "SYSTEM":
+            return False
 
-        if head == "cat":
-            hd_pat = r"<<-?\s*'[A-Za-z_][A-Za-z0-9_]*'"
-            rd_pat = r"(?:>>|>)\s*('[^']+'|\"[^\"]+\"|[^\s;|&<>'\"]+)"
-            m1 = re.fullmatch(rf"cat\s+{hd_pat}\s+{rd_pat}", stmt)
-            m2 = re.fullmatch(rf"cat\s+{rd_pat}\s+{hd_pat}", stmt)
-            m = m1 or m2
-            if not m:
-                return False
-            target = _unquote_posix_token(m.group(1))
-            if target is None or not _is_safe_teamwork_md_file(target):
-                return False
-            md_write_count += 1
-            continue
+        content = str(first_obj.get("content") or "")
+        sender_m = TEAMWORK_SENDER_RE.search(content)
+        if not sender_m:
+            return False
+        parent_id = sender_m.group(1)
+        if not UUID_RE.fullmatch(parent_id):
+            return False
 
-        if head == "ls":
-            paths = [t for t in tokens[1:] if t not in {"-l", "-la", "-lh", "-a", "-1"}]
-            if any(t.startswith("-") for t in paths) or not paths:
-                return False
-            if not all(_is_safe_teamwork_dir(p) for p in paths):
-                return False
-            continue
+        desc_path = root / parent_id / ".system_generated" / "subagents" / f"{cur}.json"
+        try:
+            desc_obj = json.loads(desc_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
 
-        if head == "wc":
-            paths = [t for t in tokens[1:] if t not in {"-l", "-c", "-w", "-m"}]
-            if any(t.startswith("-") for t in paths) or not paths:
-                return False
-            if not all(_is_safe_teamwork_dir(p) for p in paths):
-                return False
-            continue
+        if not isinstance(desc_obj, dict):
+            return False
+        descriptor = desc_obj.get("subagentDescriptor")
+        if not isinstance(descriptor, dict):
+            return False
+        type_name = str(descriptor.get("typeName") or "")
+        if type_name == "teamwork" or type_name.startswith("teamwork_"):
+            return True
 
-        if head == "test":
-            if len(tokens) != 3 or tokens[1] not in {"-f", "-e", "-d"}:
-                return False
-            if not _is_safe_teamwork_dir(tokens[2]):
-                return False
-            continue
+        cur = parent_id
 
-        return False
-
-    return md_write_count >= 1
-
-
-def _is_whitelisted_teamwork_md_write(
-    command: str, stripped_command: str, herestring_bodies: list[str]
-) -> bool:
-    """/teamwork 用の .agents/teamwork 配下 .md 作成・更新コマンドか検証する（機密検出時は拒否）。"""
-    if dh.scan_text_for_secrets(stripped_command):
-        return False
-    if any(dh.scan_text_for_secrets(body) for body in herestring_bodies):
-        return False
-    if _is_whitelisted_ps_teamwork_md_write(stripped_command):
-        return True
-    if _is_whitelisted_posix_teamwork_md_write(
-        stripped_command, has_heredoc=bool(herestring_bodies)
-    ):
-        return True
     return False
 
 
-def evaluate_stage1(command: str) -> tuple[str, str] | None:
+def evaluate_stage1(
+    command: str, *, is_teamwork: bool = False, cwd: str = ""
+) -> tuple[str, str] | None:
     """第 1 段の決定論的ローカル判定を行う。決着しない場合は None を返す。"""
     if not command.strip():
         return ("ask", "Empty command line; fallback to standard confirmation.")
 
     stripped_for_scan, herestring_bodies = _strip_verbatim_herestrings(command)
-    use_stripped = False
     if herestring_bodies:
         outer_segments = _collect_all_command_segments(stripped_for_scan)
         if not _has_code_exec_sink(stripped_for_scan, outer_segments) and not _has_external_transfer(
             outer_segments
         ):
-            use_stripped = True
             segments = outer_segments
             secret_hits = _extract_secret_file_hits(stripped_for_scan)
         else:
@@ -2766,12 +2030,20 @@ def evaluate_stage1(command: str) -> tuple[str, str] | None:
         )
 
     for seg_tokens in segments:
-        destructive_reason = _check_destructive_command(seg_tokens)
+        destructive_reason = _check_destructive_command(
+            seg_tokens, is_teamwork=is_teamwork, cwd=cwd
+        )
         if destructive_reason is not None:
             return (
                 "force_ask",
                 f"Requires explicit confirmation: destructive operation detected locally ({destructive_reason}).",
             )
+
+    if is_teamwork:
+        return (
+            "allow",
+            "Allowed in active /teamwork subagent session (safety blacklists passed).",
+        )
 
     if not secret_hits and not _has_env_dump(segments):
         allowed, includes_push = _classify_whitelisted_command(command)
@@ -2782,10 +2054,6 @@ def evaluate_stage1(command: str) -> tuple[str, str] | None:
                     "Allowed by local whitelist (safe feature-branch git push and read-only commands).",
                 )
             return ("allow", "Allowed by local read-only and unit-test whitelist.")
-
-        scan_text = stripped_for_scan if use_stripped else command
-        if _is_whitelisted_teamwork_md_write(command, scan_text, herestring_bodies):
-            return ("allow", "Allowed by local whitelist (teamwork markdown file creation).")
 
     return None
 
@@ -2906,8 +2174,10 @@ def evaluate_stage2(
         return ("ask", FALLBACK_REASON)
 
 
-def _extract_hook_context(stdin_payload_text: str) -> tuple[str, str, str]:
-    """PreToolUse 標準入力 JSON から (tool_name, cwd, command_line) を抽出する。"""
+def _extract_hook_metadata(
+    stdin_payload_text: str,
+) -> tuple[str, str, str, str, str, str]:
+    """PreToolUse 標準入力 JSON から (tool_name, cwd, command_line, conversation_id, transcript_path, artifact_dir) を抽出する。"""
     data = json.loads(stdin_payload_text)
     if not isinstance(data, dict):
         raise ValueError("PreToolUse stdin payload must be a JSON object.")
@@ -2928,6 +2198,15 @@ def _extract_hook_context(stdin_payload_text: str) -> tuple[str, str, str]:
     cwd = str(data.get("cwd") or "")
     if not cwd and isinstance(data.get("workspacePaths"), list) and data["workspacePaths"]:
         cwd = str(data["workspacePaths"][0] or "")
+    conversation_id = str(data.get("conversationId") or "")
+    transcript_path = str(data.get("transcriptPath") or "")
+    artifact_dir = str(data.get("artifactDirectoryPath") or "")
+    return tool_name, cwd, command_line, conversation_id, transcript_path, artifact_dir
+
+
+def _extract_hook_context(stdin_payload_text: str) -> tuple[str, str, str]:
+    """PreToolUse 標準入力 JSON から (tool_name, cwd, command_line) を抽出する。"""
+    tool_name, cwd, command_line, _, _, _ = _extract_hook_metadata(stdin_payload_text)
     return tool_name, cwd, command_line
 
 
@@ -2949,6 +2228,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--cwd",
         default="",
         help="--command 指定時に使用する作業ディレクトリ文字列",
+    )
+    parser.add_argument(
+        "--teamwork",
+        action="store_true",
+        help="--command 指定時に /teamwork 配下サブエージェントとして評価する",
     )
     parser.add_argument(
         "--endpoint",
@@ -2983,10 +2267,18 @@ def main(
         tool_name = "run_command"
         cwd = args.cwd
         command_line = args.command
+        is_teamwork = bool(args.teamwork)
     else:
         raw_stdin = stdin_text if stdin_text is not None else sys.stdin.read()
         try:
-            tool_name, cwd, command_line = _extract_hook_context(raw_stdin)
+            (
+                tool_name,
+                cwd,
+                command_line,
+                conversation_id,
+                transcript_path,
+                artifact_dir,
+            ) = _extract_hook_metadata(raw_stdin)
         except (ValueError, json.JSONDecodeError) as exc:
             print(
                 f"pretool_guard: invalid PreToolUse stdin JSON ({redact_secrets(str(exc))})",
@@ -3007,7 +2299,13 @@ def main(
             )
             return 0
 
-    stage1 = evaluate_stage1(command_line)
+        is_teamwork = _is_teamwork_conversation(
+            conversation_id,
+            transcript_path=transcript_path,
+            artifact_dir=artifact_dir,
+        )
+
+    stage1 = evaluate_stage1(command_line, is_teamwork=is_teamwork, cwd=cwd)
     if stage1 is not None:
         decision, reason = stage1
         out: dict[str, Any] = {"decision": decision, "reason": reason}
