@@ -1121,7 +1121,10 @@ class TestPretoolGuard(unittest.TestCase):
         force_ask_cmds = [
             'rg -n "$(rm -rf /)" src/',
             'rg -n "$(echo ok; rm -rf /)" src/',
+            'rg -n "$(echo $(rm -rf /))" .',
+            'rg -n "$(echo (a); rm -rf /)" .',
             'rg -n "`rm -rf /`" src/',
+            'rg -n "foo\\\\" | rm -rf /; echo "bar"',
             'rg --pre "rm -rf /" foo .',
             'rg --pre="rm -rf /" foo .',
             'rg -n "foo|bar" . ; rm -rf /',

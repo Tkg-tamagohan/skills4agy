@@ -353,8 +353,8 @@ def _split_unquoted_top_level(command: str) -> list[str] | None:
             buf.append(ch)
             if ch == quote:
                 quote = None
-            elif quote == '"' and ch == "\\" and i + 1 < n and command[i + 1] == '"':
-                buf.append('"')
+            elif quote == '"' and ch == "\\" and i + 1 < n and command[i + 1] in ('"', "\\"):
+                buf.append(command[i + 1])
                 i += 2
                 continue
             i += 1
@@ -417,6 +417,34 @@ def _is_safe_rg_segment(segment: str) -> bool:
     return True
 
 
+def _extract_paren_cmd_subst_bodies(text: str) -> list[str]:
+    """文字列中の $(...) 本体を括弧対応（ネスト・未閉鎖含む）で再帰抽出する。"""
+    bodies: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i : i + 2] == "$(":
+            start = i + 2
+            depth = 1
+            j = start
+            while j < n and depth > 0:
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            body = text[start:j]
+            if body.strip():
+                bodies.append(body)
+                bodies.extend(_extract_paren_cmd_subst_bodies(body))
+            i = j + 1 if depth == 0 else j
+            continue
+        i += 1
+    return bodies
+
+
 def _extract_double_quoted_substitutions(segment: str) -> list[str]:
     """ダブルクォート内のみから $(...) と `...` の中身を取り出し、サブセグメント列を返す。"""
     dq_chunks: list[str] = []
@@ -433,8 +461,9 @@ def _extract_double_quoted_substitutions(segment: str) -> list[str]:
             i += 1
             continue
         if quote == '"':
-            if ch == "\\" and i + 1 < n and segment[i + 1] == '"':
-                buf.append('\\"')
+            if ch == "\\" and i + 1 < n and segment[i + 1] in ('"', "\\"):
+                buf.append(ch)
+                buf.append(segment[i + 1])
                 i += 2
                 continue
             if ch == '"':
@@ -451,7 +480,7 @@ def _extract_double_quoted_substitutions(segment: str) -> list[str]:
 
     subs: list[str] = []
     for dq in dq_chunks:
-        for body in re.findall(r"\$\(([^)]+)\)", dq):
+        for body in _extract_paren_cmd_subst_bodies(dq):
             subs.extend(_split_top_level_segments_raw(body))
         for body in re.findall(r"`([^`]+)`", dq):
             subs.extend(_split_top_level_segments_raw(body))
@@ -947,8 +976,9 @@ def _split_whitelist_segments(command: str) -> list[str] | None:
             if ch == quote:
                 quote = None
                 buf.append(ch)
-            elif quote == '"' and ch == "\\" and i + 1 < n and command[i + 1] == '"':
-                buf.append('\\"')
+            elif quote == '"' and ch == "\\" and i + 1 < n and command[i + 1] in ('"', "\\"):
+                buf.append(ch)
+                buf.append(command[i + 1])
                 i += 2
                 continue
             else:
