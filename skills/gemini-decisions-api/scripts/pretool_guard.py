@@ -423,7 +423,7 @@ def _tokenize_lossy(segment: str) -> list[str]:
         return segment.split()
 
 
-def _split_top_level_segments_raw(text: str) -> list[str]:
+def _split_top_level_segments_raw(text: str, *, posix_shell: bool = False) -> list[str]:
     """連結記号・パイプ・改行および $() / バッククォート内をセグメント分割する（従来分割）。"""
     raw_parts = re.split(r"&&|\|\||[;|&`]|[\r\n]+", text)
     segments: list[str] = []
@@ -433,20 +433,21 @@ def _split_top_level_segments_raw(text: str) -> list[str]:
             continue
         segments.append(stripped)
         for m in re.finditer(r"\$\(([^)]+)\)", stripped):
-            backslashes = 0
-            k = m.start() - 1
-            while k >= 0 and stripped[k] == "\\":
-                backslashes += 1
-                k -= 1
-            if backslashes % 2 == 1:
-                continue
+            if posix_shell:
+                backslashes = 0
+                k = m.start() - 1
+                while k >= 0 and stripped[k] == "\\":
+                    backslashes += 1
+                    k -= 1
+                if backslashes % 2 == 1:
+                    continue
             sub_stripped = m.group(1).strip()
             if sub_stripped:
                 segments.append(sub_stripped)
     return segments
 
 
-def _split_unquoted_top_level(command: str) -> list[str] | None:
+def _split_unquoted_top_level(command: str, *, posix_shell: bool = False) -> list[str] | None:
     """クォート外の連結記号・パイプ・改行で分割する。未閉鎖クォート時は None を返す。"""
     parts: list[str] = []
     buf: list[str] = []
@@ -460,7 +461,7 @@ def _split_unquoted_top_level(command: str) -> list[str] | None:
             buf.append(ch)
             if ch == quote:
                 quote = None
-            elif quote == '"' and ch == "\\" and i + 1 < n and command[i + 1] in ('"', "\\"):
+            elif posix_shell and quote == '"' and ch == "\\" and i + 1 < n and command[i + 1] in ('"', "\\"):
                 buf.append(command[i + 1])
                 i += 2
                 continue
@@ -605,7 +606,7 @@ def _unescape_backtick_body(body: str, *, in_double_quote: bool) -> str:
     return "".join(out)
 
 
-def _find_matching_paren_subst(text: str, start: int) -> int | None:
+def _find_matching_paren_subst(text: str, start: int, *, posix_shell: bool = False) -> int | None:
     """$( の直後から対応する ) の位置をクォート・ネストを考慮して返す。未閉鎖時は None。"""
     depth = 1
     quote: str | None = None
@@ -619,11 +620,11 @@ def _find_matching_paren_subst(text: str, start: int) -> int | None:
             i += 1
             continue
         if quote == '"':
-            if ch == "\\" and i + 1 < n:
+            if posix_shell and ch == "\\" and i + 1 < n:
                 i += 2
                 continue
             if text[i : i + 2] == "$(":
-                end = _find_matching_paren_subst(text, i + 2)
+                end = _find_matching_paren_subst(text, i + 2, posix_shell=posix_shell)
                 if end is None:
                     return None
                 i = end + 1
@@ -638,7 +639,7 @@ def _find_matching_paren_subst(text: str, start: int) -> int | None:
                 quote = None
             i += 1
             continue
-        if ch == "\\" and i + 1 < n:
+        if posix_shell and ch == "\\" and i + 1 < n:
             i += 2
             continue
         if ch in ("'", '"'):
@@ -646,7 +647,7 @@ def _find_matching_paren_subst(text: str, start: int) -> int | None:
             i += 1
             continue
         if text[i : i + 2] == "$(":
-            end = _find_matching_paren_subst(text, i + 2)
+            end = _find_matching_paren_subst(text, i + 2, posix_shell=posix_shell)
             if end is None:
                 return None
             i = end + 1
@@ -667,7 +668,7 @@ def _find_matching_paren_subst(text: str, start: int) -> int | None:
     return None
 
 
-def _extract_command_substitutions(text: str) -> list[str]:
+def _extract_command_substitutions(text: str, *, posix_shell: bool = False) -> list[str]:
     """単一引用外（未引用＋ダブルクォート内）からエスケープを除外し対応が閉じた $(...) / `...` 本体を再帰抽出する。"""
     bodies: list[str] = []
     quote: str | None = None
@@ -681,16 +682,16 @@ def _extract_command_substitutions(text: str) -> list[str]:
             i += 1
             continue
         if quote == '"':
-            if ch == "\\" and i + 1 < n:
+            if posix_shell and ch == "\\" and i + 1 < n:
                 i += 2
                 continue
             if text[i : i + 2] == "$(":
-                end = _find_matching_paren_subst(text, i + 2)
+                end = _find_matching_paren_subst(text, i + 2, posix_shell=posix_shell)
                 if end is not None:
                     body = text[i + 2 : end]
                     if body.strip():
                         bodies.append(body)
-                        bodies.extend(_extract_command_substitutions(body))
+                        bodies.extend(_extract_command_substitutions(body, posix_shell=posix_shell))
                     i = end + 1
                     continue
                 i += 2
@@ -701,7 +702,7 @@ def _extract_command_substitutions(text: str) -> list[str]:
                     body = _unescape_backtick_body(text[i + 1 : end], in_double_quote=True)
                     if body.strip():
                         bodies.append(body)
-                        bodies.extend(_extract_command_substitutions(body))
+                        bodies.extend(_extract_command_substitutions(body, posix_shell=posix_shell))
                     i = end + 1
                     continue
                 i += 1
@@ -710,7 +711,7 @@ def _extract_command_substitutions(text: str) -> list[str]:
                 quote = None
             i += 1
             continue
-        if ch == "\\" and i + 1 < n and text[i + 1] in ("$", "`", "\\", "'", '"'):
+        if posix_shell and ch == "\\" and i + 1 < n and text[i + 1] in ("$", "`", "\\", "'", '"'):
             i += 2
             continue
         if ch in ("'", '"'):
@@ -718,12 +719,12 @@ def _extract_command_substitutions(text: str) -> list[str]:
             i += 1
             continue
         if text[i : i + 2] == "$(":
-            end = _find_matching_paren_subst(text, i + 2)
+            end = _find_matching_paren_subst(text, i + 2, posix_shell=posix_shell)
             if end is not None:
                 body = text[i + 2 : end]
                 if body.strip():
                     bodies.append(body)
-                    bodies.extend(_extract_command_substitutions(body))
+                    bodies.extend(_extract_command_substitutions(body, posix_shell=posix_shell))
                 i = end + 1
                 continue
             i += 2
@@ -734,7 +735,7 @@ def _extract_command_substitutions(text: str) -> list[str]:
                 body = _unescape_backtick_body(text[i + 1 : end], in_double_quote=False)
                 if body.strip():
                     bodies.append(body)
-                    bodies.extend(_extract_command_substitutions(body))
+                    bodies.extend(_extract_command_substitutions(body, posix_shell=posix_shell))
                 i = end + 1
                 continue
             i += 1
@@ -743,19 +744,23 @@ def _extract_command_substitutions(text: str) -> list[str]:
     return bodies
 
 
-def _extract_rg_substitutions(segment: str) -> list[str]:
-    """単一引用外（未引用＋ダブルクォート内）から $(...) と `...` の中身を抽出しサブセグメント列を返す。"""
+def _extract_rg_substitutions(segment: str, *, posix_shell: bool = False) -> list[str]:
+    """単一引用外（未引用＋ダブルクォート内）から $(...) と `...` の中身を抽出し引用境界に沿って分割する。"""
     subs: list[str] = []
-    for body in _extract_command_substitutions(segment):
-        subs.extend(_split_top_level_segments_raw(body))
+    for body in _extract_command_substitutions(segment, posix_shell=posix_shell):
+        parts = _split_unquoted_top_level(body, posix_shell=posix_shell)
+        if parts is not None:
+            subs.extend(parts)
+        else:
+            subs.extend(_split_top_level_segments_raw(body, posix_shell=posix_shell))
     return subs
 
 
-def _split_top_level_segments(command: str) -> list[str]:
+def _split_top_level_segments(command: str, *, posix_shell: bool = False) -> list[str]:
     """連結記号・パイプ・改行および $() / バッククォート内をセグメント分割する。"""
-    unquoted_parts = _split_unquoted_top_level(command)
+    unquoted_parts = _split_unquoted_top_level(command, posix_shell=posix_shell)
     if unquoted_parts is None:
-        return _split_top_level_segments_raw(command)
+        return _split_top_level_segments_raw(command, posix_shell=posix_shell)
 
     segments: list[str] = []
     any_safe_rg = False
@@ -764,9 +769,9 @@ def _split_top_level_segments(command: str) -> list[str]:
             segments.append(part)
             any_safe_rg = True
         else:
-            segments.extend(_split_top_level_segments_raw(part))
+            segments.extend(_split_top_level_segments_raw(part, posix_shell=posix_shell))
     if any_safe_rg:
-        segments.extend(_extract_rg_substitutions(command))
+        segments.extend(_extract_rg_substitutions(command, posix_shell=posix_shell))
     return segments
 
 
@@ -779,7 +784,9 @@ def _command_basename(token: str) -> str:
     return name
 
 
-def _unwrap_segment_tokens(tokens: list[str]) -> list[list[str]]:
+def _unwrap_segment_tokens(
+    tokens: list[str], *, posix_shell: bool = False
+) -> list[list[str]]:
     """sudo 等のラッパーや bash -c / cmd /c / rg --pre 内のコマンド列を展開して返す。"""
     if not tokens:
         return []
@@ -813,23 +820,29 @@ def _unwrap_segment_tokens(tokens: list[str]) -> list[list[str]]:
             )
             if is_cmd_flag and i + 1 < len(sub_tokens):
                 nested = " ".join(sub_tokens[i + 1 :])
-                for seg in _split_top_level_segments(nested):
-                    results.extend(_unwrap_segment_tokens(_tokenize_lossy(seg)))
+                for seg in _split_top_level_segments(nested, posix_shell=posix_shell):
+                    results.extend(
+                        _unwrap_segment_tokens(_tokenize_lossy(seg), posix_shell=posix_shell)
+                    )
                 break
     elif head == "rg":
         _, pre_cmds = _extract_rg_pre_info(sub_tokens[1:])
         for nested in pre_cmds:
             if nested:
-                for seg in _split_top_level_segments(nested):
-                    results.extend(_unwrap_segment_tokens(_tokenize_lossy(seg)))
+                for seg in _split_top_level_segments(nested, posix_shell=posix_shell):
+                    results.extend(
+                        _unwrap_segment_tokens(_tokenize_lossy(seg), posix_shell=posix_shell)
+                    )
     return results
 
 
-def _collect_all_command_segments(command: str) -> list[list[str]]:
+def _collect_all_command_segments(
+    command: str, *, posix_shell: bool = False
+) -> list[list[str]]:
     all_segments: list[list[str]] = []
-    for seg in _split_top_level_segments(command):
+    for seg in _split_top_level_segments(command, posix_shell=posix_shell):
         tokens = _tokenize_lossy(seg)
-        all_segments.extend(_unwrap_segment_tokens(tokens))
+        all_segments.extend(_unwrap_segment_tokens(tokens, posix_shell=posix_shell))
     return all_segments
 
 
@@ -1939,7 +1952,9 @@ def _strip_verbatim_herestrings(command: str) -> tuple[str, list[str]]:
     return stripped, bodies
 
 
-def _extract_executable_text_chunks(stripped_command: str) -> str:
+def _extract_executable_text_chunks(
+    stripped_command: str, *, posix_shell: bool = False
+) -> str:
     """単一/二重引用リテラルを除外し、クォート外およびコマンド置換 $(...) / `...` 本体のみを返す。"""
     chunks: list[str] = []
     buf: list[str] = []
@@ -1961,7 +1976,7 @@ def _extract_executable_text_chunks(stripped_command: str) -> str:
             if ch == "`" and i + 1 < n:
                 i += 2
                 continue
-            if ch == "\\" and i + 1 < n and stripped_command[i + 1] in ('"', "\\"):
+            if posix_shell and ch == "\\" and i + 1 < n and stripped_command[i + 1] in ('"', "\\"):
                 i += 2
                 continue
             if ch == '"':
@@ -1984,18 +1999,20 @@ def _extract_executable_text_chunks(stripped_command: str) -> str:
 
     if buf:
         chunks.append("".join(buf))
-    for body in _extract_command_substitutions(stripped_command):
+    for body in _extract_command_substitutions(stripped_command, posix_shell=posix_shell):
         chunks.append(" " + body + " ")
     return "".join(chunks)
 
 
-def _has_code_exec_sink(stripped_command: str, segments: list[list[str]]) -> bool:
+def _has_code_exec_sink(
+    stripped_command: str, segments: list[list[str]], *, posix_shell: bool = False
+) -> bool:
     """コード実行シンク（シェル起動、eval/iex、呼び出し演算子 &、ドットソース等）を検出する。"""
     for tokens in segments:
         if tokens and _command_basename(tokens[0]) in CODE_EXEC_SINKS:
             return True
 
-    exec_text = _extract_executable_text_chunks(stripped_command)
+    exec_text = _extract_executable_text_chunks(stripped_command, posix_shell=posix_shell)
     if re.search(
         r"\b(?:scriptblock|invoke-expression|iex|invoke-command|icm)\b",
         exec_text,
@@ -2151,8 +2168,31 @@ def _is_teamwork_conversation(
     return False
 
 
+def _collect_quote_aware_segments(
+    command_text: str, *, posix_shell: bool = False
+) -> list[list[str]] | None:
+    """引用境界を保ったまま実際のコマンドセグメントと展開式のみを抽出し展開する。"""
+    unquoted_parts = _split_unquoted_top_level(command_text, posix_shell=posix_shell)
+    if unquoted_parts is None:
+        return None
+
+    extracted: list[list[str]] = []
+    for part in unquoted_parts:
+        extracted.extend(
+            _unwrap_segment_tokens(_tokenize_lossy(part), posix_shell=posix_shell)
+        )
+    for sub in _extract_rg_substitutions(command_text, posix_shell=posix_shell):
+        extracted.extend(
+            _unwrap_segment_tokens(_tokenize_lossy(sub), posix_shell=posix_shell)
+        )
+    return extracted
+
+
 def _are_posix_heredoc_receivers_safe(
-    heredoc_opener_lines: list[str], outer_segments: list[list[str]]
+    heredoc_opener_lines: list[str],
+    outer_segments: list[list[str]] | None,
+    *,
+    posix_shell: bool = False,
 ) -> bool:
     """POSIX heredoc を受け取るコマンドが cat / tee のみ、かつ外側全コマンドが許可リスト内か検証する。"""
     if not heredoc_opener_lines:
@@ -2163,32 +2203,31 @@ def _are_posix_heredoc_receivers_safe(
         if not tokens or _command_basename(tokens[0]) not in SAFE_POSIX_HEREDOC_OUTER_COMMANDS:
             return False
     for hd_line in heredoc_opener_lines:
-        parts = _split_unquoted_top_level(hd_line)
+        parts = _split_unquoted_top_level(hd_line, posix_shell=posix_shell)
         if parts is None:
             return False
         hd_parts = [p for p in parts if _find_single_quoted_heredoc_opener(p)[0]]
         if not hd_parts:
             return False
         for part in hd_parts:
-            unwrapped = _unwrap_segment_tokens(_tokenize_lossy(part))
+            unwrapped = _unwrap_segment_tokens(
+                _tokenize_lossy(part), posix_shell=posix_shell
+            )
             if not unwrapped or _command_basename(unwrapped[0][0]) not in SAFE_POSIX_HEREDOC_RECEIVERS:
                 return False
     return True
 
 
 def _extract_teamwork_push_segments(
-    command_text: str, fallback_segments: list[list[str]]
+    command_text: str,
+    fallback_segments: list[list[str]],
+    *,
+    posix_shell: bool = False,
 ) -> list[list[str]]:
     """引用境界を保ったまま実際のコマンドセグメントと展開式のみを抽出し git push 判定に使う。"""
-    unquoted_parts = _split_unquoted_top_level(command_text)
-    if unquoted_parts is None:
+    extracted = _collect_quote_aware_segments(command_text, posix_shell=posix_shell)
+    if extracted is None:
         return fallback_segments
-
-    extracted: list[list[str]] = []
-    for part in unquoted_parts:
-        extracted.extend(_unwrap_segment_tokens(_tokenize_lossy(part)))
-    for sub in _extract_rg_substitutions(command_text):
-        extracted.extend(_unwrap_segment_tokens(_tokenize_lossy(sub)))
     return extracted
 
 
@@ -2232,29 +2271,37 @@ def _is_safe_goog_header_value(val: str, *, in_single_quote: bool) -> bool:
     return bool(GOOG_HEADER_SAFE_ENV_RE.match(val))
 
 
-def _has_non_var_goog_header(text: str) -> bool:
+def _has_non_var_goog_header(
+    text: str, *, strict_shell_quotes: bool = True
+) -> bool:
     """x-goog-api-key ヘッダに展開される環境変数参照や REDACTED 以外の生値が指定されているか検査する。"""
     for m in GOOG_HEADER_QUOTED_RE.finditer(text):
         raw_rhs = m.group(0)[len(m.group(1)) :].strip()
         val = raw_rhs[1:-1].strip() if len(raw_rhs) >= 2 else ""
-        in_sq = (m.group(2) == "'") or (_quote_state_at(text, m.start()) == "'")
+        in_sq = (
+            (m.group(2) == "'") or (_quote_state_at(text, m.start()) == "'")
+            if strict_shell_quotes
+            else False
+        )
         if val and not _is_safe_goog_header_value(val, in_single_quote=in_sq):
             return True
     for m in GOOG_HEADER_PLAIN_RE.finditer(text):
         val = m.group(2).strip().strip("\"'")
-        in_sq = _quote_state_at(text, m.start()) == "'"
+        in_sq = (_quote_state_at(text, m.start()) == "'") if strict_shell_quotes else False
         if val and not _is_safe_goog_header_value(val, in_single_quote=in_sq):
             return True
     return False
 
 
-def _has_inline_secret_literal(text: str) -> bool:
+def _has_inline_secret_literal(
+    text: str, *, strict_shell_quotes: bool = True
+) -> bool:
     """コマンド文字列内の API トークン・秘密鍵ヘッダ・認証ヘッダ実値パターンを検出する。"""
     if dh.scan_text_for_secrets(text):
         return True
     if dh.BEARER_TOKEN_RE.search(text):
         return True
-    if _has_non_var_goog_header(text):
+    if _has_non_var_goog_header(text, strict_shell_quotes=strict_shell_quotes):
         return True
     return False
 
@@ -2275,21 +2322,34 @@ def evaluate_stage1(
     )
     use_stripped = False
     if herestring_bodies:
-        outer_segments = _collect_all_command_segments(stripped_for_scan)
-        safe_posix_hd = _are_posix_heredoc_receivers_safe(heredoc_opener_lines, outer_segments)
+        if heredoc_opener_lines:
+            outer_segments = _collect_quote_aware_segments(
+                stripped_for_scan, posix_shell=posix_shell
+            )
+            safe_posix_hd = _are_posix_heredoc_receivers_safe(
+                heredoc_opener_lines, outer_segments, posix_shell=posix_shell
+            )
+        else:
+            outer_segments = _collect_all_command_segments(
+                stripped_for_scan, posix_shell=posix_shell
+            )
+            safe_posix_hd = True
         if (
             safe_posix_hd
-            and not _has_code_exec_sink(stripped_for_scan, outer_segments)
+            and outer_segments is not None
+            and not _has_code_exec_sink(
+                stripped_for_scan, outer_segments, posix_shell=posix_shell
+            )
             and not _has_external_transfer(outer_segments)
         ):
             use_stripped = True
             segments = outer_segments
             secret_hits = _extract_secret_file_hits(stripped_for_scan)
         else:
-            segments = _collect_all_command_segments(command)
+            segments = _collect_all_command_segments(command, posix_shell=posix_shell)
             secret_hits = _extract_secret_file_hits(command)
     else:
-        segments = _collect_all_command_segments(command)
+        segments = _collect_all_command_segments(command, posix_shell=posix_shell)
         secret_hits = _extract_secret_file_hits(command)
 
     if _has_external_transfer(segments) and (secret_hits or _has_env_dump(segments)):
@@ -2310,7 +2370,17 @@ def evaluate_stage1(
             )
 
     if is_teamwork:
-        if _has_inline_secret_literal(command):
+        shell_text = stripped_for_scan if use_stripped else command
+        has_inline_secret = _has_inline_secret_literal(
+            shell_text, strict_shell_quotes=True
+        ) or (
+            use_stripped
+            and any(
+                _has_inline_secret_literal(body, strict_shell_quotes=False)
+                for body in herestring_bodies
+            )
+        )
+        if has_inline_secret:
             if _has_external_transfer(segments):
                 return (
                     "deny",
@@ -2322,7 +2392,9 @@ def evaluate_stage1(
                 "Requires explicit confirmation: inline credential or private key pattern detected in command.",
             )
         push_scan_text = stripped_for_scan if use_stripped else command
-        for seg_tokens in _extract_teamwork_push_segments(push_scan_text, segments):
+        for seg_tokens in _extract_teamwork_push_segments(
+            push_scan_text, segments, posix_shell=posix_shell
+        ):
             subcmd, _ = _extract_git_subcommand(seg_tokens, strict_safe_globals=False)
             if subcmd == "push" and not _classify_whitelisted_git(seg_tokens)[0]:
                 return (
