@@ -175,6 +175,26 @@ CODE_EXEC_SINKS = frozenset(
     }
 )
 SAFE_POSIX_HEREDOC_RECEIVERS = frozenset({"cat", "tee"})
+SAFE_POSIX_HEREDOC_OUTER_COMMANDS = frozenset(
+    {
+        "cat",
+        "tee",
+        "cd",
+        "set-location",
+        "sl",
+        "chdir",
+        "push-location",
+        "pushd",
+        "mkdir",
+        "ls",
+        "dir",
+        "wc",
+        "test",
+        "echo",
+        "printf",
+        "touch",
+    }
+)
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -412,8 +432,15 @@ def _split_top_level_segments_raw(text: str) -> list[str]:
         if not stripped:
             continue
         segments.append(stripped)
-        for sub in re.findall(r"\$\(([^)]+)\)", stripped):
-            sub_stripped = sub.strip()
+        for m in re.finditer(r"\$\(([^)]+)\)", stripped):
+            backslashes = 0
+            k = m.start() - 1
+            while k >= 0 and stripped[k] == "\\":
+                backslashes += 1
+                k -= 1
+            if backslashes % 2 == 1:
+                continue
+            sub_stripped = m.group(1).strip()
             if sub_stripped:
                 segments.append(sub_stripped)
     return segments
@@ -542,29 +569,175 @@ def _is_safe_rg_segment(segment: str) -> bool:
     return not has_pre
 
 
-def _extract_paren_cmd_subst_bodies(text: str) -> list[str]:
-    """文字列中の $(...) 本体を括弧対応（ネスト・未閉鎖含む）で再帰抽出する。"""
+def _find_matching_backtick(text: str, start: int, *, in_double_quote: bool) -> int | None:
+    """` の直後から対応する閉じ ` の位置をエスケープを考慮して返す。未閉鎖時は None。"""
+    escapable = {"$", "`", "\\"}
+    if in_double_quote:
+        escapable.add('"')
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] in escapable:
+            i += 2
+            continue
+        if ch == "`":
+            return i
+        i += 1
+    return None
+
+
+def _unescape_backtick_body(body: str, *, in_double_quote: bool) -> str:
+    """バッククォートコマンド置換内のシェルエスケープを1パスで解除する。"""
+    escapable = {"$", "`", "\\"}
+    if in_double_quote:
+        escapable.add('"')
+    out: list[str] = []
+    i = 0
+    n = len(body)
+    while i < n:
+        if body[i] == "\\" and i + 1 < n and body[i + 1] in escapable:
+            out.append(body[i + 1])
+            i += 2
+            continue
+        out.append(body[i])
+        i += 1
+    return "".join(out)
+
+
+def _find_matching_paren_subst(text: str, start: int) -> int | None:
+    """$( の直後から対応する ) の位置をクォート・ネストを考慮して返す。未閉鎖時は None。"""
+    depth = 1
+    quote: str | None = None
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if text[i : i + 2] == "$(":
+                end = _find_matching_paren_subst(text, i + 2)
+                if end is None:
+                    return None
+                i = end + 1
+                continue
+            if ch == "`":
+                end = _find_matching_backtick(text, i + 1, in_double_quote=True)
+                if end is None:
+                    return None
+                i = end + 1
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if text[i : i + 2] == "$(":
+            end = _find_matching_paren_subst(text, i + 2)
+            if end is None:
+                return None
+            i = end + 1
+            continue
+        if ch == "`":
+            end = _find_matching_backtick(text, i + 1, in_double_quote=False)
+            if end is None:
+                return None
+            i = end + 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _extract_command_substitutions(text: str) -> list[str]:
+    """単一引用外（未引用＋ダブルクォート内）からエスケープを除外し対応が閉じた $(...) / `...` 本体を再帰抽出する。"""
     bodies: list[str] = []
+    quote: str | None = None
     i = 0
     n = len(text)
     while i < n:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if text[i : i + 2] == "$(":
+                end = _find_matching_paren_subst(text, i + 2)
+                if end is not None:
+                    body = text[i + 2 : end]
+                    if body.strip():
+                        bodies.append(body)
+                        bodies.extend(_extract_command_substitutions(body))
+                    i = end + 1
+                    continue
+                i += 2
+                continue
+            if ch == "`":
+                end = _find_matching_backtick(text, i + 1, in_double_quote=True)
+                if end is not None:
+                    body = _unescape_backtick_body(text[i + 1 : end], in_double_quote=True)
+                    if body.strip():
+                        bodies.append(body)
+                        bodies.extend(_extract_command_substitutions(body))
+                    i = end + 1
+                    continue
+                i += 1
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n and text[i + 1] in ("$", "`", "\\", "'", '"'):
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
         if text[i : i + 2] == "$(":
-            start = i + 2
-            depth = 1
-            j = start
-            while j < n and depth > 0:
-                if text[j] == "(":
-                    depth += 1
-                elif text[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            body = text[start:j]
-            if body.strip():
-                bodies.append(body)
-                bodies.extend(_extract_paren_cmd_subst_bodies(body))
-            i = j + 1 if depth == 0 else j
+            end = _find_matching_paren_subst(text, i + 2)
+            if end is not None:
+                body = text[i + 2 : end]
+                if body.strip():
+                    bodies.append(body)
+                    bodies.extend(_extract_command_substitutions(body))
+                i = end + 1
+                continue
+            i += 2
+            continue
+        if ch == "`":
+            end = _find_matching_backtick(text, i + 1, in_double_quote=False)
+            if end is not None:
+                body = _unescape_backtick_body(text[i + 1 : end], in_double_quote=False)
+                if body.strip():
+                    bodies.append(body)
+                    bodies.extend(_extract_command_substitutions(body))
+                i = end + 1
+                continue
+            i += 1
             continue
         i += 1
     return bodies
@@ -572,56 +745,9 @@ def _extract_paren_cmd_subst_bodies(text: str) -> list[str]:
 
 def _extract_rg_substitutions(segment: str) -> list[str]:
     """単一引用外（未引用＋ダブルクォート内）から $(...) と `...` の中身を抽出しサブセグメント列を返す。"""
-    active_chunks: list[str] = []
-    buf: list[str] = []
-    quote: str | None = None
-    i = 0
-    n = len(segment)
-
-    while i < n:
-        ch = segment[i]
-        if quote == "'":
-            if ch == "'":
-                quote = None
-            i += 1
-            continue
-        if quote == '"':
-            if ch == "\\" and i + 1 < n and segment[i + 1] in ('"', "\\"):
-                buf.append(ch)
-                buf.append(segment[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                active_chunks.append("".join(buf))
-                buf = []
-                quote = None
-            else:
-                buf.append(ch)
-            i += 1
-            continue
-        if ch == "'":
-            if buf:
-                active_chunks.append("".join(buf))
-                buf = []
-            quote = "'"
-        elif ch == '"':
-            if buf:
-                active_chunks.append("".join(buf))
-                buf = []
-            quote = '"'
-        else:
-            buf.append(ch)
-        i += 1
-
-    if buf:
-        active_chunks.append("".join(buf))
-
     subs: list[str] = []
-    for chunk in active_chunks:
-        for body in _extract_paren_cmd_subst_bodies(chunk):
-            subs.extend(_split_top_level_segments_raw(body))
-        for body in re.findall(r"`([^`]+)`", chunk):
-            subs.extend(_split_top_level_segments_raw(body))
+    for body in _extract_command_substitutions(segment):
+        subs.extend(_split_top_level_segments_raw(body))
     return subs
 
 
@@ -632,12 +758,15 @@ def _split_top_level_segments(command: str) -> list[str]:
         return _split_top_level_segments_raw(command)
 
     segments: list[str] = []
+    any_safe_rg = False
     for part in unquoted_parts:
         if _is_safe_rg_segment(part):
             segments.append(part)
-            segments.extend(_extract_rg_substitutions(part))
+            any_safe_rg = True
         else:
             segments.extend(_split_top_level_segments_raw(part))
+    if any_safe_rg:
+        segments.extend(_extract_rg_substitutions(command))
     return segments
 
 
@@ -1811,10 +1940,9 @@ def _strip_verbatim_herestrings(command: str) -> tuple[str, list[str]]:
 
 
 def _extract_executable_text_chunks(stripped_command: str) -> str:
-    """単一/二重引用リテラルを除外し、クォート外および二重引用内の $(...) / `...` 本体のみを返す。"""
+    """単一/二重引用リテラルを除外し、クォート外およびコマンド置換 $(...) / `...` 本体のみを返す。"""
     chunks: list[str] = []
     buf: list[str] = []
-    dq_buf: list[str] = []
     in_quote: str | None = None
     i = 0
     n = len(stripped_command)
@@ -1831,25 +1959,13 @@ def _extract_executable_text_chunks(stripped_command: str) -> str:
             continue
         if in_quote == '"':
             if ch == "`" and i + 1 < n:
-                dq_buf.append(ch)
-                dq_buf.append(stripped_command[i + 1])
                 i += 2
                 continue
             if ch == "\\" and i + 1 < n and stripped_command[i + 1] in ('"', "\\"):
-                dq_buf.append(ch)
-                dq_buf.append(stripped_command[i + 1])
                 i += 2
                 continue
             if ch == '"':
-                dq_text = "".join(dq_buf)
-                dq_buf = []
-                for body in _extract_paren_cmd_subst_bodies(dq_text):
-                    chunks.append(" " + body + " ")
-                for body in re.findall(r"`([^`]+)`", dq_text):
-                    chunks.append(" " + body + " ")
                 in_quote = None
-            else:
-                dq_buf.append(ch)
             i += 1
             continue
         if ch == "'":
@@ -1868,8 +1984,8 @@ def _extract_executable_text_chunks(stripped_command: str) -> str:
 
     if buf:
         chunks.append("".join(buf))
-    if dq_buf:
-        chunks.append("".join(dq_buf))
+    for body in _extract_command_substitutions(stripped_command):
+        chunks.append(" " + body + " ")
     return "".join(chunks)
 
 
@@ -2035,10 +2151,17 @@ def _is_teamwork_conversation(
     return False
 
 
-def _are_posix_heredoc_receivers_safe(heredoc_opener_lines: list[str]) -> bool:
-    """POSIX heredoc を受け取るコマンド自体が安全なローカル書き出しコマンド（cat / tee）のみか検証する。"""
+def _are_posix_heredoc_receivers_safe(
+    heredoc_opener_lines: list[str], outer_segments: list[list[str]]
+) -> bool:
+    """POSIX heredoc を受け取るコマンドが cat / tee のみ、かつ外側全コマンドが許可リスト内か検証する。"""
     if not heredoc_opener_lines:
         return True
+    if not outer_segments:
+        return False
+    for tokens in outer_segments:
+        if not tokens or _command_basename(tokens[0]) not in SAFE_POSIX_HEREDOC_OUTER_COMMANDS:
+            return False
     for hd_line in heredoc_opener_lines:
         parts = _split_unquoted_top_level(hd_line)
         if parts is None:
@@ -2064,21 +2187,63 @@ def _extract_teamwork_push_segments(
     extracted: list[list[str]] = []
     for part in unquoted_parts:
         extracted.extend(_unwrap_segment_tokens(_tokenize_lossy(part)))
-        for sub in _extract_rg_substitutions(part):
-            extracted.extend(_unwrap_segment_tokens(_tokenize_lossy(sub)))
+    for sub in _extract_rg_substitutions(command_text):
+        extracted.extend(_unwrap_segment_tokens(_tokenize_lossy(sub)))
     return extracted
 
 
+GOOG_HEADER_SAFE_ENV_RE = re.compile(
+    r"^(?:%[A-Za-z_][A-Za-z0-9_]*%|\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\}|[Ee][Nn][Vv]:[A-Za-z_][A-Za-z0-9_]*))$"
+)
+
+
+def _quote_state_at(text: str, pos: int) -> str | None:
+    """text[:pos] を走査し、pos 時点で開いているクォート種別（' / \" / None）を返す。"""
+    quote: str | None = None
+    i = 0
+    limit = min(pos, len(text))
+    while i < limit:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < limit and text[i + 1] in ('"', "\\"):
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        i += 1
+    return quote
+
+
+def _is_safe_goog_header_value(val: str, *, in_single_quote: bool) -> bool:
+    """x-goog-api-key ヘッダ値がプレースホルダ（REDACTED）または展開される厳格な環境変数参照のみか判定する。"""
+    if val.upper() in ("REDACTED", "[REDACTED]"):
+        return True
+    if in_single_quote:
+        return False
+    return bool(GOOG_HEADER_SAFE_ENV_RE.match(val))
+
+
 def _has_non_var_goog_header(text: str) -> bool:
-    """x-goog-api-key ヘッダに変数参照やプレースホルダ以外の生値が指定されているか検査する。"""
+    """x-goog-api-key ヘッダに展開される環境変数参照や REDACTED 以外の生値が指定されているか検査する。"""
     for m in GOOG_HEADER_QUOTED_RE.finditer(text):
         raw_rhs = m.group(0)[len(m.group(1)) :].strip()
         val = raw_rhs[1:-1].strip() if len(raw_rhs) >= 2 else ""
-        if val and not val.startswith(("$", "%", "<", "[")) and val.upper() != "REDACTED":
+        in_sq = (m.group(2) == "'") or (_quote_state_at(text, m.start()) == "'")
+        if val and not _is_safe_goog_header_value(val, in_single_quote=in_sq):
             return True
     for m in GOOG_HEADER_PLAIN_RE.finditer(text):
         val = m.group(2).strip().strip("\"'")
-        if val and not val.startswith(("$", "%", "<", "[")) and val.upper() != "REDACTED":
+        in_sq = _quote_state_at(text, m.start()) == "'"
+        if val and not _is_safe_goog_header_value(val, in_single_quote=in_sq):
             return True
     return False
 
@@ -2111,7 +2276,7 @@ def evaluate_stage1(
     use_stripped = False
     if herestring_bodies:
         outer_segments = _collect_all_command_segments(stripped_for_scan)
-        safe_posix_hd = _are_posix_heredoc_receivers_safe(heredoc_opener_lines)
+        safe_posix_hd = _are_posix_heredoc_receivers_safe(heredoc_opener_lines, outer_segments)
         if (
             safe_posix_hd
             and not _has_code_exec_sink(stripped_for_scan, outer_segments)
