@@ -28,7 +28,7 @@ The evidence below comes from the first pass and may have line offsets or false 
 Do not fix or plan issues outside your assigned scope; record them in `out_of_scope_findings`.
 
 ## Completion Criteria
-- Save the plan to your own `<Worker Artifact Directory>/scratch/plans/<slug>.md` via `write_file` (never leave plan files inside the repository)
+- Resolve your own `<Worker Artifact Directory>/scratch/plans/<slug>.md`, save the plan there via `write_file` (never leave plan files inside the repository), and record that concrete saved absolute path as `plan_path`
 - Return `{summary, plan_path, recommendation, requires_discussion, out_of_scope_findings}` via `finish` (all JSON summary strings in Japanese, following `japanese-tech-writing`)
 ```
 
@@ -109,5 +109,5 @@ IMPL_SCHEMA = {
 
 - 計画フェーズは読み取り中心のため `workspace="inherit"`（または `invoke_subagent` の `TypeName="research"`）でよい。
 - 実装フェーズは複数ワーカーが同時にファイルを編集するため、必ず `workspace="share"`（独立クローンで PR まで作る場合は `workspace="branch"`）を指定する。
-- ワークフローのワーカーは親とコンテキストを共有しないため、`<Artifact Directory Path>`、対象リポジトリパス、共通規約はプロンプト本文へすべて展開して渡す。
+- ワークフローのワーカーは親とコンテキストを共有しないため、対象リポジトリパス、共通規約、および実装フェーズでは計画ワーカーが返した確定済み `plan_path` を親がプロンプト本文へ展開して渡す（計画書の保存先は計画ワーカー自身が `<Worker Artifact Directory>/scratch/plans/<slug>.md` を解決し、保存した実在の絶対パスを `plan_path` で返す）。
 - 実装フェーズでワーカーが `workspace="share"` や `"branch"` で作成したコミットは、ワークフロー終了後に親が確認して統合する（または PR 作成後に確認する）。

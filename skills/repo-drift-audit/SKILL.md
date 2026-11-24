@@ -86,7 +86,7 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scrip
 - Phase 番号、仕様決定 ID、テスト ID などの採番は計画書では仮採番と明記し、先行ブランチや先行 PR のマージ後に確定する。
 - 複数トラックが同じファイルの別箇所を触る必要がある場合は、同一トラックへまとめるか、集約書に統合順と競合予測を添える。
 - PR やコード変更以外の作業（プラグイン設定の更新、外部サービスの設定変更、ユーザー確認が必要な作業）はワーカーに振らず親エージェントが直接行う。
-- 計画書と集約書はリポジトリ外（`<Artifact Directory Path>/scratch/plans/` および `<Artifact Directory Path>/`）に置き、作業対象リポジトリに一時計画書を残さない。
+- 計画書は各計画ワーカー自身の `<Worker Artifact Directory>/scratch/plans/` へ、集約書は親の `<Artifact Directory Path>/` へそれぞれ置き、作業対象リポジトリに一時計画書を残さない。
 - ワーカーが `run_workflow` の `workspace="share"` や `"branch"` で変更したブランチは、親が差分やテスト結果を確認してから作業コピーへ統合するか PR 化する。
 
 ## リファクタ系トラックの検証技法

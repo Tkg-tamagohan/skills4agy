@@ -1,4 +1,4 @@
-"""check_hygiene.py の単体テスト（CH-01〜CH-08）。
+"""check_hygiene.py の単体テスト（CH-01〜CH-09）。
 
 テストケースの ID 採番と報告は rule `test-conventions` に従う。
 実行: `python test_check_hygiene.py`（同ディレクトリから）
@@ -39,7 +39,7 @@ def _init_git(root: Path) -> None:
 
 
 class TestCheckHygiene(unittest.TestCase):
-    """check_hygiene.py の構文・文字コード・競合マーカー・slop_lint 検査（CH-01〜CH-08）。"""
+    """check_hygiene.py の構文・文字コード・競合マーカー・slop_lint 検査（CH-01〜CH-09）。"""
 
     def make_repo(self, *, init_git: bool = False) -> Path:
         root = Path(tempfile.mkdtemp(prefix="check-hygiene-test-"))
@@ -189,8 +189,53 @@ class TestCheckHygiene(unittest.TestCase):
         self.assertNotIn("slop_lint --strict", out_skip)
 
     def test_ch_08_実リポジトリに対する統合スモーク検査が通過する(self):
-        rc, out = self.run_cli()
+        rc, out = self.run_cli("--tracked-only")
         self.assertEqual(rc, 0, out)
+
+    def test_ch_09_sloplintignoreのgitignore互換照合とtracked_only切替を確認する(self):
+        # 1. 非 Git と Git 双方で skills/*.md が配下サブディレクトリまで除外しないことを確認する
+        for use_git in (False, True):
+            with self.subTest(init_git=use_git):
+                root = self.make_repo(init_git=use_git)
+                (root / ".sloplintignore").write_text("skills/*.md\n", encoding="utf-8")
+                (root / "skills").mkdir()
+                (root / "skills" / "top.md").write_text(
+                    "# 直下\n\n機能の追加・変更を行う。\n", encoding="utf-8"
+                )
+                (root / "skills" / "sub").mkdir()
+                (root / "skills" / "sub" / "nested.md").write_text(
+                    "# 配下\n\n機能の追加・変更を行う。\n", encoding="utf-8"
+                )
+                if use_git:
+                    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+                    subprocess.run(
+                        ["git", "commit", "-qm", "add skills"],
+                        cwd=root,
+                        check=True,
+                        capture_output=True,
+                    )
+
+                rc, out = self.run_cli("--root", str(root))
+                self.assertEqual(rc, 1, out)
+                self.assertNotIn("skills/top.md", out)
+                self.assertIn("skills/sub/nested.md", out)
+
+                # ** を使えば配下も含めて除外される
+                (root / ".sloplintignore").write_text("skills/**/*.md\n", encoding="utf-8")
+                rc_glob, out_glob = self.run_cli("--root", str(root))
+                self.assertEqual(rc_glob, 0, out_glob)
+
+        # 2. Git 管理下で未追跡ファイルの下書きは --tracked-only で除外され、既定時は検出される
+        git_root = self.make_repo(init_git=True)
+        (git_root / "draft.md").write_text(
+            "# 下書き\n\n機能の追加・変更を行う。\n", encoding="utf-8"
+        )
+        rc_default, out_default = self.run_cli("--root", str(git_root))
+        self.assertEqual(rc_default, 1, out_default)
+        self.assertIn("draft.md", out_default)
+
+        rc_tracked, out_tracked = self.run_cli("--root", str(git_root), "--tracked-only")
+        self.assertEqual(rc_tracked, 0, out_tracked)
 
 
 if __name__ == "__main__":

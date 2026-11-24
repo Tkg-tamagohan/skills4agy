@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import importlib.util
 import json
 import os
@@ -13,8 +12,8 @@ import re
 import subprocess
 import sys
 import tempfile
-from pathlib import Path, PurePosixPath
-from typing import Any, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, List, Optional, Pattern, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SLOP_LINT_PATH = (
@@ -61,26 +60,40 @@ def _load_slop_lint() -> Any:
     return module
 
 
-def collect_target_files(root: Path) -> List[str]:
-    """Git 管理下では追跡済みと未追跡の実在ファイル、非 Git では再帰走査結果を返す。"""
+def _is_git_repo_root(root: Path) -> bool:
+    """root 自身が Git リポジトリのトップレベルかどうかを判定する。"""
     proc = subprocess.run(
-        [
-            "git",
-            "-c",
-            "core.quotePath=false",
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ],
+        ["git", "rev-parse", "--show-toplevel"],
         cwd=root,
         capture_output=True,
         check=False,
     )
-    if proc.returncode == 0:
-        rels = sorted({p.decode("utf-8") for p in proc.stdout.split(b"\x00") if p})
-        return [rel for rel in rels if (root / rel).is_file()]
+    if proc.returncode != 0:
+        return False
+    toplevel = proc.stdout.decode("utf-8", errors="replace").strip()
+    if not toplevel:
+        return False
+    try:
+        return Path(toplevel).resolve() == root.resolve()
+    except OSError:
+        return False
+
+
+def collect_target_files(root: Path, *, tracked_only: bool = False) -> List[str]:
+    """Git 管理下では追跡済み（tracked_only=False 時は未追跡も含む）の実在ファイル、非 Git では再帰走査結果を返す。"""
+    if _is_git_repo_root(root):
+        cmd = ["git", "-c", "core.quotePath=false", "ls-files", "-z", "--cached"]
+        if not tracked_only:
+            cmd.extend(["--others", "--exclude-standard"])
+        proc = subprocess.run(
+            cmd,
+            cwd=root,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            rels = sorted({p.decode("utf-8") for p in proc.stdout.split(b"\x00") if p})
+            return [rel for rel in rels if (root / rel).is_file()]
 
     found: List[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -154,7 +167,7 @@ def check_text_hygiene(root: Path, files: List[str]) -> Tuple[int, List[str]]:
 
 
 def load_sloplint_ignore(root: Path) -> List[str]:
-    """.sloplintignore から除外パターン一覧を読み込む。"""
+    """.sloplintignore から gitignore 互換の除外パターン一覧を読み込む。"""
     ignore_path = root / ".sloplintignore"
     if not ignore_path.is_file():
         return []
@@ -164,34 +177,114 @@ def load_sloplint_ignore(root: Path) -> List[str]:
         if not line or line.startswith("#"):
             continue
         if line.startswith("./"):
-            line = line[2:]
-        line = line.lstrip("/")
-        if line:
-            patterns.append(line)
+            line = "/" + line[2:]
+        patterns.append(line)
     return patterns
+
+
+def _compile_gitignore_pattern(raw_pat: str) -> Tuple[bool, Pattern[str]]:
+    """gitignore 形式 1 行を (negated, compiled_regex) へ変換する（* は / に一致しない）。"""
+    negated = False
+    pat = raw_pat
+    if pat.startswith("!"):
+        negated = True
+        pat = pat[1:]
+    if pat.startswith("\\"):
+        pat = pat[1:]
+
+    dir_only = pat.endswith("/")
+    if dir_only:
+        pat = pat.rstrip("/")
+    anchored = "/" in pat
+    if pat.startswith("/"):
+        pat = pat[1:]
+
+    parts: List[str] = []
+    i = 0
+    n = len(pat)
+    while i < n:
+        if pat.startswith("**/", i):
+            parts.append("(?:.*/)?")
+            i += 3
+        elif pat.startswith("/**", i) and i + 3 == n:
+            parts.append("(?:/.*)?")
+            i += 3
+        elif pat.startswith("**", i):
+            parts.append(".*")
+            i += 2
+        elif pat[i] == "*":
+            parts.append("[^/]*")
+            i += 1
+        elif pat[i] == "?":
+            parts.append("[^/]")
+            i += 1
+        elif pat[i] == "[":
+            end = pat.find("]", i + 1)
+            if end != -1:
+                inner = pat[i + 1 : end]
+                if inner.startswith(("!", "^")):
+                    parts.append(f"[^{inner[1:]}/]")
+                else:
+                    parts.append(f"[{inner.replace('/', '')}]")
+                i = end + 1
+            else:
+                parts.append(re.escape(pat[i]))
+                i += 1
+        else:
+            parts.append(re.escape(pat[i]))
+            i += 1
+
+    prefix = "^" if anchored else "^(?:.*/)?"
+    suffix = "/.*$" if dir_only else "(?:/.*)?$"
+    return negated, re.compile(prefix + "".join(parts) + suffix)
 
 
 def is_slop_ignored(rel: str, ignore_patterns: List[str]) -> bool:
     """対象 Markdown が .sloplintignore または恒久除外サフィックスに該当するか判定する。"""
     if any(rel.endswith(suffix) for suffix in ALWAYS_EXCLUDED_SLOP_SUFFIXES):
         return True
-    posix_rel = PurePosixPath(rel)
-    for pat in ignore_patterns:
-        if pat.endswith("/") and rel.startswith(pat):
-            return True
-        if rel == pat or fnmatch.fnmatch(rel, pat) or posix_rel.match(pat):
-            return True
-    return False
+    ignored = False
+    for raw_pat in ignore_patterns:
+        negated, regex = _compile_gitignore_pattern(raw_pat)
+        if regex.match(rel):
+            ignored = not negated
+    return ignored
 
 
-def check_slop_lint(root: Path, files: List[str]) -> Tuple[int, List[str]]:
+def _collect_git_slop_ignored(
+    root: Path, *, tracked_only: bool = False
+) -> Optional[Set[str]]:
+    """Git 管理下かつ .sloplintignore 実在時は git 自身の除外判定結果を返す。"""
+    if not (root / ".sloplintignore").is_file() or not _is_git_repo_root(root):
+        return None
+    cmd = ["git", "-c", "core.quotePath=false", "ls-files", "-z", "--cached"]
+    if not tracked_only:
+        cmd.append("--others")
+    cmd.extend(["--ignored", "--exclude-from=.sloplintignore"])
+    proc = subprocess.run(cmd, cwd=root, capture_output=True, check=False)
+    if proc.returncode != 0:
+        return None
+    return {p.decode("utf-8") for p in proc.stdout.split(b"\x00") if p}
+
+
+def check_slop_lint(
+    root: Path, files: List[str], *, tracked_only: bool = False
+) -> Tuple[int, List[str]]:
     """除外対象を除く全 Markdown に slop_lint --strict（warn/error）を適用する。"""
-    ignore_patterns = load_sloplint_ignore(root)
-    md_files = [
-        rel
-        for rel in files
-        if rel.lower().endswith(".md") and not is_slop_ignored(rel, ignore_patterns)
-    ]
+    git_ignored = _collect_git_slop_ignored(root, tracked_only=tracked_only)
+    ignore_patterns = [] if git_ignored is not None else load_sloplint_ignore(root)
+    md_files: List[str] = []
+    for rel in files:
+        if not rel.lower().endswith(".md"):
+            continue
+        if any(rel.endswith(suffix) for suffix in ALWAYS_EXCLUDED_SLOP_SUFFIXES):
+            continue
+        if git_ignored is not None:
+            if rel in git_ignored:
+                continue
+        elif is_slop_ignored(rel, ignore_patterns):
+            continue
+        md_files.append(rel)
     if not md_files:
         return 0, []
 
@@ -226,10 +319,13 @@ def check_slop_lint(root: Path, files: List[str]) -> Tuple[int, List[str]]:
 
 
 def run_hygiene_checks(
-    root: Path = REPO_ROOT, *, skip_slop_lint: bool = False
+    root: Path = REPO_ROOT,
+    *,
+    skip_slop_lint: bool = False,
+    tracked_only: bool = False,
 ) -> List[Tuple[str, int, List[str]]]:
     """全衛生検査を実行し、[(検査名, 件数, エラーリスト), ...] を返す。"""
-    files = collect_target_files(root)
+    files = collect_target_files(root, tracked_only=tracked_only)
     py_count, py_errors = check_py_compile(root, files)
     json_count, json_errors = check_json_files(root, files)
     text_count, text_errors = check_text_hygiene(root, files)
@@ -240,7 +336,7 @@ def run_hygiene_checks(
         ("text hygiene (UTF-8 / U+FFFD / conflict markers)", text_count, text_errors),
     ]
     if not skip_slop_lint:
-        slop_count, slop_errors = check_slop_lint(root, files)
+        slop_count, slop_errors = check_slop_lint(root, files, tracked_only=tracked_only)
         results.append(("slop_lint --strict", slop_count, slop_errors))
     return results
 
@@ -266,10 +362,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Markdown に対する slop_lint --strict 検査を省略する",
     )
+    parser.add_argument(
+        "--tracked-only",
+        action="store_true",
+        help="Git 管理下で未追跡ファイルを除外し、追跡済みファイルのみを検査する",
+    )
     args = parser.parse_args(argv)
 
     root = args.root.resolve()
-    results = run_hygiene_checks(root, skip_slop_lint=args.skip_slop_lint)
+    results = run_hygiene_checks(
+        root, skip_slop_lint=args.skip_slop_lint, tracked_only=args.tracked_only
+    )
 
     total_errors = 0
     for label, count, errors in results:

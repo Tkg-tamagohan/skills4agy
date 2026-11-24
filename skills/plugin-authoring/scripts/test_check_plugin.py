@@ -616,6 +616,41 @@ class TestCheckPluginStructure(unittest.TestCase):
             over_errors,
         )
 
+    def test_cp_38_見出し空白欠落と折り返しdescriptionを拒否する(self):
+        # 1. ルールの ##手順 / ##対象外（空白なし）を拒否し、正常見出しのみ通す
+        root_rule = self.make_repo()
+        (root_rule / "rules" / "no-space-heading.md").write_text(
+            "---\ntrigger: model_decision\ndescription: test\n---\n\n"
+            "# 見出し\n\n##手順\n\n1. 手順\n\n##対象外\n\n- なし\n",
+            encoding="utf-8",
+        )
+        rule_errors = check_plugin.check_rules(root_rule)
+        self.assertIn("rules/no-space-heading.md: 「## 手順」節がありません", rule_errors)
+        self.assertIn("rules/no-space-heading.md: 「## 対象外」節がありません", rule_errors)
+
+        # 2. ブロックスカラー記号なしの折り返し（プレーン継続・引用折り返し・空行開始折り返し）を拒否する
+        cases = [
+            ("plain-wrap", f"description: First line\n  {'a' * 5001}"),
+            ("quoted-wrap", 'description: "First line\n  second line"'),
+            ("empty-head-wrap", "description:\n  wrapped line"),
+        ]
+        for skill_name, desc_block in cases:
+            with self.subTest(case=skill_name):
+                root = self.make_repo()
+                (root / "skills" / skill_name).mkdir()
+                (root / "skills" / skill_name / "SKILL.md").write_text(
+                    f"---\nname: {skill_name}\n{desc_block}\n---\n\n# タイトル\n",
+                    encoding="utf-8",
+                )
+                errors = check_plugin.check_skills(root)
+                self.assertTrue(
+                    any(
+                        f"skills/{skill_name}/SKILL.md: description が複数行に折り返されています" in e
+                        for e in errors
+                    ),
+                    errors,
+                )
+
 
 class TestHooksJsonValidation(unittest.TestCase):
     """hooks.json のスキーマ検査・スクリプト実在検査・バンプ検査(CP-23〜CP-29)"""

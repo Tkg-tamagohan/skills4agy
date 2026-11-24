@@ -36,7 +36,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
@@ -172,6 +172,24 @@ def parse_frontmatter(text: str) -> Optional[dict]:
     return None
 
 
+def _find_multiline_frontmatter_keys(text: str) -> Set[str]:
+    """先頭 frontmatter 内で複数行に継続しているキー名集合を返す。"""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return set()
+    multiline_keys: Set[str] = set()
+    current_key: Optional[str] = None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return multiline_keys
+        m = re.match(r"^([A-Za-z_]+):\s*(.*)$", line)
+        if m:
+            current_key = m.group(1)
+        elif line.strip() and not line.lstrip().startswith("#") and current_key is not None:
+            multiline_keys.add(current_key)
+    return set()
+
+
 def _partition_markdown_lines(lines: List[str]) -> Tuple[List[str], List[Tuple[int, str]]]:
     """frontmatter 以降の本文行リストと、コードブロック内 (1 始まり行番号, 行) リストを返す。"""
     start = 0
@@ -243,9 +261,9 @@ def check_rules(root: Path = REPO_ROOT) -> List[str]:
         body_lines = _iter_markdown_body_lines(lines)
         if not any(l.startswith("# ") for l in body_lines):
             errors.append(f"{rel}: 命令形の見出し(# ...)がありません")
-        if not any(re.match(r"^##\s*手順(?:\s|$)", l) for l in body_lines):
+        if not any(re.match(r"^##[ \t]+手順(?:\s|$)", l) for l in body_lines):
             errors.append(f"{rel}: 「## 手順」節がありません")
-        if not any(re.match(r"^##\s*対象外(?:\s|$)", l) for l in body_lines):
+        if not any(re.match(r"^##[ \t]+対象外(?:\s|$)", l) for l in body_lines):
             errors.append(f"{rel}: 「## 対象外」節がありません")
     return errors
 
@@ -267,6 +285,7 @@ def check_skills(root: Path = REPO_ROOT) -> List[str]:
         text = skill_md.read_text(encoding="utf-8")
         lines = text.splitlines()
         fm = parse_frontmatter(text)
+        multiline_keys = _find_multiline_frontmatter_keys(text)
         if fm is None:
             errors.append(f"{rel}/SKILL.md: frontmatter がありません")
         else:
@@ -276,13 +295,18 @@ def check_skills(root: Path = REPO_ROOT) -> List[str]:
                     f"ディレクトリ名({skill_dir.name})と一致しません"
                 )
             desc = fm.get("description")
-            if not desc:
-                errors.append(f"{rel}/SKILL.md: frontmatter に description がありません")
-            elif desc.startswith((">", "|")):
+            if desc and desc.startswith((">", "|")):
                 errors.append(
                     f"{rel}/SKILL.md: description に複数行ブロックスカラー({desc[0]})は"
                     "使用できません(単一行 YAML で記述してください)"
                 )
+            elif "description" in multiline_keys:
+                errors.append(
+                    f"{rel}/SKILL.md: description が複数行に折り返されています"
+                    "(単一行 YAML で記述してください)"
+                )
+            elif not desc:
+                errors.append(f"{rel}/SKILL.md: frontmatter に description がありません")
             else:
                 total_desc_chars += len(desc)
         if len(lines) > SKILL_LINE_LIMIT:
