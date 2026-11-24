@@ -423,7 +423,9 @@ def _tokenize_lossy(segment: str) -> list[str]:
         return segment.split()
 
 
-def _split_top_level_segments_raw(text: str, *, posix_shell: bool = False) -> list[str]:
+def _split_top_level_segments_raw(
+    text: str, *, posix_shell: bool = False, allow_cmd_subst: bool = True
+) -> list[str]:
     """連結記号・パイプ・改行および $() / バッククォート内をセグメント分割する（従来分割）。"""
     raw_parts = re.split(r"&&|\|\||[;|&`]|[\r\n]+", text)
     segments: list[str] = []
@@ -432,18 +434,19 @@ def _split_top_level_segments_raw(text: str, *, posix_shell: bool = False) -> li
         if not stripped:
             continue
         segments.append(stripped)
-        for m in re.finditer(r"\$\(([^)]+)\)", stripped):
-            if posix_shell:
-                backslashes = 0
-                k = m.start() - 1
-                while k >= 0 and stripped[k] == "\\":
-                    backslashes += 1
-                    k -= 1
-                if backslashes % 2 == 1:
-                    continue
-            sub_stripped = m.group(1).strip()
-            if sub_stripped:
-                segments.append(sub_stripped)
+        if allow_cmd_subst:
+            for m in re.finditer(r"\$\(([^)]+)\)", stripped):
+                if posix_shell:
+                    backslashes = 0
+                    k = m.start() - 1
+                    while k >= 0 and stripped[k] == "\\":
+                        backslashes += 1
+                        k -= 1
+                    if backslashes % 2 == 1:
+                        continue
+                sub_stripped = m.group(1).strip()
+                if sub_stripped:
+                    segments.append(sub_stripped)
     return segments
 
 
@@ -780,8 +783,12 @@ def _extract_command_substitutions(text: str, *, posix_shell: bool = False) -> l
     return bodies
 
 
-def _extract_rg_substitutions(segment: str, *, posix_shell: bool = False) -> list[str]:
+def _extract_rg_substitutions(
+    segment: str, *, posix_shell: bool = False, allow_cmd_subst: bool = True
+) -> list[str]:
     """単一引用外（未引用＋ダブルクォート内）から $(...) と `...` の中身を抽出し引用境界に沿って分割する。"""
+    if not allow_cmd_subst:
+        return []
     subs: list[str] = []
     for body in _extract_command_substitutions(segment, posix_shell=posix_shell):
         parts = _split_unquoted_top_level(body, posix_shell=posix_shell)
@@ -792,11 +799,15 @@ def _extract_rg_substitutions(segment: str, *, posix_shell: bool = False) -> lis
     return subs
 
 
-def _split_top_level_segments(command: str, *, posix_shell: bool = False) -> list[str]:
+def _split_top_level_segments(
+    command: str, *, posix_shell: bool = False, allow_cmd_subst: bool = True
+) -> list[str]:
     """連結記号・パイプ・改行および $() / バッククォート内をセグメント分割する。"""
     unquoted_parts = _split_unquoted_top_level(command, posix_shell=posix_shell)
     if unquoted_parts is None:
-        return _split_top_level_segments_raw(command, posix_shell=posix_shell)
+        return _split_top_level_segments_raw(
+            command, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+        )
 
     segments: list[str] = []
     extract_outer_subs = False
@@ -805,9 +816,17 @@ def _split_top_level_segments(command: str, *, posix_shell: bool = False) -> lis
             segments.append(part)
             extract_outer_subs = True
         else:
-            segments.extend(_split_top_level_segments_raw(part, posix_shell=posix_shell))
-    if extract_outer_subs:
-        segments.extend(_extract_rg_substitutions(command, posix_shell=posix_shell))
+            segments.extend(
+                _split_top_level_segments_raw(
+                    part, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+                )
+            )
+    if extract_outer_subs and allow_cmd_subst:
+        segments.extend(
+            _extract_rg_substitutions(
+                command, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+            )
+        )
     return segments
 
 
@@ -856,7 +875,12 @@ def _unwrap_segment_tokens(
             )
             if is_cmd_flag and i + 1 < len(sub_tokens):
                 nested = " ".join(sub_tokens[i + 1 :])
-                for seg in _split_top_level_segments(nested, posix_shell=is_unix_shell):
+                child_allow_cmd_subst = head != "cmd"
+                for seg in _split_top_level_segments(
+                    nested,
+                    posix_shell=is_unix_shell,
+                    allow_cmd_subst=child_allow_cmd_subst,
+                ):
                     results.extend(
                         _unwrap_segment_tokens(_tokenize_lossy(seg), posix_shell=is_unix_shell)
                     )
