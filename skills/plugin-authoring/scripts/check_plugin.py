@@ -8,16 +8,18 @@ skills/plugin-authoring/guidelines.md のチェックリストのうち、機械
 
 検査項目:
 - rules/*.md (AGENTS.md / GEMINI.md を除く): 命名、frontmatter(trigger, description)、
-  ## 対象外、30 行以内
+  # 見出し、## 手順、## 対象外、30 行以内
 - skills/<name>/SKILL.md: 命名、frontmatter の name とディレクトリ名の一致、
-  description、200 行以内
-- rules/AGENTS.md (または AGENTS.md): ## 節の本文が 5 行以内
+  単一行 description、# 見出し、200 行以内、全スキル description 合計 5,000 文字以内
+- skills/<name>/**/*.md (plugin-authoring を除く): コードブロック内の
+  skills/<name>/(scripts|presets)/ 相対パス禁止
+- rules/AGENTS.md (未存在時はレガシー互換で AGENTS.md): ## 節の本文が 5 行以内
 - README.md: rules/ と skills/ が収録一覧と双方向で一致している
-- docs/*.md: チェックリストを持つ計画書に `状態:` 行(進行中/完了/中断)がある、
+- docs/*.md (docs/ 実在時): チェックリストを持つ計画書に `状態:` 行(進行中/完了/中断)がある、
   「進行中」なのに全項目チェック済みの矛盾がない
-- plugin.json: name, version, description を持つ JSON。
-  displayName, suggestedPrompts, disabled, author, homepage, repository,
-  license, keywords, platforms など公式仕様フィールドについても型を検査する
+- plugin.json: name, version, description を必須とし、公式仕様の 10 キー
+  (name, description, logo, suggestedPrompts, displayName, version,
+  author, homepage, repository, disabled) のみ許容して型、URL、logo 相対パスを検査する
 - hooks.json (存在する場合): 公式スキーマのイベント名・未知キー・ハンドラ型、
   および command 内のプラグイン内相対スクリプト実在を検査する
 - --version-base <ref>: 指定した git ref の plugin.json と version が
@@ -33,7 +35,7 @@ import json
 import re
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -41,6 +43,10 @@ NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
 SEMVER_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 RULE_LINE_LIMIT = 30
 SKILL_LINE_LIMIT = 200
+SKILL_DESCRIPTION_TOTAL_LIMIT = 5000
+SKILL_CODEBLOCK_RELPATH_PATTERN = re.compile(
+    r"(?:^|[\s\"'(=])(?:\./)?(skills/[a-z0-9-]+/(?:scripts|presets)/[^\s\"'`)]*)"
+)
 AGENTS_SECTION_LINE_LIMIT = 5
 # version の意味づけ対象となるプラグイン中身のパス。これらの移動・改名・削除は
 # guidelines.md の規約上マイナーバンプを要求する
@@ -70,10 +76,25 @@ AGENTS_MD_PATH = Path("rules") / "AGENTS.md"
 IGNORED_RULE_STEMS = frozenset({"AGENTS", "GEMINI"})
 README_PATH = Path("README.md")
 README_HEADINGS = {"rule": "### ルール", "skill": "### スキル"}
+PLUGIN_JSON_ALLOWED_KEYS = frozenset(
+    {
+        "name",
+        "description",
+        "logo",
+        "suggestedPrompts",
+        "displayName",
+        "version",
+        "author",
+        "homepage",
+        "repository",
+        "disabled",
+    }
+)
 PLUGIN_JSON_REQUIRED_STRING_FIELDS = ("name", "version", "description")
-PLUGIN_JSON_OPTIONAL_STRING_FIELDS = ("displayName", "homepage", "license", "logo")
-PLUGIN_JSON_DEPENDENCY_LIST_FIELDS = ("requiredPlugins", "optionalPlugins", "forbiddenPlugins")
-PLUGIN_JSON_ALLOWED_PLATFORMS = frozenset({"cloud", "local", "security"})
+PLUGIN_JSON_AUTHOR_ALLOWED_KEYS = frozenset({"name", "url"})
+PLUGIN_JSON_REPOSITORY_ALLOWED_KEYS = frozenset({"type", "url"})
+PLUGIN_JSON_LOGO_EXTENSIONS = (".png", ".svg", ".jpg", ".jpeg", ".webp")
+HTTPS_URL_PATTERN = re.compile(r"^https://[^/\s]+(?:/\S*)?$")
 
 
 def run_git(root: Path, *args: str) -> str:
@@ -151,6 +172,50 @@ def parse_frontmatter(text: str) -> Optional[dict]:
     return None
 
 
+def _partition_markdown_lines(lines: List[str]) -> Tuple[List[str], List[Tuple[int, str]]]:
+    """frontmatter 以降の本文行リストと、コードブロック内 (1 始まり行番号, 行) リストを返す。"""
+    start = 0
+    if lines and lines[0].strip() == "---":
+        for idx, line in enumerate(lines[1:], start=1):
+            if line.strip() == "---":
+                start = idx + 1
+                break
+    body: List[str] = []
+    codeblock: List[Tuple[int, str]] = []
+    fence_char: Optional[str] = None
+    fence_len = 0
+    for lineno, line in enumerate(lines[start:], start=start + 1):
+        stripped = line.lstrip()
+        m = re.match(r"^(`{3,}|~{3,})", stripped)
+        if m:
+            tok = m.group(1)
+            if fence_char is None:
+                fence_char = tok[0]
+                fence_len = len(tok)
+                continue
+            if tok[0] == fence_char and len(tok) >= fence_len and stripped[len(tok) :].strip() == "":
+                fence_char = None
+                fence_len = 0
+                continue
+        if fence_char is None:
+            body.append(line)
+        else:
+            codeblock.append((lineno, line))
+    return body, codeblock
+
+
+def _iter_markdown_body_lines(lines: List[str]) -> List[str]:
+    """frontmatter とフェンス付きコードブロックを除いた本文行を返す。"""
+    body, _ = _partition_markdown_lines(lines)
+    return body
+
+
+def _iter_fenced_codeblock_lines(lines: List[str]) -> List[Tuple[int, str]]:
+    """frontmatter 以降のフェンス付きコードブロック内の (1 始まり行番号, 行文字列) を返す。"""
+    _, codeblock = _partition_markdown_lines(lines)
+    return codeblock
+
+
 def check_rules(root: Path = REPO_ROOT) -> List[str]:
     errors = []
     rules_dir = root / "rules"
@@ -175,9 +240,12 @@ def check_rules(root: Path = REPO_ROOT) -> List[str]:
                 errors.append(f"{rel}: frontmatter に description がありません")
         if len(lines) > RULE_LINE_LIMIT:
             errors.append(f"{rel}: {len(lines)} 行は上限 {RULE_LINE_LIMIT} 行を超えています")
-        if not any(l.startswith("# ") for l in lines):
+        body_lines = _iter_markdown_body_lines(lines)
+        if not any(l.startswith("# ") for l in body_lines):
             errors.append(f"{rel}: 命令形の見出し(# ...)がありません")
-        if not any(re.match(r"^##\s*対象外", l) for l in lines):
+        if not any(re.match(r"^##\s*手順(?:\s|$)", l) for l in body_lines):
+            errors.append(f"{rel}: 「## 手順」節がありません")
+        if not any(re.match(r"^##\s*対象外(?:\s|$)", l) for l in body_lines):
             errors.append(f"{rel}: 「## 対象外」節がありません")
     return errors
 
@@ -187,6 +255,7 @@ def check_skills(root: Path = REPO_ROOT) -> List[str]:
     skills_dir = root / "skills"
     if not skills_dir.is_dir():
         return ["skills/ ディレクトリがありません"]
+    total_desc_chars = 0
     for skill_dir in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
         skill_md = skill_dir / "SKILL.md"
         rel = skill_dir.relative_to(root).as_posix()
@@ -206,12 +275,40 @@ def check_skills(root: Path = REPO_ROOT) -> List[str]:
                     f"{rel}/SKILL.md: frontmatter の name({fm.get('name')})が"
                     f"ディレクトリ名({skill_dir.name})と一致しません"
                 )
-            if not fm.get("description"):
+            desc = fm.get("description")
+            if not desc:
                 errors.append(f"{rel}/SKILL.md: frontmatter に description がありません")
+            elif desc.startswith((">", "|")):
+                errors.append(
+                    f"{rel}/SKILL.md: description に複数行ブロックスカラー({desc[0]})は"
+                    "使用できません(単一行 YAML で記述してください)"
+                )
+            else:
+                total_desc_chars += len(desc)
         if len(lines) > SKILL_LINE_LIMIT:
             errors.append(
                 f"{rel}/SKILL.md: {len(lines)} 行は上限 {SKILL_LINE_LIMIT} 行を超えています"
             )
+        body_lines = _iter_markdown_body_lines(lines)
+        if not any(l.startswith("# ") for l in body_lines):
+            errors.append(f"{rel}/SKILL.md: 名詞句の見出し(# ...)がありません")
+        if skill_dir.name != "plugin-authoring":
+            for md_path in sorted(skill_dir.rglob("*.md")):
+                md_lines = md_path.read_text(encoding="utf-8").splitlines()
+                md_rel = md_path.relative_to(root).as_posix()
+                for lineno, cb_line in _iter_fenced_codeblock_lines(md_lines):
+                    m = SKILL_CODEBLOCK_RELPATH_PATTERN.search(cb_line)
+                    if m:
+                        errors.append(
+                            f"{md_rel}:{lineno}: コードブロック内でプラグイン相対パス "
+                            f"'{m.group(1)}' は使用できません"
+                            '("$HOME/.gemini/config/plugins/shared-skills/..." 形式を使用してください)'
+                        )
+    if total_desc_chars > SKILL_DESCRIPTION_TOTAL_LIMIT:
+        errors.append(
+            f"skills/*/SKILL.md: 全スキル description の合計文字数 {total_desc_chars} は"
+            f"上限 {SKILL_DESCRIPTION_TOTAL_LIMIT} 文字を超えています"
+        )
     return errors
 
 
@@ -368,53 +465,62 @@ def _is_non_empty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def _check_plugin_json_mcp_servers(value: object, errors: List[str]) -> None:
-    if _is_non_empty_string(value):
+def _is_https_url(value: object) -> bool:
+    return isinstance(value, str) and bool(HTTPS_URL_PATTERN.match(value))
+
+
+def _check_plugin_logo(logo: object, root: Optional[Path], errors: List[str]) -> None:
+    if not _is_non_empty_string(logo):
+        errors.append(f"{PLUGIN_JSON_LABEL}: logo は空でない文字列である必要があります")
         return
-    if isinstance(value, list):
-        if all(_is_non_empty_string(item) for item in value):
-            return
+    assert isinstance(logo, str)
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", logo) or logo.startswith("//"):
         errors.append(
-            f"{PLUGIN_JSON_LABEL}: mcpServers は文字列、文字列の配列、"
-            "paths/exclusive オブジェクト、サーバー定義のオブジェクトのいずれかである必要があります"
+            f"{PLUGIN_JSON_LABEL}: logo に URL は指定できません"
+            "(プラグインディレクトリからの相対パスを指定してください)"
         )
         return
-    if isinstance(value, dict):
-        keys = set(value.keys())
-        if keys & {"paths", "exclusive"}:
-            paths = value.get("paths")
-            if not isinstance(paths, list) or not all(
-                _is_non_empty_string(path) for path in paths
-            ):
-                errors.append(
-                    f"{PLUGIN_JSON_LABEL}: mcpServers.paths は文字列の配列である必要があります"
-                )
-            if "exclusive" in value and not isinstance(value["exclusive"], bool):
-                errors.append(
-                    f"{PLUGIN_JSON_LABEL}: mcpServers.exclusive は真偽値である必要があります"
-                )
-            if not keys <= {"paths", "exclusive"}:
-                errors.append(
-                    f"{PLUGIN_JSON_LABEL}: mcpServers の paths/exclusive 形式に未知のキーがあります"
-                )
-            return
-        for name, server in value.items():
-            if not isinstance(server, dict):
-                errors.append(
-                    f"{PLUGIN_JSON_LABEL}: mcpServers.{name} はオブジェクトである必要があります"
-                )
+    if "\\" in logo:
+        errors.append(
+            f"{PLUGIN_JSON_LABEL}: logo にバックスラッシュ '\\' は使えません"
+            "(POSIX 相対パス '/' を使用してください)"
+        )
         return
-    errors.append(
-        f"{PLUGIN_JSON_LABEL}: mcpServers は文字列、文字列の配列、"
-        "paths/exclusive オブジェクト、サーバー定義のオブジェクトのいずれかである必要があります"
-    )
+    if logo.startswith("/") or re.match(r"^[A-Za-z]:", logo):
+        errors.append(
+            f"{PLUGIN_JSON_LABEL}: logo に絶対パスは指定できません"
+            "(プラグインディレクトリからの相対パスを指定してください)"
+        )
+        return
+    if ".." in PurePosixPath(logo).parts:
+        errors.append(f"{PLUGIN_JSON_LABEL}: logo がプラグインディレクトリ外を参照しています")
+        return
+    if not logo.endswith(PLUGIN_JSON_LOGO_EXTENSIONS):
+        errors.append(
+            f"{PLUGIN_JSON_LABEL}: logo の拡張子は "
+            ".png, .svg, .jpg, .jpeg, .webp のいずれかである必要があります"
+        )
+        return
+    if root is not None:
+        root_resolved = root.resolve()
+        target = (root / logo).resolve()
+        try:
+            target.relative_to(root_resolved)
+        except ValueError:
+            errors.append(f"{PLUGIN_JSON_LABEL}: logo がプラグインディレクトリ外を参照しています")
+            return
+        if not target.is_file():
+            errors.append(f"{PLUGIN_JSON_LABEL}: logo のファイルが見つかりません: {logo}")
 
 
-def validate_plugin_json(data: object) -> List[str]:
-    """plugin.json の必須項目と公式仕様フィールドの型を検査する"""
+def validate_plugin_json(data: object, root: Optional[Path] = None) -> List[str]:
+    """plugin.json の必須項目と公式仕様 10 フィールドの型と制約を検査する。"""
     errors: List[str] = []
     if not isinstance(data, dict):
         return [f"{PLUGIN_JSON_LABEL}: JSON のトップレベルがオブジェクトではありません"]
+
+    for key in sorted(set(data.keys()) - PLUGIN_JSON_ALLOWED_KEYS):
+        errors.append(f"{PLUGIN_JSON_LABEL}: 公式仕様外のトップレベルキー {key!r} があります")
 
     for key in PLUGIN_JSON_REQUIRED_STRING_FIELDS:
         if key not in data:
@@ -426,31 +532,44 @@ def validate_plugin_json(data: object) -> List[str]:
         elif not value.strip():
             errors.append(f"{PLUGIN_JSON_LABEL}: {key} がありません")
 
+    name = data.get("name")
+    if isinstance(name, str) and name.strip() and not NAME_PATTERN.match(name):
+        errors.append(
+            f"{PLUGIN_JSON_LABEL}: name は小文字英数字とハイフンのみである必要があります"
+        )
+
     version = data.get("version")
     if isinstance(version, str) and version.strip() and semver_tuple(version) is None:
         errors.append(
             f"{PLUGIN_JSON_LABEL}: version が SemVer(X.Y.Z) ではありません({version})"
         )
 
-    for key in PLUGIN_JSON_OPTIONAL_STRING_FIELDS:
-        if key not in data:
-            continue
-        if not _is_non_empty_string(data[key]):
-            errors.append(
-                f"{PLUGIN_JSON_LABEL}: {key} は空でない文字列である必要があります"
-            )
+    if "displayName" in data and not _is_non_empty_string(data["displayName"]):
+        errors.append(f"{PLUGIN_JSON_LABEL}: displayName は空でない文字列である必要があります")
+
+    if "logo" in data:
+        _check_plugin_logo(data["logo"], root, errors)
+
+    if "homepage" in data and not _is_https_url(data["homepage"]):
+        errors.append(
+            f"{PLUGIN_JSON_LABEL}: homepage は https:// で始まる URL である必要があります"
+        )
 
     if "repository" in data:
         repo = data["repository"]
         if isinstance(repo, str):
-            if not repo.strip():
+            if not _is_https_url(repo):
                 errors.append(
-                    f"{PLUGIN_JSON_LABEL}: repository は空でない文字列である必要があります"
+                    f"{PLUGIN_JSON_LABEL}: repository は https:// で始まる URL である必要があります"
                 )
         elif isinstance(repo, dict):
-            if not _is_non_empty_string(repo.get("url")):
+            for key in sorted(set(repo.keys()) - PLUGIN_JSON_REPOSITORY_ALLOWED_KEYS):
                 errors.append(
-                    f"{PLUGIN_JSON_LABEL}: repository.url は空でない文字列である必要があります"
+                    f"{PLUGIN_JSON_LABEL}: repository に公式仕様外のキー {key!r} があります"
+                )
+            if not _is_https_url(repo.get("url")):
+                errors.append(
+                    f"{PLUGIN_JSON_LABEL}: repository.url は https:// で始まる URL である必要があります"
                 )
             if "type" in repo and not _is_non_empty_string(repo["type"]):
                 errors.append(
@@ -458,7 +577,7 @@ def validate_plugin_json(data: object) -> List[str]:
                 )
         else:
             errors.append(
-                f"{PLUGIN_JSON_LABEL}: repository は空でない文字列または url を持つオブジェクトである必要があります"
+                f"{PLUGIN_JSON_LABEL}: repository は https:// URL または url を持つオブジェクトである必要があります"
             )
 
     if "author" in data:
@@ -469,11 +588,18 @@ def validate_plugin_json(data: object) -> List[str]:
                     f"{PLUGIN_JSON_LABEL}: author は空でない文字列またはオブジェクトである必要があります"
                 )
         elif isinstance(author, dict):
-            for key in ("name", "email", "url"):
-                if key in author and not _is_non_empty_string(author[key]):
-                    errors.append(
-                        f"{PLUGIN_JSON_LABEL}: author.{key} は空でない文字列である必要があります"
-                    )
+            for key in sorted(set(author.keys()) - PLUGIN_JSON_AUTHOR_ALLOWED_KEYS):
+                errors.append(
+                    f"{PLUGIN_JSON_LABEL}: author に公式仕様外のキー {key!r} があります"
+                )
+            if not _is_non_empty_string(author.get("name")):
+                errors.append(
+                    f"{PLUGIN_JSON_LABEL}: author.name は空でない文字列である必要があります"
+                )
+            if "url" in author and not _is_https_url(author["url"]):
+                errors.append(
+                    f"{PLUGIN_JSON_LABEL}: author.url は https:// で始まる URL である必要があります"
+                )
         else:
             errors.append(
                 f"{PLUGIN_JSON_LABEL}: author は空でない文字列またはオブジェクトである必要があります"
@@ -495,62 +621,6 @@ def validate_plugin_json(data: object) -> List[str]:
     if "disabled" in data and not isinstance(data["disabled"], bool):
         errors.append(f"{PLUGIN_JSON_LABEL}: disabled は真偽値である必要があります")
 
-    if "keywords" in data:
-        keywords = data["keywords"]
-        if not isinstance(keywords, list) or not all(
-            _is_non_empty_string(keyword) for keyword in keywords
-        ):
-            errors.append(f"{PLUGIN_JSON_LABEL}: keywords は文字列の配列である必要があります")
-
-    if "platforms" in data:
-        platforms = data["platforms"]
-        if not isinstance(platforms, list) or not all(
-            _is_non_empty_string(platform) for platform in platforms
-        ):
-            errors.append(f"{PLUGIN_JSON_LABEL}: platforms は文字列の配列である必要があります")
-        else:
-            for platform in platforms:
-                if platform not in PLUGIN_JSON_ALLOWED_PLATFORMS:
-                    errors.append(
-                        f"{PLUGIN_JSON_LABEL}: platforms に公式仕様外の値 {platform!r} があります"
-                        "(cloud, local, security のいずれか)"
-                    )
-
-    if "skills" in data:
-        skills = data["skills"]
-        valid_skills = _is_non_empty_string(skills) or (
-            isinstance(skills, list)
-            and all(_is_non_empty_string(skill) for skill in skills)
-        )
-        if not valid_skills:
-            errors.append(
-                f"{PLUGIN_JSON_LABEL}: skills は空でない文字列または文字列の配列である必要があります"
-            )
-
-    for key in PLUGIN_JSON_DEPENDENCY_LIST_FIELDS:
-        if key not in data:
-            continue
-        entries = data[key]
-        if not isinstance(entries, list):
-            errors.append(f"{PLUGIN_JSON_LABEL}: {key} は配列である必要があります")
-            continue
-        for index, entry in enumerate(entries):
-            if _is_non_empty_string(entry):
-                continue
-            if isinstance(entry, dict):
-                if not _is_non_empty_string(entry.get("source")):
-                    errors.append(
-                        f"{PLUGIN_JSON_LABEL}: {key}[{index}] は source を持つオブジェクトか"
-                        "文字列である必要があります"
-                    )
-                continue
-            errors.append(
-                f"{PLUGIN_JSON_LABEL}: {key}[{index}] は文字列またはオブジェクトである必要があります"
-            )
-
-    if "mcpServers" in data:
-        _check_plugin_json_mcp_servers(data["mcpServers"], errors)
-
     return errors
 
 
@@ -562,7 +632,7 @@ def check_plugin_json(root: Path = REPO_ROOT) -> List[str]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         return [f"{PLUGIN_JSON_LABEL}: JSON として解釈できません({e})"]
-    return validate_plugin_json(data)
+    return validate_plugin_json(data, root=root)
 
 
 def _tokenize_hook_command(command: str) -> Optional[List[str]]:
@@ -950,10 +1020,15 @@ def main() -> int:
         ("skills/*/SKILL.md", check_skills()),
         ("rules/AGENTS.md", check_agents()),
         ("README.md", check_readme()),
-        ("docs/*.md", check_docs()),
-        ("plugin.json", check_plugin_json()),
-        ("hooks.json", check_hooks_json()),
     ]
+    if (REPO_ROOT / "docs").is_dir():
+        checks.append(("docs/*.md", check_docs()))
+    checks.extend(
+        [
+            ("plugin.json", check_plugin_json()),
+            ("hooks.json", check_hooks_json()),
+        ]
+    )
     if args.version_base:
         checks.append(("version bump", check_version_bump(args.version_base)))
 
