@@ -1,6 +1,6 @@
 ---
 name: invariant-gate
-description: 任意の Git リポジトリ上で git diff とルール文書（AGENTS.md、GEMINI.md、CLAUDE.md、.agents/rules/*.md、.agent/rules/*.md、ネイティブプラグインの rules/*.md 等）を Gemini Decision 1（gemini-decision-1）の 1 回の呼び出しで突合し、不変条件の違反候補を抽出する汎用検査手順と CLI を扱う。PR 作成前や実装完了時に差分の規約違反を網羅スクリーニングするときに使用する。Decisions API の一般仕様とスキーマ設計は gemini-decisions-api、常駐システム境界の監査観点は systems-pre-pr-audit、API キーの発行と環境変数設定の案内は scoped-secret-provisioning、Windows シェルでの引用符と文字コード対策は windows-cli-pitfalls に委ねる。
+description: 任意の Git リポジトリの git diff とルール文書を Gemini Decision 1 で一括突合し、規約違反候補を抽出する。PR 作成前や実装完了時に差分の不変条件を検査するときに使用する。Decisions API 仕様は gemini-decisions-api、常駐システム監査は systems-pre-pr-audit に委ねる。
 ---
 
 # Gemini Decision 1 による汎用不変条件検査
@@ -24,7 +24,7 @@ description: 任意の Git リポジトリ上で git diff とルール文書（A
 
 1. **自動検出（第 1 層）**：対象リポジトリルートから `AGENTS.md`、`GEMINI.md`、`CLAUDE.md`、`.agents/rules/*.md`、`.agent/rules/*.md`、`_agents/rules/*.md`、`_agent/rules/*.md` を昇順で読み込む。
    リポジトリルートにネイティブプラグインのマニフェスト（`plugin.json`、`.antigravity-plugin/plugin.json`、`.gemini-plugin/plugin.json`）または `rules/AGENTS.md` が存在する場合は、`rules/AGENTS.md`、`rules/GEMINI.md`、`rules/*.md` も重複を除いて読み込む。
-   いずれも YAML frontmatter、フェンス付きコードブロック内、および `## 対象外` 節を除いて見出しまたはトップレベル箇条書き単位で抽出する。
+   いずれも YAML frontmatter、フェンス付きコードブロック内、および除外見出し（`## 対象外`、`## Out of Scope`、`## Non-Goals` 等）節を除いて見出しまたはトップレベル箇条書き単位で抽出する。
 2. **追加指定（第 2 層）**：`--rules <path...>` または `--preset systems-pre-pr` で外部や同梱スキルの Markdown（例：`skills/systems-pre-pr-audit/SKILL.md`）を追加投入できる。
 3. **カスタム定義（第 3 層）**：対象リポジトリに `.agents/invariants.json`（または `--questions-file <path>`）があれば読み込み、既存キーの上書き、`path_globs` による変更ファイル限定、個別の `threshold` と `warn_threshold` を適用する。
 
@@ -42,7 +42,7 @@ description: 任意の Git リポジトリ上で git diff とルール文書（A
 ```
 
 差分取得では `git -c core.quotePath=false diff --no-ext-diff --unified=15` を UTF-8 で実行し、バイナリ差分とロックファイル（`Cargo.lock`、`package-lock.json`、`pnpm-lock.yaml`、`yarn.lock`、`uv.lock`、`poetry.lock`）を既定除外する。
-変更ファイルに `.env` 系（`.env.example` 等の雛形を除く）が含まれる場合、または追加行や文脈行に秘密鍵ヘッダ（`BEGIN ... PRIVATE KEY` 等）や主要 API トークン形式（`AIza...`、`ghp_` や `github_pat_` 等の GitHub トークン、`sk-...`、`AKIA...`）が含まれる場合は、API 送信前に終了コード `2` で遮断する（エラー出力に実値は出さない）。
+変更ファイルに `.env` 系（`.env.example` 等の雛形を除く）が含まれる場合、または追加行や文脈行に秘密鍵ヘッダ（`BEGIN ... PRIVATE KEY` 等）や主要 API トークン形式（`AIza...`、`ghp_` や `github_pat_` 等の GitHub トークン、`sk-...`、`AKIA...`、`cog_...`）が含まれる場合は、API 送信前に終了コード `2` で遮断する（エラー出力に実値は出さない）。
 入力文字数が既定上限 `400,000` 文字を超える場合、または質問数が `1,000` 問を超える場合は無言で切り詰めず、終了コード `2` で `--paths` や `--rules` による分割を案内する。
 
 ## 実行手順

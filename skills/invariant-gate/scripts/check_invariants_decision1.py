@@ -24,6 +24,7 @@ _DECISIONS_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "gemini-decisions
 if str(_DECISIONS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_DECISIONS_SCRIPTS_DIR))
 
+import decision_common  # noqa: E402
 import decision_hygiene  # noqa: E402
 import run_decisions  # noqa: E402
 
@@ -83,13 +84,10 @@ GITHUB_TOKEN_RE = decision_hygiene.GITHUB_TOKEN_RE
 GITHUB_PAT_RE = decision_hygiene.GITHUB_PAT_RE
 SECRET_KEY_PREFIX_RE = decision_hygiene.SECRET_KEY_PREFIX_RE
 AWS_ACCESS_KEY_RE = decision_hygiene.AWS_ACCESS_KEY_RE
+DEVIN_API_KEY_RE = decision_hygiene.DEVIN_API_KEY_RE
 
 SECRET_TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("Google API キー (AIza...)", GOOGLE_API_KEY_RE),
-    ("GitHub トークン (gh*_...)", GITHUB_TOKEN_RE),
-    ("GitHub PAT (github_pat_...)", GITHUB_PAT_RE),
-    ("API シークレットキー (sk-...)", SECRET_KEY_PREFIX_RE),
-    ("AWS アクセスキー (AKIA...)", AWS_ACCESS_KEY_RE),
+    decision_hygiene.SECRET_TOKEN_DETECT_PATTERNS
 )
 
 PRESET_RULE_RELPATHS: dict[str, Path] = {
@@ -137,42 +135,13 @@ def mask_secret(text: str, secret: str | None = None) -> str:
     return decision_hygiene.mask_secret(text, secret)
 
 
-def _normalize_rel_path(path_str: str) -> str:
-    norm = path_str.replace("\\", "/").strip()
-    if norm.startswith("./"):
-        norm = norm[2:]
-    return norm
-
-
-def _glob_to_regex(pattern: str) -> re.Pattern[str]:
-    pat = _normalize_rel_path(pattern)
-    i = 0
-    n = len(pat)
-    parts: list[str] = ["^"]
-    while i < n:
-        if pat[i : i + 3] == "**/":
-            parts.append("(?:.*/)?")
-            i += 3
-        elif pat[i : i + 2] == "**":
-            parts.append(".*")
-            i += 2
-        elif pat[i] == "*":
-            parts.append("[^/]*")
-            i += 1
-        elif pat[i] == "?":
-            parts.append("[^/]")
-            i += 1
-        else:
-            parts.append(re.escape(pat[i]))
-            i += 1
-    parts.append("$")
-    return re.compile("".join(parts))
+_normalize_rel_path = decision_common.normalize_posix_rel_path
+_glob_to_regex = decision_common.glob_to_regex
 
 
 def glob_match(path_str: str, pattern: str) -> bool:
     """POSIX パスに対して ** を含む glob 一致判定を行う。"""
-    norm = _normalize_rel_path(path_str)
-    return bool(_glob_to_regex(pattern).match(norm))
+    return decision_common.glob_match(path_str, pattern)
 
 
 def is_lockfile_path(path_str: str) -> bool:
@@ -294,12 +263,46 @@ def build_rule_instructions(
     return instructions, criteria
 
 
+EXCLUDED_HEADING_NAMES: frozenset[str] = frozenset(
+    {
+        "対象外",
+        "out of scope",
+        "non goal",
+        "non goals",
+        "nongoal",
+        "nongoals",
+    }
+)
+
+
+def _normalize_heading_token(text: str) -> str:
+    norm = text.strip().lower()
+    norm = re.sub(r"^\d+(?:[.-]\d+)*[.)]?\s*", "", norm)
+    while True:
+        updated = re.sub(r"(?:\s*(?:\([^)]*\)|（[^）]*）|[:：]))+\s*$", "", norm).strip()
+        if updated == norm:
+            break
+        norm = updated
+    return re.sub(r"[\s\-\u2010-\u2015\u2212]+", " ", norm).strip()
+
+
+def _is_excluded_heading(title: str) -> bool:
+    stripped = _normalize_heading_token(title)
+    if not stripped:
+        return False
+    if stripped in EXCLUDED_HEADING_NAMES:
+        return True
+    parts = [_normalize_heading_token(p) for p in re.split(r"[/／]", title)]
+    parts = [p for p in parts if p]
+    return bool(parts) and all(p in EXCLUDED_HEADING_NAMES for p in parts)
+
+
 def extract_rules_from_markdown(
     content: str,
     source_file: str,
     used_keys: set[str] | None = None,
 ) -> list[RuleItem]:
-    """Markdown から YAML frontmatter、コードブロック、## 対象外を除いてルールを抽出する。"""
+    """Markdown から YAML frontmatter、コードブロック、および除外見出し（対象外 / Out of Scope / Non-Goals 等）を除いてルールを抽出する。"""
     if used_keys is None:
         used_keys = set()
 
@@ -417,7 +420,7 @@ def extract_rules_from_markdown(
             if skip_heading_level is not None and level <= skip_heading_level:
                 skip_heading_level = None
 
-            if title == "対象外":
+            if skip_heading_level is None and _is_excluded_heading(title):
                 skip_heading_level = level
                 current_heading = title
                 current_heading_level = level

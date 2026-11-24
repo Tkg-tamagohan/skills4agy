@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""decision_hygiene.py の単体テスト（テスト ID: DH-01–DH-06）。
+"""decision_hygiene.py の単体テスト（テスト ID: DH-01–DH-07）。
 
 境界条件、複数行 PEM ブロックと単独ヘッダのマスク、生値と URL エンコード値のマスク、
-Windows/POSIX 両パスの .env 判定、および stdio UTF-8 再設定を検証する。
+Windows/POSIX 両パスの .env 判定、stdio UTF-8 再設定、およびトークンパターン抽出を検証する。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import decision_hygiene as dh  # noqa: E402
 
 class TestDecisionHygiene(unittest.TestCase):
     def test_dh01_sk_boundary_and_token_patterns(self) -> None:
-        """DH-01: sk- 境界により英単語内識別子を誤検知せず、5 種のトークン形式を正確に検出・マスクする。"""
+        """DH-01: sk- 境界により英単語内識別子を誤検知せず、基本 5 種のトークン形式（cog_ は DH-06 で検証）を正確に検出・マスクする。"""
         safe_identifiers = [
             "flask-app-secret-config-1234567890",
             "task-executor-worker-pool-config",
@@ -187,6 +187,39 @@ class TestDecisionHygiene(unittest.TestCase):
         masked = dh.mask_secrets(f"Authorization: Bearer {dummy_cog_key}")
         self.assertNotIn(dummy_cog_key, masked)
         self.assertEqual(masked, "Authorization: Bearer [REDACTED]")
+
+    def test_dh07_secret_token_patterns_and_iter_string_fields(self) -> None:
+        """DH-07: SECRET_TOKEN_DETECT_PATTERNS（6 種）の整合性と iter_string_fields の再帰抽出を検証する。"""
+        patterns = dh.SECRET_TOKEN_DETECT_PATTERNS
+        self.assertEqual(len(patterns), 6)
+        self.assertTrue(all(pat is not dh.PRIVATE_KEY_HEADER_RE for _, pat in patterns))
+        self.assertTrue(any(pat is dh.DEVIN_API_KEY_RE for _, pat in patterns))
+
+        pem_header = "-----BEGIN " + "RSA PRIVATE KEY-----"
+        self.assertEqual(dh.scan_text_for_secrets(pem_header, patterns=patterns), [])
+
+        dummy_cog = "cog_" + "AbCdEf0123456789_-XyZ"
+        self.assertEqual(
+            dh.scan_text_for_secrets(f"key={dummy_cog}", patterns=patterns),
+            ["Devin API キー (cog_...)"],
+        )
+
+        payload = {
+            "id": "item-1",
+            "count": 42,
+            "flag": True,
+            "nested": {"note": "alpha", "empty": None},
+            "tags": ["t1", {"sub": "t2"}],
+        }
+        self.assertEqual(
+            dh.iter_string_fields(payload, "root"),
+            [
+                ("root.id", "item-1"),
+                ("root.nested.note", "alpha"),
+                ("root.tags[0]", "t1"),
+                ("root.tags[1].sub", "t2"),
+            ],
+        )
 
 
 if __name__ == "__main__":
