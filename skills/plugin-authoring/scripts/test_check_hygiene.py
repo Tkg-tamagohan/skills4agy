@@ -1,4 +1,4 @@
-"""check_hygiene.py の単体テスト（CH-01〜CH-09）。
+"""check_hygiene.py の単体テスト（CH-01〜CH-10）。
 
 テストケースの ID 採番と報告は rule `test-conventions` に従う。
 実行: `python test_check_hygiene.py`（同ディレクトリから）
@@ -39,7 +39,7 @@ def _init_git(root: Path) -> None:
 
 
 class TestCheckHygiene(unittest.TestCase):
-    """check_hygiene.py の構文・文字コード・競合マーカー・slop_lint 検査（CH-01〜CH-09）。"""
+    """check_hygiene.py の構文・文字コード・競合マーカー・slop_lint 検査（CH-01〜CH-10）。"""
 
     def make_repo(self, *, init_git: bool = False) -> Path:
         root = Path(tempfile.mkdtemp(prefix="check-hygiene-test-"))
@@ -236,6 +236,71 @@ class TestCheckHygiene(unittest.TestCase):
 
         rc_tracked, out_tracked = self.run_cli("--root", str(git_root), "--tracked-only")
         self.assertEqual(rc_tracked, 0, out_tracked)
+
+    def test_ch_10_エスケープとdot_slash正規化と親ディレクトリ除外優先とサブディレクトリrootを検証する(self):
+        # 1. バックスラッシュエスケープ（\[Draft\].md）、./docs/draft.md、および親ディレクトリ除外優先（docs/ + !docs/keep.md）
+        for use_git in (False, True):
+            with self.subTest(init_git=use_git):
+                root = self.make_repo(init_git=use_git)
+                (root / "[Draft].md").write_text(
+                    "# 下書き\n\n機能の追加・変更を行う。\n", encoding="utf-8"
+                )
+                (root / "docs").mkdir()
+                (root / "docs" / "draft.md").write_text(
+                    "# 下書き\n\n機能の追加・変更を行う。\n", encoding="utf-8"
+                )
+                (root / "docs" / "keep.md").write_text(
+                    "# 保持\n\n機能の追加・変更を行う。\n", encoding="utf-8"
+                )
+                (root / ".sloplintignore").write_text(
+                    "\\[Draft\\].md\n./docs/draft.md\ndocs/\n!docs/keep.md\n[broken.md\n",
+                    encoding="utf-8",
+                )
+                if use_git:
+                    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+                    subprocess.run(
+                        ["git", "commit", "-qm", "add edge cases"],
+                        cwd=root,
+                        check=True,
+                        capture_output=True,
+                    )
+
+                # [Draft].md と ./docs/draft.md は除外され、親 docs/ が除外のままなので !docs/keep.md も再包含されない
+                rc, out = self.run_cli("--root", str(root))
+                self.assertEqual(rc, 0, out)
+
+                # 親ディレクトリを再包含した場合、または docs/* を使った場合は !docs/keep.md が有効になる
+                for pat in ("docs/\n!docs/\n!docs/keep.md\n", "docs/*\n!docs/keep.md\n"):
+                    (root / ".sloplintignore").write_text(
+                        "\\[Draft\\].md\n./docs/draft.md\n" + pat, encoding="utf-8"
+                    )
+                    rc_keep, out_keep = self.run_cli("--root", str(root))
+                    self.assertEqual(rc_keep, 1, out_keep)
+                    self.assertIn("docs/keep.md", out_keep)
+                    self.assertNotIn("draft.md", out_keep)
+
+        # 2. Git リポジトリのサブディレクトリを --root に指定しても .gitignore と --tracked-only が効く
+        sub_repo = self.make_repo(init_git=True)
+        area = sub_repo / "area"
+        area.mkdir()
+        (area / "app.py").write_text("def area_ok():\n    return 1\n", encoding="utf-8")
+        (area / "area.json").write_text('{"area": true}\n', encoding="utf-8")
+        (area / "ok.md").write_text("# 見出し\n\n正常な本文である。\n", encoding="utf-8")
+        (sub_repo / ".gitignore").write_text("area/draft.md\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=sub_repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "add area"], cwd=sub_repo, check=True, capture_output=True
+        )
+        (area / "draft.md").write_text("# 下書き\n\n機能の追加・変更を行う。\n", encoding="utf-8")
+        (area / "untracked.md").write_text("# 未追跡\n\n機能の追加・変更を行う。\n", encoding="utf-8")
+
+        rc_sub, out_sub = self.run_cli("--root", str(area))
+        self.assertEqual(rc_sub, 1, out_sub)
+        self.assertNotIn("draft.md", out_sub)
+        self.assertIn("untracked.md", out_sub)
+
+        rc_sub_tracked, out_sub_tracked = self.run_cli("--root", str(area), "--tracked-only")
+        self.assertEqual(rc_sub_tracked, 0, out_sub_tracked)
 
 
 if __name__ == "__main__":

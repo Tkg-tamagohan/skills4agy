@@ -110,4 +110,5 @@ IMPL_SCHEMA = {
 - 計画フェーズは読み取り中心のため `workspace="inherit"`（または `invoke_subagent` の `TypeName="research"`）でよい。
 - 実装フェーズは複数ワーカーが同時にファイルを編集するため、必ず `workspace="share"`（独立クローンで PR まで作る場合は `workspace="branch"`）を指定する。
 - ワークフローのワーカーは親とコンテキストを共有しないため、対象リポジトリパス、共通規約、および実装フェーズでは計画ワーカーが返した確定済み `plan_path` を親がプロンプト本文へ展開して渡す（計画書の保存先は計画ワーカー自身が `<Worker Artifact Directory>/scratch/plans/<slug>.md` を解決し、保存した実在の絶対パスを `plan_path` で返す）。
+- 親は集約時に各計画ワーカーの `plan_path` を実際に読み取れることを確認し、`workspace="branch"` 等の環境制約により実装ワーカーが他ワーカーの Artifact ディレクトリを `read_file` で直接読めない場合は、確定済み計画書を親の `<Artifact Directory Path>/scratch/plans/` へ複製して渡すか、計画本文を実装ワーカーのプロンプトへ直接展開する。
 - 実装フェーズでワーカーが `workspace="share"` や `"branch"` で作成したコミットは、ワークフロー終了後に親が確認して統合する（または PR 作成後に確認する）。

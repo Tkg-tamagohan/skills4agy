@@ -60,8 +60,16 @@ def _load_slop_lint() -> Any:
     return module
 
 
-def _is_git_repo_root(root: Path) -> bool:
-    """root 自身が Git リポジトリのトップレベルかどうかを判定する。"""
+def _get_git_toplevel(root: Path) -> Optional[Path]:
+    """root が Git 作業ツリー内であればトップレベルの解決済み Path を返す。"""
+    inside = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+    )
+    if inside.returncode != 0 or inside.stdout.decode("utf-8", errors="replace").strip() != "true":
+        return None
     proc = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         cwd=root,
@@ -69,19 +77,19 @@ def _is_git_repo_root(root: Path) -> bool:
         check=False,
     )
     if proc.returncode != 0:
-        return False
+        return None
     toplevel = proc.stdout.decode("utf-8", errors="replace").strip()
     if not toplevel:
-        return False
+        return None
     try:
-        return Path(toplevel).resolve() == root.resolve()
+        return Path(toplevel).resolve()
     except OSError:
-        return False
+        return None
 
 
 def collect_target_files(root: Path, *, tracked_only: bool = False) -> List[str]:
     """Git 管理下では追跡済み（tracked_only=False 時は未追跡も含む）の実在ファイル、非 Git では再帰走査結果を返す。"""
-    if _is_git_repo_root(root):
+    if _get_git_toplevel(root) is not None:
         cmd = ["git", "-c", "core.quotePath=false", "ls-files", "-z", "--cached"]
         if not tracked_only:
             cmd.extend(["--others", "--exclude-standard"])
@@ -166,6 +174,29 @@ def check_text_hygiene(root: Path, files: List[str]) -> Tuple[int, List[str]]:
     return checked, errors
 
 
+def _normalize_sloplint_ignore_line(raw: str) -> Optional[str]:
+    """gitignore 互換で .sloplintignore の 1 行を正規化する（空白行とコメントは None）。"""
+    line = raw.rstrip("\r\n")
+    end = len(line)
+    while end > 0 and line[end - 1] == " ":
+        bs = 0
+        j = end - 2
+        while j >= 0 and line[j] == "\\":
+            bs += 1
+            j -= 1
+        if bs % 2 == 1:
+            break
+        end -= 1
+    line = line[:end]
+    if not line.strip() or line.startswith("#"):
+        return None
+    if line.startswith("!./"):
+        return "!/" + line[3:]
+    if line.startswith("./"):
+        return "/" + line[2:]
+    return line
+
+
 def load_sloplint_ignore(root: Path) -> List[str]:
     """.sloplintignore から gitignore 互換の除外パターン一覧を読み込む。"""
     ignore_path = root / ".sloplintignore"
@@ -173,29 +204,54 @@ def load_sloplint_ignore(root: Path) -> List[str]:
         return []
     patterns: List[str] = []
     for raw in ignore_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("./"):
-            line = "/" + line[2:]
-        patterns.append(line)
+        norm = _normalize_sloplint_ignore_line(raw)
+        if norm is not None:
+            patterns.append(norm)
     return patterns
 
 
-def _compile_gitignore_pattern(raw_pat: str) -> Tuple[bool, Pattern[str]]:
-    """gitignore 形式 1 行を (negated, compiled_regex) へ変換する（* は / に一致しない）。"""
+def _has_trailing_unescaped_slash(pat: str) -> bool:
+    if not pat.endswith("/"):
+        return False
+    bs = 0
+    i = len(pat) - 2
+    while i >= 0 and pat[i] == "\\":
+        bs += 1
+        i -= 1
+    return bs % 2 == 0
+
+
+def _contains_unescaped_slash(pat: str) -> bool:
+    i = 0
+    while i < len(pat):
+        if pat[i] == "\\":
+            i += 2
+            continue
+        if pat[i] == "/":
+            return True
+        i += 1
+    return False
+
+
+def _compile_gitignore_pattern(
+    raw_pat: str,
+) -> Optional[Tuple[bool, bool, Pattern[str]]]:
+    """gitignore 形式 1 行を (negated, dir_only, compiled_regex) へ変換する。不正パターンは None。"""
     negated = False
     pat = raw_pat
     if pat.startswith("!"):
         negated = True
         pat = pat[1:]
-    if pat.startswith("\\"):
-        pat = pat[1:]
+    if not pat:
+        return None
 
-    dir_only = pat.endswith("/")
+    dir_only = _has_trailing_unescaped_slash(pat)
     if dir_only:
-        pat = pat.rstrip("/")
-    anchored = "/" in pat
+        pat = pat[:-1]
+    if not pat:
+        return None
+
+    anchored = _contains_unescaped_slash(pat)
     if pat.startswith("/"):
         pat = pat[1:]
 
@@ -203,7 +259,14 @@ def _compile_gitignore_pattern(raw_pat: str) -> Tuple[bool, Pattern[str]]:
     i = 0
     n = len(pat)
     while i < n:
-        if pat.startswith("**/", i):
+        if pat[i] == "\\":
+            if i + 1 < n:
+                parts.append(re.escape(pat[i + 1]))
+                i += 2
+            else:
+                parts.append(re.escape("\\"))
+                i += 1
+        elif pat.startswith("**/", i) and (i == 0 or pat[i - 1] == "/"):
             parts.append("(?:.*/)?")
             i += 3
         elif pat.startswith("/**", i) and i + 3 == n:
@@ -219,52 +282,119 @@ def _compile_gitignore_pattern(raw_pat: str) -> Tuple[bool, Pattern[str]]:
             parts.append("[^/]")
             i += 1
         elif pat[i] == "[":
-            end = pat.find("]", i + 1)
-            if end != -1:
-                inner = pat[i + 1 : end]
-                if inner.startswith(("!", "^")):
-                    parts.append(f"[^{inner[1:]}/]")
-                else:
-                    parts.append(f"[{inner.replace('/', '')}]")
-                i = end + 1
+            j = i + 1
+            if j < n and pat[j] in ("!", "^"):
+                j += 1
+            if j < n and pat[j] == "]":
+                j += 1
+            closed = False
+            while j < n:
+                if pat[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if pat[j] == "]":
+                    closed = True
+                    break
+                j += 1
+            if not closed:
+                return None
+            inner = pat[i + 1 : j]
+            if inner.startswith(("!", "^")):
+                parts.append(f"[^{inner[1:]}/]")
             else:
-                parts.append(re.escape(pat[i]))
-                i += 1
+                parts.append(f"(?!/)[{inner}]")
+            i = j + 1
         else:
             parts.append(re.escape(pat[i]))
             i += 1
 
     prefix = "^" if anchored else "^(?:.*/)?"
-    suffix = "/.*$" if dir_only else "(?:/.*)?$"
-    return negated, re.compile(prefix + "".join(parts) + suffix)
+    try:
+        regex = re.compile(prefix + "".join(parts) + "$")
+    except re.error:
+        return None
+    return negated, dir_only, regex
 
 
 def is_slop_ignored(rel: str, ignore_patterns: List[str]) -> bool:
-    """対象 Markdown が .sloplintignore または恒久除外サフィックスに該当するか判定する。"""
+    """対象 Markdown が .sloplintignore または恒久除外サフィックスに該当するか判定する（親ディレクトリ除外優先）。"""
     if any(rel.endswith(suffix) for suffix in ALWAYS_EXCLUDED_SLOP_SUFFIXES):
         return True
-    ignored = False
-    for raw_pat in ignore_patterns:
-        negated, regex = _compile_gitignore_pattern(raw_pat)
+    rules = [
+        compiled
+        for raw_pat in ignore_patterns
+        if (compiled := _compile_gitignore_pattern(raw_pat)) is not None
+    ]
+    if not rules:
+        return False
+
+    parts = rel.split("/")
+    for idx in range(1, len(parts)):
+        dir_rel = "/".join(parts[:idx])
+        dir_ignored = False
+        for negated, _dir_only, regex in rules:
+            if regex.match(dir_rel):
+                dir_ignored = not negated
+        if dir_ignored:
+            return True
+
+    file_ignored = False
+    for negated, dir_only, regex in rules:
+        if dir_only:
+            continue
         if regex.match(rel):
-            ignored = not negated
-    return ignored
+            file_ignored = not negated
+    return file_ignored
 
 
 def _collect_git_slop_ignored(
     root: Path, *, tracked_only: bool = False
 ) -> Optional[Set[str]]:
-    """Git 管理下かつ .sloplintignore 実在時は git 自身の除外判定結果を返す。"""
-    if not (root / ".sloplintignore").is_file() or not _is_git_repo_root(root):
+    """Git 管理下かつ .sloplintignore 実在時は正規化済みパターンで git 自身の除外判定結果を返す。"""
+    toplevel = _get_git_toplevel(root)
+    if toplevel is None:
         return None
-    cmd = ["git", "-c", "core.quotePath=false", "ls-files", "-z", "--cached"]
-    if not tracked_only:
-        cmd.append("--others")
-    cmd.extend(["--ignored", "--exclude-from=.sloplintignore"])
-    proc = subprocess.run(cmd, cwd=root, capture_output=True, check=False)
-    if proc.returncode != 0:
+    try:
+        resolved_root = root.resolve()
+    except OSError:
         return None
-    return {p.decode("utf-8") for p in proc.stdout.split(b"\x00") if p}
+
+    is_toplevel = resolved_root == toplevel
+    if is_toplevel:
+        ignore_file = resolved_root / ".sloplintignore"
+        if not ignore_file.is_file():
+            return set()
+        git_cwd = resolved_root
+        rel_prefix = ""
+    else:
+        if (resolved_root / ".sloplintignore").is_file():
+            return None
+        ignore_file = toplevel / ".sloplintignore"
+        if not ignore_file.is_file():
+            return set()
+        git_cwd = toplevel
+        rel_prefix = resolved_root.relative_to(toplevel).as_posix() + "/"
+
+    norm_lines = load_sloplint_ignore(ignore_file.parent)
+    if not norm_lines:
+        return set()
+
+    with tempfile.TemporaryDirectory(prefix="hygiene-ignore-") as tmpdir:
+        tmp_ignore = Path(tmpdir) / "sloplintignore"
+        tmp_ignore.write_text("\n".join(norm_lines) + "\n", encoding="utf-8", newline="\n")
+        cmd = ["git", "-c", "core.quotePath=false", "ls-files", "-z", "--cached"]
+        if not tracked_only:
+            cmd.append("--others")
+        cmd.extend(["--ignored", f"--exclude-from={tmp_ignore}"])
+        proc = subprocess.run(cmd, cwd=git_cwd, capture_output=True, check=False)
+        if proc.returncode != 0:
+            return None
+        raw_paths = {p.decode("utf-8") for p in proc.stdout.split(b"\x00") if p}
+        if not rel_prefix:
+            return raw_paths
+        return {
+            p[len(rel_prefix) :] for p in raw_paths if p.startswith(rel_prefix)
+        }
 
 
 def check_slop_lint(
