@@ -8,7 +8,8 @@ V2=v1.1.1 Phase 2 の検出強化(語彙パターン、フィラー文単位化�
 V3=v1.1.1 Phase 3 のダッシュ3ルール化と否定構文強化、
 P2=yomiyasu v3.0.0 Phase 2 の info 系規則14件、
 P3=yomiyasu v3.0.0 Phase 3 の calque 型1〜3、
-P4=yomiyasu v3.0.0 Phase 4 の JSON 形式2・終了コード・--strict/--fail-on・通常出力。
+P4=yomiyasu v3.0.0 Phase 4 の JSON 形式2・終了コード・--strict/--fail-on・通常出力、
+PATH=入力パス制限、WORDS=.yomiyasu-words/ 実ファイル読込。
 
 実行: `python3 test_slop_lint.py`(同ディレクトリから)
 """
@@ -1146,9 +1147,6 @@ class TestYomiyasuV3Phase3(unittest.TestCase):
     def calques(self, text, words=None):
         return [f for f in self.findings(text, words) if f["rule"] == "calque"]
 
-    def severities(self, rule, text, words=None):
-        return [f["severity"] for f in self.findings(text, words) if f["rule"] == rule]
-
     def words(self, **kw):
         base = {"path": "/x", "allow": (), "flag": (), "allow_lines": 0,
                 "flag_lines": 0, "allow_sha256": None, "flag_sha256": None}
@@ -1267,8 +1265,7 @@ class TestYomiyasuV3Phase3(unittest.TestCase):
 
 class TestYomiyasuV3Phase4(unittest.TestCase):
     """yomiyasu v3.0.0 Phase 4: JSON 形式2、終了コード、--strict/--fail-on、通常出力。
-    仕様の根拠は docs/implementation-plan-yomiyasu-v3-port.md の Phase 4 と
-    docs/decision-records.md の Y-19・Y-20。"""
+    仕様の根拠は上流 yomiyasu v3.0.0 移植時の Phase 4 仕様および references/slop-lint-usage.md。"""
 
     CLEAN = "質の高い文書を心がけます。\n"
     INFO_ONLY = "本記事では、構成を解説します。\n"  # meta_intro(info)だけが出る
@@ -1470,6 +1467,113 @@ class TestStreamsWithoutReconfigure(unittest.TestCase):
             code = run_in_process(LINT, ["--json"], stdin=None, stdout=io.StringIO())
         self.assertEqual(code, 2)
         self.assertIn("Error reading stdin", stderr.getvalue())
+
+
+class TestCliPathAndWordsBoundaries(unittest.TestCase):
+    """CLI の入力パス制限と .yomiyasu-words/ 実ファイル読込の境界検証"""
+
+    def _run_cli(self, work_dir: Path, args: list[str], stdin_text: str | None = None) -> subprocess.CompletedProcess:
+        env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+        return subprocess.run(
+            [sys.executable, str(LINT), *args],
+            cwd=str(work_dir),
+            input=stdin_text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=10,
+        )
+
+    def test_path_01_作業フォルダ外と隠しパス引数は終了コード2で拒否する(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside.md"
+            outside.write_text("外部ファイル\n", encoding="utf-8")
+            work = root / "work"
+            work.mkdir()
+            (work / ".git").mkdir()
+            (work / ".hidden").mkdir()
+            (work / ".hidden" / "doc.md").write_text("隠しフォルダ\n", encoding="utf-8")
+            (work / ".env").write_text("SECRET=1\n", encoding="utf-8")
+
+            expected = {
+                "../outside.md": "作業フォルダの外にあるファイル",
+                ".hidden/doc.md": "名前が点で始まる",
+                ".env": "名前が点で始まる",
+            }
+            for arg, msg_part in expected.items():
+                with self.subTest(arg=arg):
+                    res = self._run_cli(work, [arg])
+                    self.assertEqual(res.returncode, 2)
+                    self.assertIn("Error opening file", res.stderr)
+                    self.assertIn(msg_part, res.stderr)
+                    orig_cwd = os.getcwd()
+                    try:
+                        os.chdir(work)
+                        err = io.StringIO()
+                        with mock.patch.object(slop_lint, "_read_input", side_effect=AssertionError("must not read")), \
+                                contextlib.redirect_stderr(err):
+                            self.assertEqual(slop_lint.main([arg]), 2)
+                    finally:
+                        os.chdir(orig_cwd)
+
+    def test_path_02_作業フォルダ内の通常相対パスとハイフン標準入力は許可する(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "work"
+            work.mkdir()
+            (work / ".git").mkdir()
+            doc = work / "doc.md"
+            doc.write_text("質の高い文書を心がけます。\n", encoding="utf-8")
+
+            res_file = self._run_cli(work, ["doc.md", "--json"])
+            self.assertEqual(res_file.returncode, 0, res_file.stderr)
+            self.assertEqual(json.loads(res_file.stdout)["format_version"], 2)
+
+            res_stdin = self._run_cli(work, ["-", "--json"], stdin_text="質の高い文書を心がけます。\n")
+            self.assertEqual(res_stdin.returncode, 0, res_stdin.stderr)
+            self.assertEqual(json.loads(res_stdin.stdout)["format_version"], 2)
+
+    def test_words_01_yomiyasu_wordsフォルダのallowとflagとflag_patternsを実ファイルから読み込む(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "work"
+            work.mkdir()
+            (work / ".git").mkdir()
+            words_dir = work / ".yomiyasu-words"
+            words_dir.mkdir()
+            (words_dir / "allow.txt").write_text("手触り\n", encoding="utf-8")
+            (words_dir / "flag.txt").write_text("旧名称\t新名称\n", encoding="utf-8")
+            (words_dir / "flag-patterns.txt").write_text("独自表記\t旧式(?:版|形式)\n", encoding="utf-8")
+
+            doc = work / "target.md"
+            doc.write_text("手触りの確認です。\n旧名称を使います。\n旧式版を使います。\n", encoding="utf-8")
+
+            res = self._run_cli(work, ["target.md", "--json"])
+            self.assertEqual(res.returncode, 0, res.stderr)
+            data = json.loads(res.stdout)
+            self.assertIn("words", data["context"])
+            rules = [f["rule"] for f in data["findings"]]
+            self.assertNotIn("slop_vocabulary", rules)
+            project_findings = [f for f in data["findings"] if f["rule"] == "project_term"]
+            self.assertEqual(len(project_findings), 2)
+            self.assertTrue(any("新名称" in f["message"] for f in project_findings))
+            self.assertTrue(any("独自表記" in f["message"] for f in project_findings))
+
+    def test_words_02_不正なflag_patterns正規表現は終了コード2で拒否する(self):
+        for bad_pattern in ("量指定子\ta+\n", "組あり\t(abc)\n"):
+            with self.subTest(bad_pattern=bad_pattern.strip()):
+                with tempfile.TemporaryDirectory() as tmp:
+                    work = Path(tmp) / "work"
+                    work.mkdir()
+                    (work / ".git").mkdir()
+                    words_dir = work / ".yomiyasu-words"
+                    words_dir.mkdir()
+                    (words_dir / "flag-patterns.txt").write_text(bad_pattern, encoding="utf-8")
+                    (work / "doc.md").write_text("本文です。\n", encoding="utf-8")
+
+                    res = self._run_cli(work, ["doc.md"])
+                    self.assertEqual(res.returncode, 2)
+                    self.assertIn("Error opening file", res.stderr)
 
 
 if __name__ == "__main__":

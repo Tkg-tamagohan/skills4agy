@@ -30,13 +30,13 @@ def valid_manifest(**overrides):
 
 
 class TestPluginJsonValidation(unittest.TestCase):
-    """plugin.json の型検査(CP-01〜CP-12, CP-30)"""
+    """plugin.json の型検査(CP-01, CP-02, CP-04〜CP-07, CP-12, CP-30〜CP-34)"""
 
-    def assert_valid(self, data):
-        self.assertEqual([], check_plugin.validate_plugin_json(data))
+    def assert_valid(self, data, *, root=None):
+        self.assertEqual([], check_plugin.validate_plugin_json(data, root=root))
 
-    def assert_invalid(self, data, *needles):
-        errors = check_plugin.validate_plugin_json(data)
+    def assert_invalid(self, data, *needles, root=None):
+        errors = check_plugin.validate_plugin_json(data, root=root)
         self.assertTrue(errors)
         for needle in needles:
             self.assertTrue(
@@ -47,15 +47,15 @@ class TestPluginJsonValidation(unittest.TestCase):
     def test_cp_01_必須項目だけのmanifestは有効(self):
         self.assert_valid(BASE_MANIFEST)
 
-    def test_cp_02_公式仕様のメタデータと依存を含むmanifestは有効(self):
+    def test_cp_02_公式仕様の10フィールドのみを含むmanifestは有効(self):
         self.assert_valid(
             valid_manifest(
                 displayName="Shared Skills",
+                logo="assets/logo.png",
                 suggestedPrompts=["プロンプト1", "プロンプト2"],
                 disabled=False,
                 author={
                     "name": "Tkg-tamagohan",
-                    "email": "test@example.com",
                     "url": "https://example.com",
                 },
                 homepage="https://github.com/Tkg-tamagohan/devin-plugins",
@@ -63,35 +63,8 @@ class TestPluginJsonValidation(unittest.TestCase):
                     "type": "git",
                     "url": "https://github.com/Tkg-tamagohan/devin-plugins",
                 },
-                license="MIT",
-                keywords=["agy", "plugin", "rules", "skills"],
-                platforms=["cloud", "local"],
-                logo="assets/logo.png",
-                skills=["skills", "extra/skills"],
-                requiredPlugins=[
-                    "owner/repo",
-                    {"source": "github", "repo": "owner/repo", "sha": "3f2a9c1"},
-                ],
-                optionalPlugins=[
-                    {"source": "url", "url": "https://gitlab.com/team/plugin.git"}
-                ],
-                forbiddenPlugins=["sketchy-org/*"],
-                mcpServers={"paths": ["config/mcp.json"], "exclusive": True},
             )
         )
-
-    def test_cp_03_mcpServersの各形式は有効(self):
-        variants = [
-            "config/mcp.json",
-            ["config/mcp.json", "config/extra.json"],
-            {"paths": ["config/mcp.json"], "exclusive": True},
-            {"linear": {"command": "npx", "args": ["-y", "linear-mcp"]}},
-            [],
-            {},
-        ]
-        for variant in variants:
-            with self.subTest(mcpServers=variant):
-                self.assert_valid(valid_manifest(mcpServers=variant))
 
     def test_cp_04_必須項目の欠落を検出する(self):
         for key in ("name", "version", "description"):
@@ -109,6 +82,7 @@ class TestPluginJsonValidation(unittest.TestCase):
 
     def test_cp_06_authorの型違反を検出する(self):
         self.assert_valid(valid_manifest(author="Tkg-tamagohan"))
+        self.assert_valid(valid_manifest(author={"name": "Tkg-tamagohan"}))
         self.assert_invalid(
             valid_manifest(author=""),
             "author は空でない文字列またはオブジェクトである必要があります",
@@ -122,34 +96,42 @@ class TestPluginJsonValidation(unittest.TestCase):
             "author.name は空でない文字列である必要があります",
         )
         self.assert_invalid(
-            valid_manifest(author={"email": ""}),
-            "author.email は空でない文字列である必要があります",
+            valid_manifest(author={"url": "https://example.com"}),
+            "author.name は空でない文字列である必要があります",
         )
         self.assert_invalid(
-            valid_manifest(author={"url": ""}),
-            "author.url は空でない文字列である必要があります",
+            valid_manifest(author={"name": "Tkg", "url": ""}),
+            "author.url は https:// で始まる URL である必要があります",
         )
 
     def test_cp_07_文字列メタデータとAGY独自フィールドの型違反を検出する(self):
-        for key in ("displayName", "homepage", "license", "logo"):
-            for bad in (123, ""):
-                with self.subTest(key=key, value=bad):
-                    self.assert_invalid(
-                        valid_manifest(**{key: bad}),
-                        f"{key} は空でない文字列である必要があります",
-                    )
+        for bad in (123, ""):
+            with self.subTest(key="displayName", value=bad):
+                self.assert_invalid(
+                    valid_manifest(displayName=bad),
+                    "displayName は空でない文字列である必要があります",
+                )
+        self.assert_valid(valid_manifest(homepage="https://example.com"))
+        self.assert_invalid(
+            valid_manifest(homepage="http://example.com"),
+            "homepage は https:// で始まる URL である必要があります",
+        )
         self.assert_valid(valid_manifest(repository="https://example.com/repo.git"))
         self.assert_invalid(
             valid_manifest(repository=""),
-            "repository は空でない文字列である必要があります",
+            "repository は https:// で始まる URL である必要があります",
         )
         self.assert_invalid(
             valid_manifest(repository=123),
-            "repository は空でない文字列または url を持つオブジェクトである必要があります",
+            "repository は https:// URL または url を持つオブジェクトである必要があります",
         )
         self.assert_invalid(
             valid_manifest(repository={"type": "git"}),
-            "repository.url は空でない文字列である必要があります",
+            "repository.url は https:// で始まる URL である必要があります",
+        )
+        self.assert_invalid(
+            valid_manifest(repository={"type": "", "url": "https://example.com/repo.git"}),
+            "repository.type は空でない文字列である必要があります",
         )
         self.assert_invalid(
             valid_manifest(suggestedPrompts="prompt"),
@@ -166,75 +148,6 @@ class TestPluginJsonValidation(unittest.TestCase):
         self.assert_invalid(
             valid_manifest(disabled="true"),
             "disabled は真偽値である必要があります",
-        )
-
-    def test_cp_08_keywordsとplatformsの型違反を検出する(self):
-        self.assert_invalid(
-            valid_manifest(keywords="devin"), "keywords は文字列の配列である必要があります"
-        )
-        self.assert_invalid(
-            valid_manifest(keywords=["devin", 123]),
-            "keywords は文字列の配列である必要があります",
-        )
-        self.assert_invalid(
-            valid_manifest(platforms="cloud"), "platforms は文字列の配列である必要があります"
-        )
-        self.assert_invalid(
-            valid_manifest(platforms=["cloud", 123]),
-            "platforms は文字列の配列である必要があります",
-        )
-        self.assert_invalid(
-            valid_manifest(platforms=["clouds"]), "platforms に公式仕様外の値"
-        )
-
-    def test_cp_09_skillsの型違反を検出する(self):
-        self.assert_valid(valid_manifest(skills="custom-skills"))
-        self.assert_valid(valid_manifest(skills=[]))
-        self.assert_invalid(
-            valid_manifest(skills=123),
-            "skills は空でない文字列または文字列の配列である必要があります",
-        )
-        self.assert_invalid(
-            valid_manifest(skills=["skills", 123]),
-            "skills は空でない文字列または文字列の配列である必要があります",
-        )
-
-    def test_cp_10_依存リストの型違反を検出する(self):
-        self.assert_invalid(
-            valid_manifest(requiredPlugins="owner/repo"), "requiredPlugins は配列である必要があります"
-        )
-        self.assert_invalid(
-            valid_manifest(requiredPlugins=[123]),
-            "requiredPlugins[0] は文字列またはオブジェクトである必要があります",
-        )
-        self.assert_invalid(
-            valid_manifest(optionalPlugins=[{"repo": "owner/repo"}]),
-            "optionalPlugins[0] は source を持つオブジェクトか文字列である必要があります",
-        )
-        self.assert_invalid(
-            valid_manifest(forbiddenPlugins={"plugin": "owner/repo"}),
-            "forbiddenPlugins は配列である必要があります",
-        )
-
-    def test_cp_11_mcpServersの型違反を検出する(self):
-        self.assert_invalid(
-            valid_manifest(mcpServers=123), "mcpServers は文字列、文字列の配列"
-        )
-        self.assert_invalid(
-            valid_manifest(mcpServers=["config/mcp.json", 123]),
-            "mcpServers は文字列、文字列の配列",
-        )
-        self.assert_invalid(
-            valid_manifest(mcpServers={"paths": "config/mcp.json"}),
-            "mcpServers.paths は文字列の配列である必要があります",
-        )
-        self.assert_invalid(
-            valid_manifest(mcpServers={"paths": ["config/mcp.json"], "exclusive": "yes"}),
-            "mcpServers.exclusive は真偽値である必要があります",
-        )
-        self.assert_invalid(
-            valid_manifest(mcpServers={"linear": "npx"}),
-            "mcpServers.linear はオブジェクトである必要があります",
         )
 
     def test_cp_12_トップレベルがオブジェクトでない場合を検出する(self):
@@ -262,6 +175,79 @@ class TestPluginJsonValidation(unittest.TestCase):
             with self.subTest(good=good):
                 self.assert_valid(valid_manifest(version=good))
 
+    def test_cp_31_公式10キー以外のトップレベルキーを拒否する(self):
+        for key, value in (
+            ("license", "MIT"),
+            ("keywords", ["agy"]),
+            ("platforms", ["cloud"]),
+            ("skills", ["skills"]),
+            ("requiredPlugins", ["owner/repo"]),
+            ("optionalPlugins", ["owner/repo"]),
+            ("forbiddenPlugins", ["owner/repo"]),
+            ("mcpServers", {"linear": {"command": "npx"}}),
+            ("unknownField", "x"),
+        ):
+            with self.subTest(key=key):
+                self.assert_invalid(
+                    valid_manifest(**{key: value}),
+                    f"公式仕様外のトップレベルキー {key!r} があります",
+                )
+
+    def test_cp_32_plugin_jsonのnameのケバブケース違反を検出する(self):
+        for bad in ("SharedSkills", "shared_skills", "shared skills"):
+            with self.subTest(name=bad):
+                self.assert_invalid(
+                    valid_manifest(name=bad),
+                    "name は小文字英数字とハイフンのみである必要があります",
+                )
+
+    def test_cp_33_logoの形式違反と未存在ファイルを検出し実在ファイルを通過させる(self):
+        for bad, needle in (
+            ("", "logo は空でない文字列である必要があります"),
+            (123, "logo は空でない文字列である必要があります"),
+            ("https://example.com/logo.png", "logo に URL は指定できません"),
+            ("//example.com/logo.png", "logo に URL は指定できません"),
+            ("assets\\logo.png", "logo にバックスラッシュ"),
+            ("/assets/logo.png", "logo に絶対パスは指定できません"),
+            ("C:/logo.png", "logo に絶対パスは指定できません"),
+            ("../logo.png", "logo がプラグインディレクトリ外を参照しています"),
+            ("assets/logo.gif", "logo の拡張子は"),
+            ("assets/logo.PNG", "logo の拡張子は"),
+        ):
+            with self.subTest(logo=bad):
+                self.assert_invalid(valid_manifest(logo=bad), needle)
+
+        root = Path(tempfile.mkdtemp(prefix="cp-logo-test-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        self.assert_invalid(
+            valid_manifest(logo="assets/logo.png"),
+            "logo のファイルが見つかりません",
+            root=root,
+        )
+        (root / "assets").mkdir()
+        (root / "assets" / "logo.png").write_bytes(b"png")
+        self.assert_valid(valid_manifest(logo="assets/logo.png"), root=root)
+
+    def test_cp_34_homepageとrepositoryとauthorのURLおよび未知キー違反を検出する(self):
+        self.assert_invalid(
+            valid_manifest(homepage="http://example.com"),
+            "homepage は https:// で始まる URL である必要があります",
+        )
+        self.assert_invalid(
+            valid_manifest(repository="http://example.com/repo.git"),
+            "repository は https:// で始まる URL である必要があります",
+        )
+        self.assert_invalid(
+            valid_manifest(repository={"type": "git", "url": "http://example.com", "branch": "main"}),
+            "repository に公式仕様外のキー 'branch' があります",
+            "repository.url は https:// で始まる URL である必要があります",
+        )
+        self.assert_invalid(
+            valid_manifest(author={"name": "Tkg", "email": "a@example.com", "url": "http://example.com"}),
+            "author に公式仕様外のキー 'email' があります",
+            "author.url は https:// で始まる URL である必要があります",
+        )
+
 
 SAMPLE_README = """# test plugin
 
@@ -286,6 +272,10 @@ description: テスト用のルール
 ---
 
 # テスト用のルール
+
+## 手順
+
+1. 手順
 
 ## 対象外
 
@@ -335,7 +325,7 @@ def make_valid_repo(*, init_git: bool = False) -> Path:
 
 
 class TestCheckPluginStructure(unittest.TestCase):
-    """構造検査、状態行検査、README 双方向同期、version バンプ検査(CP-13〜CP-22)"""
+    """構造検査、状態行検査、README 双方向同期、version バンプ検査(CP-13〜CP-22, CP-35〜CP-37)"""
 
     def make_repo(self, *, init_git: bool = False) -> Path:
         root = make_valid_repo(init_git=init_git)
@@ -370,9 +360,11 @@ class TestCheckPluginStructure(unittest.TestCase):
             "rules/Bad_Name.md: frontmatter がありません",
             "rules/Bad_Name.md: 31 行は上限 30 行を超えています",
             "rules/Bad_Name.md: 命令形の見出し(# ...)がありません",
+            "rules/Bad_Name.md: 「## 手順」節がありません",
             "rules/Bad_Name.md: 「## 対象外」節がありません",
             "rules/partial-rule.md: frontmatter に trigger がありません",
             "rules/partial-rule.md: frontmatter に description がありません",
+            "rules/partial-rule.md: 「## 手順」節がありません",
         ):
             self.assertIn(needle, errors)
         self.assertTrue(all("\\" not in e.split(":", 1)[0] for e in errors))
@@ -530,6 +522,134 @@ class TestCheckPluginStructure(unittest.TestCase):
         self.run_git(root, "commit", "-qm", "rm doc")
         write_plugin_json(root, valid_manifest(version="1.2.4"))
         self.assertEqual([], check_plugin.check_version_bump("base2", root))
+
+    def test_cp_35_コードブロックを除外して手順節とスキル見出しの有無を検査する(self):
+        root = self.make_repo()
+        # コードブロック内だけに # 見出しや ## 手順 がある場合は偽陽性通過させない
+        (root / "rules" / "codeblock-only-rule.md").write_text(
+            "---\ntrigger: model_decision\ndescription: test\n---\n\n"
+            "# 見出し\n\n```markdown\n## 手順\n```\n\n## 対象外\n\n- なし\n",
+            encoding="utf-8",
+        )
+        rule_errors = check_plugin.check_rules(root)
+        self.assertIn("rules/codeblock-only-rule.md: 「## 手順」節がありません", rule_errors)
+
+        (root / "skills" / "codeblock-only-skill").mkdir()
+        (root / "skills" / "codeblock-only-skill" / "SKILL.md").write_text(
+            "---\nname: codeblock-only-skill\ndescription: test\n---\n\n"
+            "```markdown\n# 偽の見出し\n```\n",
+            encoding="utf-8",
+        )
+        skill_errors = check_plugin.check_skills(root)
+        self.assertIn(
+            "skills/codeblock-only-skill/SKILL.md: 名詞句の見出し(# ...)がありません",
+            skill_errors,
+        )
+
+    def test_cp_36_コードブロック内のスキル相対パスを禁止しportableパスとplugin_authoringを許可する(self):
+        root = self.make_repo()
+        # plugin-authoring は自己編集用スキルなので除外される
+        (root / "skills" / "plugin-authoring").mkdir()
+        (root / "skills" / "plugin-authoring" / "SKILL.md").write_text(
+            "---\nname: plugin-authoring\ndescription: test\n---\n\n# タイトル\n\n"
+            "```bash\npython skills/plugin-authoring/scripts/check_plugin.py\n```\n",
+            encoding="utf-8",
+        )
+        # 他スキルは "$HOME/..." 形式なら通過する
+        (root / "skills" / "portable-skill").mkdir()
+        (root / "skills" / "portable-skill" / "SKILL.md").write_text(
+            "---\nname: portable-skill\ndescription: test\n---\n\n# タイトル\n\n"
+            '```bash\npython "$HOME/.gemini/config/plugins/shared-skills/skills/portable-skill/scripts/run.py"\n```\n',
+            encoding="utf-8",
+        )
+        self.assertEqual([], check_plugin.check_skills(root))
+
+        # 他スキルの SKILL.md や references/*.md のコードブロック内相対パスは拒否される
+        (root / "skills" / "portable-skill" / "references").mkdir()
+        (root / "skills" / "portable-skill" / "references" / "usage.md").write_text(
+            "# 参照\n\n```bash\npython skills/portable-skill/scripts/run.py\n```\n"
+            "~~~bash\npython skills/portable-skill/presets/p.json\n~~~\n",
+            encoding="utf-8",
+        )
+        errors = check_plugin.check_skills(root)
+        self.assertTrue(
+            any("skills/portable-skill/references/usage.md:4:" in e for e in errors),
+            errors,
+        )
+        self.assertTrue(
+            any("skills/portable-skill/references/usage.md:7:" in e for e in errors),
+            errors,
+        )
+
+    def test_cp_37_スキルdescriptionの複数行スカラー拒否と合計5000文字上限を検査する(self):
+        root = self.make_repo()
+        (root / "skills" / "multiline-skill").mkdir()
+        (root / "skills" / "multiline-skill" / "SKILL.md").write_text(
+            "---\nname: multiline-skill\ndescription: >-\n  folded\n---\n\n# タイトル\n",
+            encoding="utf-8",
+        )
+        (root / "skills" / "pipe-skill").mkdir()
+        (root / "skills" / "pipe-skill" / "SKILL.md").write_text(
+            "---\nname: pipe-skill\ndescription: |\n  literal\n---\n\n# タイトル\n",
+            encoding="utf-8",
+        )
+        errors = check_plugin.check_skills(root)
+        self.assertTrue(
+            any("skills/multiline-skill/SKILL.md: description に複数行ブロックスカラー(>)" in e for e in errors),
+            errors,
+        )
+        self.assertTrue(
+            any("skills/pipe-skill/SKILL.md: description に複数行ブロックスカラー(|)" in e for e in errors),
+            errors,
+        )
+
+        # 合計 5,000 文字超過を検出する
+        root_over = self.make_repo()
+        (root_over / "skills" / "long-skill").mkdir()
+        (root_over / "skills" / "long-skill" / "SKILL.md").write_text(
+            f"---\nname: long-skill\ndescription: {'あ' * 5000}\n---\n\n# タイトル\n",
+            encoding="utf-8",
+        )
+        over_errors = check_plugin.check_skills(root_over)
+        self.assertTrue(
+            any("全スキル description の合計文字数" in e and "上限 5000 文字を超えています" in e for e in over_errors),
+            over_errors,
+        )
+
+    def test_cp_38_見出し空白欠落と折り返しdescriptionを拒否する(self):
+        # 1. ルールの ##手順 / ##対象外（空白なし）を拒否し、正常見出しのみ通す
+        root_rule = self.make_repo()
+        (root_rule / "rules" / "no-space-heading.md").write_text(
+            "---\ntrigger: model_decision\ndescription: test\n---\n\n"
+            "# 見出し\n\n##手順\n\n1. 手順\n\n##対象外\n\n- なし\n",
+            encoding="utf-8",
+        )
+        rule_errors = check_plugin.check_rules(root_rule)
+        self.assertIn("rules/no-space-heading.md: 「## 手順」節がありません", rule_errors)
+        self.assertIn("rules/no-space-heading.md: 「## 対象外」節がありません", rule_errors)
+
+        # 2. ブロックスカラー記号なしの折り返し（プレーン継続・引用折り返し・空行開始折り返し）を拒否する
+        cases = [
+            ("plain-wrap", f"description: First line\n  {'a' * 5001}"),
+            ("quoted-wrap", 'description: "First line\n  second line"'),
+            ("empty-head-wrap", "description:\n  wrapped line"),
+        ]
+        for skill_name, desc_block in cases:
+            with self.subTest(case=skill_name):
+                root = self.make_repo()
+                (root / "skills" / skill_name).mkdir()
+                (root / "skills" / skill_name / "SKILL.md").write_text(
+                    f"---\nname: {skill_name}\n{desc_block}\n---\n\n# タイトル\n",
+                    encoding="utf-8",
+                )
+                errors = check_plugin.check_skills(root)
+                self.assertTrue(
+                    any(
+                        f"skills/{skill_name}/SKILL.md: description が複数行に折り返されています" in e
+                        for e in errors
+                    ),
+                    errors,
+                )
 
 
 class TestHooksJsonValidation(unittest.TestCase):

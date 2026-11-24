@@ -1,6 +1,6 @@
 ---
 name: gemini-decisions-api
-description: Gemini Decision 1（gemini-decision-1 / POST /v1beta/decisions）によるゼロ出力トークンの一括確率判定、ルーティング、ポリシー検査、ルーブリック採点、マルチモーダル分類の実装手順とローカル検証 CLI を扱う。Decisions API を組み込む、質問スキーマを設計する、または同梱 CLI でバッチ判定やドライランを行うときに使用する。git diff とリポジトリ内ルール文書の突合による不変条件の自動検査は invariant-gate、テキスト生成や関数呼び出しと Structured Outputs は gemini-api-dev、双方向音声と映像のストリーミングは gemini-live-api-dev、動画生成と編集は gemini-omni-flash-api、API キーの発行と環境変数設定の案内は scoped-secret-provisioning に委ねる。
+description: Gemini Decision 1 によるゼロ出力トークンの確率判定とローカル CLI を扱う。Decisions API の組み込み、質問設計、バッチ判定やドライランを行うときに使用する。不変条件検査は invariant-gate、生成や構造化出力は gemini-api-dev、音声映像は gemini-live-api-dev、動画は gemini-omni-flash-api に委ねる。
 ---
 
 # Gemini Decision 1（Decisions API）の実装と運用
@@ -83,15 +83,15 @@ API キーは環境変数 `GEMINI_API_KEY` からのみ読み取り、CLI 引数
 ```powershell
 # 1. API キー未設定でも可能なドライラン（事前バリデーションとペイロード確認）
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python skills/gemini-decisions-api/scripts/run_decisions.py `
+python "$HOME/.gemini/config/plugins/shared-skills/skills/gemini-decisions-api/scripts/run_decisions.py" `
   --text "注文した青いマグカップが割れて届きました。" `
-  --noul is_damaged="商品は破損して届きましたか？" `
-  --choice queue="どの窓口へ振り分けますか？|billing:請求や返金|replacements:破損や誤配送の交換|other:その他" `
+  --noul "is_damaged=商品は破損して届きましたか？" `
+  --choice "queue=どの窓口へ振り分けますか？|billing:請求や返金|replacements:破損や誤配送の交換|other:その他" `
   --dry-run
 
 # 2. 実 API 呼び出し（--min-confidence 未満の回答に needs_escalation を付与）
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python skills/gemini-decisions-api/scripts/run_decisions.py `
+python "$HOME/.gemini/config/plugins/shared-skills/skills/gemini-decisions-api/scripts/run_decisions.py" `
   --text-file ticket.txt --media photo.jpg --resolution low `
   --questions questions.json --min-confidence 0.75 --format table
 ```
@@ -108,9 +108,9 @@ API キー未設定や通信障害時は `ask` へ安全にフォールバック
 ```powershell
 # ドライラン確認（API キー不要）
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python skills/gemini-decisions-api/scripts/pretool_guard.py --dry-run --command "git status"
-python skills/gemini-decisions-api/scripts/pretool_guard.py --dry-run --command "git push --force origin feature"
-python skills/gemini-decisions-api/scripts/pretool_guard.py --dry-run --command "npm run deploy"
+python "$HOME/.gemini/config/plugins/shared-skills/skills/gemini-decisions-api/scripts/pretool_guard.py" --dry-run --command "git status"
+python "$HOME/.gemini/config/plugins/shared-skills/skills/gemini-decisions-api/scripts/pretool_guard.py" --dry-run --command "git push --force origin feature"
+python "$HOME/.gemini/config/plugins/shared-skills/skills/gemini-decisions-api/scripts/pretool_guard.py" --dry-run --command "npm run deploy"
 ```
 
 フックを一時停止したい場合は `hooks.json` の `"enabled"` を `false` へ切り替え、設定変更後は事前にドライランで判定結果を確認する。

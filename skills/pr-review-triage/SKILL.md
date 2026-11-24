@@ -1,6 +1,6 @@
 ---
 name: pr-review-triage
-description: PR のレビュー指摘を現行コードとコミット履歴、GitHub GraphQL スレッドおよびレビュー総評本文と照合して 3 区分へトリアージし、一次照合の完了時点で調査を打ち切り、PR 内再発防止策の回収と複数セッション（`/boost`、`/swarm`）のブリーフ引き継ぎ、`invariant-gate` 連携による退行一次検査、既コミットと未コミットを厳密分離した返信、コミットと push、GraphQL によるスレッド Resolve、Stage 3 サマリコメントへの再発防止策累積記録と恒久ルール昇格候補の提示、Stage 3 後の Devin Review 状態確認および条件付き再トリガによる「0 件完了 vs 解析中 vs 未実行」の機械判定、および機械的事後検証までを進める手順。PR レビュー指摘の一括トリアージ、修正計画の分別、未 Resolve スレッド整理、push 後の Devin Review 完了判定を行うときに使用する。仕様判断と要協議提示は requirements-definition、別セッション移行と承認誤着工防止は session-phase-split、実装および PR 更新前へ分離する常駐システム境界監査は systems-pre-pr-audit、実装差分との機械突合は invariant-gate、シークレットの新規発行と登録案内は scoped-secret-provisioning、Windows 環境での gh と git 実行は windows-cli-pitfalls に委ねる。
+description: PR レビュー指摘と GraphQL スレッドを実コードで照合してトリアージ、再発防止策回収、返信、Resolve、push 後の Devin Review 完了判定まで進める手順。PR 指摘整理や未 Resolve 解消を行うときに使用する。仕様判断は requirements-definition、境界監査は systems-pre-pr-audit、差分検査は invariant-gate に委ねる。
 ---
 
 # PR レビュー指摘のトリアージとスレッド整理

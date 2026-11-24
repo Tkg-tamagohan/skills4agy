@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""triage_transcript_decision1.py のユニットテスト（T01–T16）。"""
+"""triage_transcript_decision1.py のユニットテスト（SH-01–SH-16）。"""
 
 from __future__ import annotations
 
@@ -50,9 +50,10 @@ def _make_row(
 
 
 class TestTriageTranscriptDecision1(unittest.TestCase):
-    """T01–T16 の仕様検証テスト。"""
+    """SH-01–SH-16 の仕様検証テスト。"""
 
-    def test_T01_load_jsonl_skips_blank_and_broken_lines(self) -> None:
+    def test_SH_01_load_jsonl_skips_blank_and_broken_lines(self) -> None:
+        """SH-01: 空行、不正 JSON 行、非オブジェクト行を警告付きでスキップし有効行のみ読み込む。"""
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "transcript.jsonl"
             lines = [
@@ -68,7 +69,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             self.assertEqual([r["step_index"] for r in rows], [0, 1])
             self.assertEqual(len(warnings), 2)
 
-    def test_T02_user_input_extracts_request_and_strips_boilerplate(self) -> None:
+    def test_SH_02_user_input_extracts_request_and_strips_boilerplate(self) -> None:
+        """SH-02: USER_INPUT から依頼本文のみを抽出しメタデータと定型タグを除去する。"""
         raw = _make_row(
             0,
             step_type="USER_INPUT",
@@ -85,7 +87,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
         self.assertNotIn("ADDITIONAL_METADATA", step.normalized_text)
         self.assertNotIn("huge plan", step.normalized_text)
 
-    def test_T03_planner_response_excludes_thinking_by_default_and_summarizes_tools(self) -> None:
+    def test_SH_03_planner_response_excludes_thinking_by_default_and_summarizes_tools(self) -> None:
+        """SH-03: PLANNER_RESPONSE でツール呼び出しを要約し既定で thinking を除外する。"""
         raw = _make_row(
             3,
             step_type="PLANNER_RESPONSE",
@@ -107,7 +110,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
         assert step_with_thinking is not None
         self.assertIn("[thinking] Internal secret chain of thought", step_with_thinking.normalized_text)
 
-    def test_T04_generic_prioritizes_error_signals_and_truncates_normal_output(self) -> None:
+    def test_SH_04_generic_prioritizes_error_signals_and_truncates_normal_output(self) -> None:
+        """SH-04: GENERIC ステップでエラー出力を優先保持し通常出力を短く切り詰める。"""
         long_normal = "Created At: 2026-11-21\n" + ("normal line\n" * 100)
         long_error = (
             "Created At: 2026-11-21\n"
@@ -125,14 +129,15 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
         self.assertGreater(len(error_step.normalized_text), len(normal_step.normalized_text))
         self.assertIn("AssertionError: expected 200 got 500", error_step.normalized_text)
 
-    def test_T05_secret_masking_removes_credentials_before_payload(self) -> None:
+    def test_SH_05_secret_masking_removes_credentials_before_payload(self) -> None:
+        """SH-05: 主要 API キー、Bearer、PEM 秘密鍵をペイロード構築前に [REDACTED] へマスクする。"""
         secret_content = (
-            "google=AIzaSyDummyKeyValue1234567890abcd\n"
-            "github=ghp_1234567890abcdefghijklmnop\n"
-            "openai=sk-proj1234567890abcdefghijklmnop\n"
-            "aws=AKIAIOSFODNN7EXAMPLE\n"
+            "google=" + "AIza" + "SyDummyKeyValue1234567890abcd\n"
+            "github=" + "ghp_" + "1234567890abcdefghijklmnop\n"
+            "openai=" + "sk-" + "proj1234567890abcdefghijklmnop\n"
+            "aws=" + "AKIA" + "IOSFODNN7EXAMPLE\n"
             "auth=Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload\n"
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
+            "-----BEGIN " + "RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END " + "RSA PRIVATE KEY-----"
         )
         step = mod.normalize_step(_make_row(2, step_type="GENERIC", content=secret_content))
         assert step is not None
@@ -142,14 +147,15 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             "AIzaSyDummy",
             "ghp_123456",
             "sk-proj123",
-            "AKIAIOSFODNN7EXAMPLE",
+            "AKIA" + "IOSFODNN7EXAMPLE",
             "eyJhbGci",
             "MIIEpAIBAAKCAQEA",
         ):
             self.assertNotIn(leaked, serialized)
         self.assertIn("[REDACTED]", serialized)
 
-    def test_T06_keep_recent_protects_tail_steps(self) -> None:
+    def test_SH_06_keep_recent_protects_tail_steps(self) -> None:
+        """SH-06: --keep-recent 指定数だけ末尾の直近ステップを分類対象外として無条件保護する。"""
         rows = [_make_row(i, content=f"step body {i}") for i in range(10)]
         chunks, recent, warnings, truncated = mod.build_chunks(
             rows,
@@ -165,7 +171,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
         self.assertEqual(truncated, 0)
         self.assertEqual(warnings, [])
 
-    def test_T07_budget_compression_and_chunk_splitting(self) -> None:
+    def test_SH_07_budget_compression_and_chunk_splitting(self) -> None:
+        """SH-07: 文字数上限とチャンク上限に従ってチャンク分割し超過時に警告を記録する。"""
         rows = [
             _make_row(i, step_type="GENERIC", content=f"step {i} " + ("x" * 600))
             for i in range(30)
@@ -185,7 +192,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
         for ch in chunks:
             self.assertLessEqual(len(ch), mod.MAX_QUESTIONS_PER_REQUEST)
 
-    def test_T08_generated_payload_passes_run_decisions_validation(self) -> None:
+    def test_SH_08_generated_payload_passes_run_decisions_validation(self) -> None:
+        """SH-08: 生成した Decisions API ペイロードが run_decisions.validate_payload を通過する。"""
         rows = [
             _make_row(0, step_type="USER_INPUT", content="<USER_REQUEST>要件確認</USER_REQUEST>"),
             _make_row(1, step_type="PLANNER_RESPONSE", content="方針を確定しました。"),
@@ -197,7 +205,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(set(payload["questions"].keys()), {"step_0000", "step_0001", "step_0002"})
 
-    def test_T09_classify_and_render_with_mock_api(self) -> None:
+    def test_SH_09_classify_and_render_with_mock_api(self) -> None:
+        """SH-09: モック API 応答に基づき保持、境界、除外、直近保護の件数と JSON 出力を整形する。"""
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "transcript.jsonl"
             rows = [
@@ -237,7 +246,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             self.assertEqual(data["meta"]["recent_steps"], 1)
             self.assertEqual([x["step_index"] for x in data["borderline"]], [5])
 
-    def test_T10_dry_run_and_error_exit_codes(self) -> None:
+    def test_SH_10_dry_run_and_error_exit_codes(self) -> None:
+        """SH-10: --dry-run の成功（exit 0）とキー未設定や安全遮断および API 失敗時の終了コード 3 を検証する。"""
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "transcript.jsonl"
             rows = [_make_row(i, content=f"message {i}") for i in range(4)]
@@ -283,7 +293,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             self.assertEqual(rc_api, 3)
             self.assertIn("呼び出しに失敗", err_buf3.getvalue())
 
-    def test_T11_threshold_skips_api_when_below_min_steps_and_bytes(self) -> None:
+    def test_SH_11_threshold_skips_api_when_below_min_steps_and_bytes(self) -> None:
+        """SH-11: --min-steps と --min-bytes の双方未満なら API を呼ばず exit 0 でスキップする。"""
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "transcript.jsonl"
             rows = [_make_row(i, content=f"short message {i}") for i in range(5)]
@@ -351,7 +362,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             self.assertTrue(dry_data["meta"]["dry_run"])
             self.assertTrue(dry_data["meta"]["skipped_below_threshold"])
 
-    def test_T12_threshold_runs_on_either_metric_and_rejects_negative(self) -> None:
+    def test_SH_12_threshold_runs_on_either_metric_and_rejects_negative(self) -> None:
+        """SH-12: ステップ数またはバイト数の片方到達で実行し、負のしきい値指定を exit 2 で拒否する。"""
         with tempfile.TemporaryDirectory() as tmp:
             small_p = Path(tmp) / "small.jsonl"
             small_rows = [_make_row(i, content=f"msg {i}") for i in range(5)]
@@ -466,8 +478,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
                 self.assertEqual(rc_bad, 2)
                 self.assertIn("0 以上", err_buf.getvalue())
 
-    def test_T13_error_outputs_mask_api_key_and_respect_sk_boundary(self) -> None:
-        """T13: SafetyBlockError・ApiRequestError・パスエラーで api_key の生値と URL エンコード値をマスクし、sk- 境界を誤検知しない。"""
+    def test_SH_13_error_outputs_mask_api_key_and_respect_sk_boundary(self) -> None:
+        """SH-13: エラー出力で API キーの生値と URL エンコード値をマスクし sk- 境界を誤検知しない。"""
         raw_api_key = "key+secret/value=abc&999"
         encoded_api_key = urllib.parse.quote(raw_api_key, safe="")
 
@@ -516,8 +528,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             self.assertNotIn(raw_api_key, err_missing.getvalue())
             self.assertNotIn(encoded_api_key, err_missing.getvalue())
 
-    def test_T14_transcript_env_file_blocking_and_template_allowance(self) -> None:
-        """T14: --transcript に .env 系ファイルを渡すと終了コード 2 で遮断し、雛形ファイルは許容する。"""
+    def test_SH_14_transcript_env_file_blocking_and_template_allowance(self) -> None:
+        """SH-14: --transcript の .env 系指定を exit 2 で遮断し雛形ファイルを許容する。"""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             env_file = tmp_dir / ".env"
@@ -541,8 +553,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             self.assertEqual(rc_ok, 0)
             self.assertIn("Transcript Triage Dry-Run", out_buf.getvalue())
 
-    def test_T15_mask_before_truncate_prevents_pem_body_leak(self) -> None:
-        """T15: normalize_step が truncate_head_tail より先に mask_secrets を実行し、長い PEM ブロックの END 欠落による鍵本体露出を防ぐ。"""
+    def test_SH_15_mask_before_truncate_prevents_pem_body_leak(self) -> None:
+        """SH-15: 切り詰めより先にマスクを実行し長い PEM ブロックの END 欠落による鍵露出を防ぐ。"""
         pem_secret_body = "MIIEpAIBAAKCAQEAUniqueSecretKeyBodyLine0123456789"
         long_pem_content = (
             "-----BEGIN "
@@ -580,8 +592,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
                 self.assertNotIn(pem_secret_body, step.tool_summary)
                 self.assertIn("[REDACTED]", step.normalized_text)
 
-    def test_T16_main_catches_io_decode_preprocessing_errors_and_cp932_stdio(self) -> None:
-        """T16: main() がファイル読込・デコード・前処理例外をスタックトレースなしでマスク済みエラー (exit 2) とし、cp932 環境でも動作する。"""
+    def test_SH_16_main_catches_io_decode_preprocessing_errors_and_cp932_stdio(self) -> None:
+        """SH-16: 読込、デコード、前処理例外をマスク済み exit 2 で処理し cp932 環境でも動作する。"""
         raw_api_key = "AIza" + "TranscriptSecretKey9876543210"
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "transcript.jsonl"

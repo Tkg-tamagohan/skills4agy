@@ -1,6 +1,6 @@
 ---
 name: spec-cold-review
-description: 仕様書や実装計画のドラフトを、事前コンテキストを持たないコールドリーダーの視点で読み直し、曖昧さや未決の設計判断、偽のトレードオフを洗い出す手順。要件定義や技術仕様の公開前レビューや実装着手前の準備度監査を行うときに使用する。要件定義の進行と決定記録は requirements-definition、文章規範は japanese-tech-writing、Decisions API の仕様は gemini-decisions-api、Devin CLI 委任と制約は devin-cli-delegate と external-agent-devin、サブエージェント終了は subagent-cleanup に委ねる。
+description: 仕様書や実装計画をコールドリーダー視点で読み直し、曖昧さ、未決判断、偽のトレードオフを洗い出す手順。公開前レビューや実装着手前の準備度監査を行うときに使用する。要件定義と決定記録は requirements-definition に委ねる。
 ---
 
 # 仕様書コールドレビューの手順
@@ -32,9 +32,9 @@ description: 仕様書や実装計画のドラフトを、事前コンテキス�
 
 ```powershell
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python skills/gemini-decisions-api/scripts/run_decisions.py `
+python "$HOME/.gemini/config/plugins/shared-skills/skills/gemini-decisions-api/scripts/run_decisions.py" `
   --text-file <spec.md> `
-  --questions skills/spec-cold-review/presets/spec_readiness_check.json `
+  --questions "$HOME/.gemini/config/plugins/shared-skills/skills/spec-cold-review/presets/spec_readiness_check.json" `
   --min-confidence 0.70 --format table
 ```
 

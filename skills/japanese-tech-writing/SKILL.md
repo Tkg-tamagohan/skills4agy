@@ -153,8 +153,9 @@ AI が生成した文章や、機械検査で指摘の多い文章を書き直�
 
 組み立て直したあとで、原文と推敲文の差分検査を行い、文末の種類のずれや消えた語など意味が変わりやすい箇所を点検する。
 
-```bash
-python3 <スキルのディレクトリ>/scripts/slop_diff.py <原文ファイル> <推敲ファイル>
+```powershell
+$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
+python "$HOME/.gemini/config/plugins/shared-skills/skills/japanese-tech-writing/scripts/slop_diff.py" <原文ファイル> <推敲ファイル>
 ```
 
 diff は文末の立場のずれのほか、文の種類の変化（type_changes）、見出しの形の変化（heading_shapes）、読点の増加（comma_increase）を候補として出す。
@@ -164,10 +165,11 @@ diff は文末の立場のずれのほか、文の種類の変化（type_changes
 文書を書き上げた、またはリライトしたあとで、同梱のリンターで機械検査を行う。
 `slop_lint.py` はカレントディレクトリ外や `.gemini` などドット始まりディレクトリを含むパス引数を拒否するため、Artifact や `.gemini` 配下のファイルを検査するときは標準入力 `-` を使う。
 
-```bash
-python3 <スキルのディレクトリ>/scripts/slop_lint.py <対象ファイル>
+```powershell
+$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
+python "$HOME/.gemini/config/plugins/shared-skills/skills/japanese-tech-writing/scripts/slop_lint.py" <対象ファイル>
 # パス制限に当たる場所（Artifact や .gemini 配下）を標準入力で検査する例
-python -c "import pathlib,subprocess,sys; sys.exit(subprocess.run([sys.executable,sys.argv[1],'-'],input=pathlib.Path(sys.argv[2]).read_text('utf-8'),encoding='utf-8').returncode)" <スキルのディレクトリ>/scripts/slop_lint.py <対象ファイル>
+python -c "import pathlib,subprocess,sys; sys.exit(subprocess.run([sys.executable,sys.argv[1],'-'],input=pathlib.Path(sys.argv[2]).read_text('utf-8'),encoding='utf-8').returncode)" "$HOME/.gemini/config/plugins/shared-skills/skills/japanese-tech-writing/scripts/slop_lint.py" <対象ファイル>
 ```
 
 複数文書の一括検査、`.sloplintignore` による除外の管理、検出結果の読み方と対応方針は `references/slop-lint-usage.md` にまとめる。

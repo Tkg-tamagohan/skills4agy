@@ -155,76 +155,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Check Python syntax, JSON syntax, UTF-8, U+FFFD, and conflict markers
+      - name: Run repository hygiene checks
         shell: bash
         env:
           PYTHONUTF8: "1"
           PYTHONIOENCODING: "utf-8"
-        run: |
-          python - <<'PY'
-          import json
-          import pathlib
-          import py_compile
-          import re
-          import subprocess
-          import sys
-
-          def ls_files(*patterns: str) -> list[str]:
-              cmd = ["git", "ls-files", "-z", *patterns]
-              proc = subprocess.run(cmd, capture_output=True, check=True)
-              return [p.decode("utf-8") for p in proc.stdout.split(b"\x00") if p]
-
-          py_files = ls_files("*.py")
-          if not py_files:
-              print("ERROR: no Python files found")
-              sys.exit(1)
-          for rel in py_files:
-              py_compile.compile(rel, doraise=True)
-          print(f"[PASS] py_compile: {len(py_files)} files")
-
-          def reject_non_json_constant(value: str) -> None:
-              raise ValueError(f"Invalid JSON constant: {value}")
-
-          json_files = ls_files("*.json")
-          if not json_files:
-              print("ERROR: no JSON files found")
-              sys.exit(1)
-          for rel in json_files:
-              text = pathlib.Path(rel).read_text(encoding="utf-8")
-              try:
-                  json.loads(text, parse_constant=reject_non_json_constant)
-              except ValueError as exc:
-                  sys.exit(f"[FAIL] {rel}: {exc}")
-          print(f"[PASS] json.loads: {len(json_files)} files")
-
-          text_exts = {".md", ".py", ".json", ".yml", ".yaml", ".txt"}
-          conflict_re = re.compile(
-              r"^(" + "<" * 7 + r"|" + "=" * 7 + r"$|" + ">" * 7 + r")",
-              re.MULTILINE,
-          )
-          checked = 0
-          errors: list[str] = []
-          for rel in ls_files():
-              p = pathlib.Path(rel)
-              if p.suffix.lower() not in text_exts or not p.is_file():
-                  continue
-              checked += 1
-              try:
-                  content = p.read_text(encoding="utf-8")
-              except UnicodeDecodeError as exc:
-                  errors.append(f"{rel}: UTF-8 decode error: {exc}")
-                  continue
-              if "\ufffd" in content:
-                  errors.append(f"{rel}: contains U+FFFD replacement character")
-              if conflict_re.search(content):
-                  errors.append(f"{rel}: contains conflict marker")
-
-          if errors:
-              for err in errors:
-                  print(f"[FAIL] {err}")
-              sys.exit(1)
-          print(f"[PASS] text hygiene (UTF-8 / U+FFFD / conflict markers): {checked} files")
-          PY
+        run: python skills/plugin-authoring/scripts/check_hygiene.py
 
   unit-tests:
     needs: []

@@ -1,6 +1,6 @@
 ---
 name: devin-cli-delegate
-description: Antigravity の親エージェント、Subagents、run_workflow、および /swarm から外部の Devin CLI を呼び出してコード調査やテスト案と雛形の生成を委任し、結果を統合する手順。無料モデルの UID 指定、同時 2 枠の並列制御、Windows でのプロンプト渡しと ACP_BACKEND 回避、Antigravity 各機能での制約を扱う。Devin CLI（devin -p）を使った外部委任やクォータ温存を行うときに使用する。PowerShell や Python の文字コードと引用の罠は windows-cli-pitfalls、利用制約はルール external-agent-devin に委ねる。
+description: 親エージェント、Subagents、run_workflow、/swarm から Devin CLI（devin -p）へ調査や雛形生成を委任して統合する手順。無料枠モデルの指定や同時 2 枠制御でクォータを温存するときに使用する。利用制約は external-agent-devin に委ねる。
 ---
 
 # Devin CLI への軽量タスク委任

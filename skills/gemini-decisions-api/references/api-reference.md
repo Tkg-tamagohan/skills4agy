@@ -114,7 +114,7 @@ if (dept?.type === "choice") {
 
 ### REST（curl / PowerShell `curl.exe`）
 
-Windows PowerShell 5.1 では `curl` が `Invoke-WebRequest` のエイリアスとなるため、`curl.exe` を使用し JSON 本文はファイル経由（`--data-binary @payload.json`）で渡す。
+Windows PowerShell 5.1 では `curl` が `Invoke-WebRequest` のエイリアスとなり無引用の `@payload.json` もスプラッティング演算子として解釈されるため、`curl.exe` を明示し JSON 本文は引用符付きのファイル指定（`--data-binary "@payload.json"`）で渡す。
 
 ```bash
 curl -X POST "https://generativelanguage.googleapis.com/v1beta/decisions" \
@@ -135,6 +135,14 @@ curl -X POST "https://generativelanguage.googleapis.com/v1beta/decisions" \
       }
     }
   }'
+```
+
+```powershell
+# Windows PowerShell 5.1（payload.json は BOM なし UTF-8 で保存してから渡す）
+curl.exe -X POST "https://generativelanguage.googleapis.com/v1beta/decisions" `
+  -H "x-goog-api-key: $env:GEMINI_API_KEY" `
+  -H "Content-Type: application/json" `
+  --data-binary "@payload.json"
 ```
 
 ## マルチモーダル入力ブロック仕様
