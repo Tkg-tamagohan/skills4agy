@@ -106,6 +106,7 @@ EXTERNAL_TRANSFER_COMMANDS = frozenset(
         "xh",
     }
 )
+INFO_ONLY_TRANSFER_FLAGS = frozenset({"--version", "-V", "--help"})
 
 DESTRUCTIVE_DISK_COMMANDS = frozenset(
     {
@@ -451,10 +452,11 @@ def _split_top_level_segments_raw(
 
 
 def _split_unquoted_top_level(command: str, *, posix_shell: bool = False) -> list[str] | None:
-    """クォート外の連結記号・パイプ・改行で分割する。未閉鎖クォート時は None を返す。"""
+    """クォート・グループ括弧外の連結記号・パイプ・改行で分割する。未閉鎖時は None を返す。"""
     parts: list[str] = []
     buf: list[str] = []
     quote: str | None = None
+    group_stack: list[str] = []
     i = 0
     n = len(command)
 
@@ -477,7 +479,21 @@ def _split_unquoted_top_level(command: str, *, posix_shell: bool = False) -> lis
             i += 1
             continue
 
-        if command[i : i + 2] in ("&&", "||"):
+        if ch in ("(", "{"):
+            is_sigil = i > 0 and command[i - 1] in ("$", "@")
+            if group_stack or not is_sigil:
+                group_stack.append(")" if ch == "(" else "}")
+            buf.append(ch)
+            i += 1
+            continue
+
+        if group_stack and ch == group_stack[-1]:
+            group_stack.pop()
+            buf.append(ch)
+            i += 1
+            continue
+
+        if not group_stack and command[i : i + 2] in ("&&", "||"):
             seg = "".join(buf).strip()
             if seg:
                 parts.append(seg)
@@ -485,7 +501,7 @@ def _split_unquoted_top_level(command: str, *, posix_shell: bool = False) -> lis
             i += 2
             continue
 
-        if ch in ";|&\r\n":
+        if not group_stack and ch in ";|&\r\n":
             seg = "".join(buf).strip()
             if seg:
                 parts.append(seg)
@@ -496,7 +512,7 @@ def _split_unquoted_top_level(command: str, *, posix_shell: bool = False) -> lis
         buf.append(ch)
         i += 1
 
-    if quote is not None:
+    if quote is not None or group_stack:
         return None
     tail = "".join(buf).strip()
     if tail:
@@ -856,69 +872,81 @@ def _scan_flat_control_tokens(
 
 
 def _split_flat_control_chunk(chunk: str, *, posix_shell: bool = False) -> list[str]:
-    """括弧グループ除去後の平坦な制御構文チャンクから実コマンド句を抽出する。"""
+    """括弧グループ除去後の平坦な制御構文チャンクから構文位置に従って実コマンド句を抽出する。"""
     toks = _scan_flat_control_tokens(chunk, posix_shell=posix_shell)
     if not toks:
         return []
 
-    slices: list[list[tuple[str, int, int, bool]]] = []
-    cur: list[tuple[str, int, int, bool]] = []
-    for item in toks:
-        tok, _, _, quoted = item
-        low = tok.lower()
-        if not quoted and low in {"then", "else", "elif", "do"}:
-            if cur:
-                slices.append(cur)
-            cur = [item]
-            continue
-        cur.append(item)
-    if cur:
-        slices.append(cur)
+    first_tok, _, _, first_quoted = toks[0]
+    first_low = first_tok.lower()
+    if not first_quoted:
+        if first_low in {"fi", "done", "esac"} and len(toks) == 1:
+            return []
+        if first_low in {"then", "else", "do", "while", "until"}:
+            if len(toks) <= 1:
+                return []
+            if len(toks) == 2 and not toks[1][3] and toks[1][0].lower() in {"fi", "done", "esac"}:
+                return []
+            clause = chunk[toks[1][1] : toks[-1][2]].strip()
+            return [clause] if clause else []
+        if first_low == "for":
+            for j, (tok, _, _, quoted) in enumerate(toks[1:], start=1):
+                if not quoted and tok.lower() == "do":
+                    if j + 1 < len(toks):
+                        clause = chunk[toks[j + 1][1] : toks[-1][2]].strip()
+                        return [clause] if clause else []
+                    return []
+            return []
+        if first_low in {"if", "elif"}:
+            k = 1
+            if k < len(toks) and not toks[k][3] and toks[k][0].lower() == "not":
+                k += 1
+            if k < len(toks) and not toks[k][3] and toks[k][0].lower() == "/i":
+                k += 1
+            is_cmd_cond = False
+            cmd_idx = 1
+            if (
+                k < len(toks)
+                and not toks[k][3]
+                and toks[k][0].lower() in {"exist", "errorlevel", "defined"}
+            ):
+                is_cmd_cond = True
+                cmd_idx = k + 2
+            elif k < len(toks) and not toks[k][3] and "==" in toks[k][0]:
+                is_cmd_cond = True
+                cmd_idx = k + 1
+            elif (
+                k + 2 < len(toks)
+                and not toks[k + 1][3]
+                and toks[k + 1][0].lower() in {"==", "equ", "neq", "lss", "leq", "gtr", "geq"}
+            ):
+                is_cmd_cond = True
+                cmd_idx = k + 3
 
-    clauses: list[str] = []
-    for sl in slices:
-        if not sl:
-            continue
-        first_tok, _, _, first_quoted = sl[0]
-        first_low = first_tok.lower()
-        cmd_idx = 0
-        if not first_quoted:
-            if first_low in {"fi", "done", "esac"} and len(sl) == 1:
-                continue
-            if first_low in {"then", "else", "do"}:
-                cmd_idx = 1
-            elif first_low == "for":
-                continue
-            elif first_low in {"if", "elif"}:
-                k = 1
-                if k < len(sl) and not sl[k][3] and sl[k][0].lower() == "not":
-                    k += 1
-                if k < len(sl) and not sl[k][3] and sl[k][0].lower() == "/i":
-                    k += 1
-                if k < len(sl) and not sl[k][3] and sl[k][0].lower() in {"exist", "errorlevel", "defined"}:
-                    cmd_idx = k + 2
-                elif k < len(sl) and not sl[k][3] and "==" in sl[k][0]:
-                    cmd_idx = k + 1
-                elif (
-                    k + 2 < len(sl)
-                    and not sl[k + 1][3]
-                    and sl[k + 1][0].lower() in {"==", "equ", "neq", "lss", "leq", "gtr", "geq"}
-                ):
-                    cmd_idx = k + 3
-                else:
-                    cmd_idx = 1
-        while cmd_idx < len(sl) and not sl[cmd_idx][3] and sl[cmd_idx][0].lower() in {"fi", "done", "esac"}:
-            if cmd_idx == len(sl) - 1:
-                cmd_idx = len(sl)
-                break
-            break
-        if cmd_idx < len(sl):
-            sub_start = sl[cmd_idx][1]
-            sub_end = sl[-1][2]
-            clause = chunk[sub_start:sub_end].strip()
-            if clause:
-                clauses.append(clause)
-    return clauses
+            if cmd_idx >= len(toks):
+                return []
+            if is_cmd_cond:
+                cmd_clauses: list[str] = []
+                seg_start_idx = cmd_idx
+                for idx_tok in range(cmd_idx, len(toks)):
+                    tok, _, _, quoted = toks[idx_tok]
+                    if not quoted and tok.lower() == "else":
+                        if seg_start_idx < idx_tok:
+                            part = chunk[toks[seg_start_idx][1] : toks[idx_tok - 1][2]].strip()
+                            if part:
+                                cmd_clauses.append(part)
+                        seg_start_idx = idx_tok + 1
+                if seg_start_idx < len(toks):
+                    part = chunk[toks[seg_start_idx][1] : toks[-1][2]].strip()
+                    if part:
+                        cmd_clauses.append(part)
+                return cmd_clauses
+
+            clause = chunk[toks[1][1] : toks[-1][2]].strip()
+            return [clause] if clause else []
+
+    stripped = chunk.strip()
+    return [stripped] if stripped else []
 
 
 def _extract_control_clauses_from_text(
@@ -936,6 +964,7 @@ def _extract_control_clauses_from_text(
     flat_chunks: list[str] = []
     quote: str | None = None
     stack: list[tuple[str, int]] = []
+    in_double_bracket = False
     flat_start = 0
     i = 0
     n = len(s)
@@ -961,7 +990,26 @@ def _extract_control_clauses_from_text(
             quote = ch
             i += 1
             continue
-        if ch in ("(", "{"):
+        if not stack:
+            if (
+                not in_double_bracket
+                and s[i : i + 2] == "[["
+                and (i == 0 or s[i - 1].isspace() or s[i - 1] in ";|&(")
+                and (i + 2 >= n or s[i + 2].isspace())
+            ):
+                in_double_bracket = True
+                i += 2
+                continue
+            if (
+                in_double_bracket
+                and s[i : i + 2] == "]]"
+                and (i == 0 or s[i - 1].isspace())
+                and (i + 2 >= n or s[i + 2].isspace() or s[i + 2] in ";|&)")
+            ):
+                in_double_bracket = False
+                i += 2
+                continue
+        if not in_double_bracket and ch in ("(", "{"):
             is_sigil = i > 0 and s[i - 1] in ("$", "@")
             closing = ")" if ch == "(" else "}"
             if not stack:
@@ -988,13 +1036,15 @@ def _extract_control_clauses_from_text(
 
     if stack:
         _, outermost_open = stack[0]
-        flat_chunks.append(s[outermost_open - 1 :])
+        unclosed_inner = s[outermost_open:].strip()
+        if unclosed_inner:
+            clauses.append(unclosed_inner)
     else:
         flat_chunks.append(s[flat_start:])
 
-    combined_flat = " ".join(c.strip() for c in flat_chunks if c.strip())
-    if combined_flat:
-        clauses.extend(_split_flat_control_chunk(combined_flat, posix_shell=posix_shell))
+    for fc in flat_chunks:
+        if fc.strip():
+            clauses.extend(_split_flat_control_chunk(fc, posix_shell=posix_shell))
     return clauses
 
 
@@ -1182,6 +1232,9 @@ def _has_external_transfer(segments: list[list[str]]) -> bool:
         if not tokens:
             continue
         if _command_basename(tokens[0]) in EXTERNAL_TRANSFER_COMMANDS:
+            args = tokens[1:]
+            if args and all(a in INFO_ONLY_TRANSFER_FLAGS for a in args):
+                continue
             return True
     return False
 
