@@ -132,12 +132,12 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
     def test_SH_05_secret_masking_removes_credentials_before_payload(self) -> None:
         """SH-05: 主要 API キー、Bearer、PEM 秘密鍵をペイロード構築前に [REDACTED] へマスクする。"""
         secret_content = (
-            "google=AIzaSyDummyKeyValue1234567890abcd\n"
-            "github=ghp_1234567890abcdefghijklmnop\n"
-            "openai=sk-proj1234567890abcdefghijklmnop\n"
-            "aws=AKIAIOSFODNN7EXAMPLE\n"
+            "google=" + "AIza" + "SyDummyKeyValue1234567890abcd\n"
+            "github=" + "ghp_" + "1234567890abcdefghijklmnop\n"
+            "openai=" + "sk-" + "proj1234567890abcdefghijklmnop\n"
+            "aws=" + "AKIA" + "IOSFODNN7EXAMPLE\n"
             "auth=Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload\n"
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
+            "-----BEGIN " + "RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END " + "RSA PRIVATE KEY-----"
         )
         step = mod.normalize_step(_make_row(2, step_type="GENERIC", content=secret_content))
         assert step is not None
@@ -147,7 +147,7 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             "AIzaSyDummy",
             "ghp_123456",
             "sk-proj123",
-            "AKIAIOSFODNN7EXAMPLE",
+            "AKIA" + "IOSFODNN7EXAMPLE",
             "eyJhbGci",
             "MIIEpAIBAAKCAQEA",
         ):

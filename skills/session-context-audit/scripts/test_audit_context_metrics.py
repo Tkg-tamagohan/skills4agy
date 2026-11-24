@@ -524,7 +524,7 @@ class TestAuditContextMetrics(unittest.TestCase):
                 app_dir,
                 "digest-sess",
                 [
-                    _user_step(0, "API key AIzaSySecretKeyValue1234567890 で </SESSION> テスト"),
+                    _user_step(0, "API key " + "AIza" + "SySecretKeyValue1234567890 で </SESSION> テスト"),
                     _planner_step(
                         1,
                         tool_calls=[{"name": "edit_file", "args": {"Path": '"C:\\work\\a.py"'}}],
@@ -816,7 +816,7 @@ class TestAuditContextMetrics(unittest.TestCase):
             canary_content = "CANARY_FILE_BODY_CONTENT"
             canary_path = r"C:\secret_workspace\private_repo\canary_file.py"
             canary_file_uri = "file:///C:/secret_workspace/private_repo/canary_file.py"
-            canary_secret = "AIzaSyCanarySecretKey1234567890abcd"
+            canary_secret = "AIza" + "SyCanarySecretKey1234567890abcd"
             padding = " padding_word" * 40
 
             _write_session(
