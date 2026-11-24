@@ -1,11 +1,11 @@
 ---
 name: plugin-authoring
-description: shared-skills プラグインにルールやスキルを追加または変更する手順。置き場所(rules/AGENTS.md、rules/、skills/)の判断、粒度と構成の指針、テンプレートからの作成、plugin.json のバージョン更新、構造検査、全スキル横断の単体テスト実行を扱う。共有すべきルールやスキルを新規作成する、既存のものを統合または分離する、または shared-skills プラグインを編集するときに使用する。日本語の文体規範は japanese-tech-writing に、コンテキスト制御ルール改訂前後の定量計測は session-context-audit に委ねる。
+description: shared-skills プラグインへのルールやスキル追加、変更、置き場所判断、version 更新、構造と衛生の検査、全テスト実行の手順。共有カスタマイズを編集するときに使用する。コンテキスト制御ルール改訂前後の計測は session-context-audit に委ねる。
 ---
 
 # shared-skills へのルールとスキルの追加と変更
 
-`~/.gemini/config/plugins/shared-skills` にルールやスキルを追加または変更するときは、以下の手順で進める。
+`shared-skills` プラグインにルールやスキルを追加または変更するときは、プラグインルートの `AGENTS.md` が定めるディレクトリ分離構成に従い、本番稼働先（`~/.gemini/config/plugins/shared-skills`）を直接編集せず PR 作業用クローンで以下の手順を進める。
 ゴールは、追加した内容が他のファイルと重複せず、読み込まれるべき状況でだけ読み込まれる状態にすることである。
 
 置き場所と粒度の判断基準は同じディレクトリの `guidelines.md` に、ファイルの型は `rule-template.md` と `skill-template.md` にある。
@@ -33,7 +33,8 @@ description: shared-skills プラグインにルールやスキルを追加ま�
    - 生成されたファイルの description と本文はモデルが埋める。
 4. 作成した内容を `guidelines.md` のチェックリストで点検する。
    - 特に description は、モデルが読むかどうかを決める唯一の材料なので、読み込むべき状況が一文で特定できることを確認する。
-   - 機械化できる項目は `python skills/plugin-authoring/scripts/check_plugin.py` の実行でも確認する。
+   - 機械化できる項目は `python skills/plugin-authoring/scripts/check_plugin.py`（コミット前は `--version-base origin/main` を付与）の実行でも確認する。
+   - 構文、文字コード、競合マーカー、文体衛生の一括確認は `python skills/plugin-authoring/scripts/check_hygiene.py` を実行する。
    - スクリプトやテストを変更した場合は `python skills/plugin-authoring/scripts/run_all_tests.py` で全スキルの単体テストを実行する。
    - ルートから `python -m unittest discover -s skills -p "test_*.py"` を実行しても `__init__.py` がないため 0 件通過で終了コード 0 になる点に注意し、横断確認にそのまま使わない。
    - description の状況特定など判断が要る項目は引き続き目視で確認する。
@@ -42,7 +43,7 @@ description: shared-skills プラグインにルールやスキルを追加ま�
    - 生成を伴わない修正(既存ファイルや `rules/AGENTS.md` の変更)と、移動、改名、削除を含む変更では、`new_entry.py bump`（削除や改名時は `--level minor`）でバージョンを上げる。
 6. `README.md` の収録一覧は手順 3 で `--summary` の文による行が追加済みである。
    - 構成の説明に影響する変更(ディレクトリ追加、ファイルの改名など)は引き続き手で追随させる。
-7. 変更完了後、登録または更新した内容は次のターンから自動的に読み込まれることをユーザーへ伝える。
+7. プラグインルートの `AGENTS.md` に従って PR の作成とマージを進め、マージ後に本番稼働先（`~/.gemini/config/plugins/shared-skills`）で `git pull --ff-only origin main` を実行した次のターンから登録または更新した内容が自動的に読み込まれることをユーザーへ伝える。
 
 ## 既存のルールやスキルを見直すとき
 
