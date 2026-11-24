@@ -1,6 +1,6 @@
 ---
 name: session-handoff
-description: 現在のセッションを安全に区切り、新しいセッションへ渡す軽量な引き継ぎメモと再開プロンプトを作成する手順。現状確認の範囲、長大セッション向けの Decision 1 重要ステップ事前選別 CLI、出力の圧縮ルール、テンプレート、保存先の扱い、およびユーザー側の呼び出し目安を扱う。セッションを切り替えて作業を引き継ぐとき、または肥大化や長時間待機の前に現セッションの要点を退避するときに使用する。別セッションへの移行を提案するタイミング判断はルール session-phase-split、Decisions API の一般仕様と質問設計はスキル gemini-decisions-api に委ねる。
+description: 現セッションを区切り、Decision 1 事前選別 CLI と圧縮テンプレートで次セッション用の引き継ぎメモと再開プロンプトを作成する手順。作業引き継ぎや肥大化前の要点退避時に使用する。移行判断は session-phase-split、ログ横断測定は session-context-audit に委ねる。
 ---
 
 # セッション引き継ぎメモの作成手順
@@ -64,8 +64,8 @@ description: 現在のセッションを安全に区切り、新しいセッシ�
 - <確定した仕様・制約・採用した方針を箇条書き>
 
 ## 3. Modified / Target Files
-- `path/to/file_a.ts:L12-L58` — [済] <変更内容の要約>
-- `path/to/file_b.ts:L100-L140` — [次] <これから行う修正の意図>
+- `path/to/file_a.ts:L12-L58`: [済] <変更内容の要約>
+- `path/to/file_b.ts:L100-L140`: [次] <これから行う修正の意図>
 
 ## 4. Failed Attempts & Gotchas（再発防止）
 - <試してダメだったアプローチや環境固有の制約>

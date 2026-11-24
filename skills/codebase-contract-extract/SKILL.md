@@ -1,6 +1,6 @@
 ---
 name: codebase-contract-extract
-description: 既存コードベースのディレクトリ単位で公開インターフェース、不変条件、および副作用を決定論的スコープ探索とボトムアップ集約により単一の仕様レポートへ抽出する手順。未把握のリポジトリやモジュールの構造、入出力仕様、制約をコード実体から整理したいときに使用する。既存文書との乖離監査や大規模整理は repo-drift-audit、Devin CLI 委任は devin-cli-delegate とルール external-agent-devin、サブエージェント終了はルール subagent-cleanup、Windows シェル制約は windows-cli-pitfalls に委ねる。
+description: 既存コードベースの公開仕様、不変条件、副作用をスコープ探索とボトムアップ集約で単一レポートへ抽出する手順。未把握コードの構造や制約を実体から整理するときに使用する。既存文書との乖離監査は repo-drift-audit に委ねる。
 ---
 
 # コードベースのボトムアップ仕様抽出

@@ -1,6 +1,6 @@
 ---
 name: cf-cli
-description: Cloudflare の公式 CLI `cf` の実行方法、認証、コマンドの探し方、wrangler との使い分けを扱う。Cloudflare のリソースをコマンドラインから操作するとき、Pages や Access などの設定を確認または変更するときに使用する。リージョンの選定は region-near-japan、Cloudflare Access の保護設定手順は cloudflare-access-setup、公開と非公開の Pages 構成判断は cloudflare-pages-private-admin に委ねる。
+description: Cloudflare 公式 CLI cf の実行、認証、コマンド探索、wrangler との使い分けを扱う。CLI で Cloudflare リソースや設定を操作するときに使用する。Access 設定は cloudflare-access-setup、Pages 構成判断は cloudflare-pages-private-admin に委ねる。
 ---
 
 # Cloudflare CLI `cf`

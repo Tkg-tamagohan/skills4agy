@@ -1,6 +1,6 @@
 ---
 name: session-context-audit
-description: Antigravity の過去セッションログ（transcript.jsonl と transcript_full.jsonl）を横断解析し、トークン消費、キャッシュヒット率、コンテキスト制御ルールの遵守状況、品質非退行の代理指標、および Gemini Decision 1 によるタスク別層別比較を集計する手順と CLI を扱う。コンテキスト制御ルールの導入前後で効果を定量確認するとき、または特定セッションのトークン消費過多を診断するときに使用する。進行中セッションの引き継ぎメモ作成は session-handoff、Decisions API の質問設計と仕様は gemini-decisions-api、API キーの発行手順は scoped-secret-provisioning、Windows シェル制約は windows-cli-pitfalls、対話的可視化の出力形式選択は output-format-escalation、単一ファイル HTML の描画規約は builtin の generative_ui に委ねる。
+description: Antigravity 過去ログを横断解析し、トークン消費、キャッシュ率、ルール遵守、品質非退行と Decision 1 層別比較を集計する手順。導入効果の定量確認や消費過多の診断時に使用する。引き継ぎメモ作成は session-handoff、可視化形式選択は output-format-escalation に委ねる。
 ---
 
 # 過去セッションのコンテキスト監査と効果測定

@@ -1,6 +1,6 @@
 ---
 name: output-format-escalation
-description: 説明や調査、分析の成果物に使う出力形式の選択基準と納品方法を扱う。制約付き文章、図、インタラクティブ HTML への形式のエスカレーションと、使い捨て成果物の運用を定める。ユーザーに説明や報告、解説を届けるとき、理解を助ける成果物を求められたときに使用する。日本語の文体は japanese-tech-writing、単一ファイル HTML の具体的な作り方は builtin の generative_ui に委ねる。
+description: 説明、調査、分析の出力形式を制約付き文章、図、インタラクティブ HTML へ上げる基準と使い捨て納品の運用。理解を助ける成果物や報告を求められたときに使用する。HTML 実装は builtin の generative_ui に委ねる。
 ---
 
 # 理解のための出力形式の選択

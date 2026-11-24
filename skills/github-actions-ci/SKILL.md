@@ -1,6 +1,6 @@
 ---
 name: github-actions-ci
-description: GitHub Actions における CI、リリース、定期セキュリティ監査ワークフローを設計または監査し、検証漏れや無駄をなくす手順と罠の回避策。必須チェックを壊さない変更判定スキップ、git diff のリネーム検出対策、node --check 等の複数引数や除外対象の盲点、権限最小化とロック固定、リリース前後検証、audit の定期分離を扱う。CI やリリースワークフローを構築、改善、レビューするときに使用する。並列監査の構成は repo-drift-audit、シークレット設定案内は scoped-secret-provisioning、テストの仕様準拠と ID 管理は test-conventions、外部ツール導入時のライセンス確認は library-license、Windows 環境のシェル罠は windows-cli-pitfalls に委ねる。
+description: GitHub Actions の CI、リリース、定期セキュリティ監査の設計と監査手順。必須チェックを壊さない変更判定スキップ、権限最小化、リネーム検出や除外対象の盲点対策を扱い、CI やリリースワークフローを構築、改善、レビューするときに使用する。
 ---
 
 # GitHub Actions における CI とリリース基盤の設計
