@@ -27,7 +27,7 @@ DECISION1_TIMEOUT_SECONDS = 8.0
 FALLBACK_REASON = "Decision 1 guard unavailable; fallback to standard confirmation."
 
 SHELL_META_RE = re.compile(r"[;&|><`\r\n\x00]|\$\(|\$\{")
-DISALLOWED_WHITELIST_META_RE = re.compile(r"[|><`\r\n\x00]|\$\(|\$\{")
+DISALLOWED_WHITELIST_ANYWHERE_RE = re.compile(r"[`\r\n\x00]|\$\(|\$\{")
 
 SAFE_ENV_VAR_VALIDATORS: dict[str, re.Pattern[str]] = {
     "PYTHONUTF8": re.compile(r"^[01]$"),
@@ -323,9 +323,9 @@ def _tokenize_lossy(segment: str) -> list[str]:
         return segment.split()
 
 
-def _split_top_level_segments(command: str) -> list[str]:
-    """連結記号・パイプ・改行および $() / バッククォート内をセグメント分割する。"""
-    raw_parts = re.split(r"&&|\|\||[;|&`]|[\r\n]+", command)
+def _split_top_level_segments_raw(text: str) -> list[str]:
+    """連結記号・パイプ・改行および $() / バッククォート内をセグメント分割する（従来分割）。"""
+    raw_parts = re.split(r"&&|\|\||[;|&`]|[\r\n]+", text)
     segments: list[str] = []
     for part in raw_parts:
         stripped = part.strip()
@@ -339,6 +339,141 @@ def _split_top_level_segments(command: str) -> list[str]:
     return segments
 
 
+def _split_unquoted_top_level(command: str) -> list[str] | None:
+    """クォート外の連結記号・パイプ・改行で分割する。未閉鎖クォート時は None を返す。"""
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            elif quote == '"' and ch == "\\" and i + 1 < n and command[i + 1] == '"':
+                buf.append('"')
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+
+        if command[i : i + 2] in ("&&", "||"):
+            seg = "".join(buf).strip()
+            if seg:
+                parts.append(seg)
+            buf = []
+            i += 2
+            continue
+
+        if ch in ";|&\r\n":
+            seg = "".join(buf).strip()
+            if seg:
+                parts.append(seg)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    if quote is not None:
+        return None
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _is_safe_rg_segment(segment: str) -> bool:
+    """--pre / --pre-glob を含まない単一の rg コマンドセグメントか判定する。"""
+    try:
+        tokens = _tokenize_command(segment)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if "=" in tok and not tok.startswith("-"):
+            idx += 1
+            continue
+        break
+    if idx >= len(tokens) or _command_basename(tokens[idx]) != "rg":
+        return False
+    for arg in tokens[idx + 1 :]:
+        low = arg.lower()
+        if low in {"--pre", "--pre-glob"} or low.startswith(("--pre=", "--pre-glob=")):
+            return False
+    return True
+
+
+def _extract_double_quoted_substitutions(segment: str) -> list[str]:
+    """ダブルクォート内のみから $(...) と `...` の中身を取り出し、サブセグメント列を返す。"""
+    dq_chunks: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(segment)
+
+    while i < n:
+        ch = segment[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n and segment[i + 1] == '"':
+                buf.append('\\"')
+                i += 2
+                continue
+            if ch == '"':
+                dq_chunks.append("".join(buf))
+                buf = []
+                quote = None
+            else:
+                buf.append(ch)
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        i += 1
+
+    subs: list[str] = []
+    for dq in dq_chunks:
+        for body in re.findall(r"\$\(([^)]+)\)", dq):
+            subs.extend(_split_top_level_segments_raw(body))
+        for body in re.findall(r"`([^`]+)`", dq):
+            subs.extend(_split_top_level_segments_raw(body))
+    return subs
+
+
+def _split_top_level_segments(command: str) -> list[str]:
+    """連結記号・パイプ・改行および $() / バッククォート内をセグメント分割する。"""
+    unquoted_parts = _split_unquoted_top_level(command)
+    if unquoted_parts is None:
+        return _split_top_level_segments_raw(command)
+
+    segments: list[str] = []
+    for part in unquoted_parts:
+        if _is_safe_rg_segment(part):
+            segments.append(part)
+            segments.extend(_extract_double_quoted_substitutions(part))
+        else:
+            segments.extend(_split_top_level_segments_raw(part))
+    return segments
+
+
 def _command_basename(token: str) -> str:
     """パスや .exe 拡張子を除いた小文字のコマンド名を返す。"""
     cleaned = token.strip().strip("\"'")
@@ -349,7 +484,7 @@ def _command_basename(token: str) -> str:
 
 
 def _unwrap_segment_tokens(tokens: list[str]) -> list[list[str]]:
-    """sudo 等のラッパーや bash -c / cmd /c 内のコマンド列を展開して返す。"""
+    """sudo 等のラッパーや bash -c / cmd /c / rg --pre 内のコマンド列を展開して返す。"""
     if not tokens:
         return []
 
@@ -385,6 +520,24 @@ def _unwrap_segment_tokens(tokens: list[str]) -> list[list[str]]:
                 for seg in _split_top_level_segments(nested):
                     results.extend(_unwrap_segment_tokens(_tokenize_lossy(seg)))
                 break
+    elif head == "rg":
+        i = 1
+        while i < len(sub_tokens):
+            tok = sub_tokens[i]
+            low = tok.lower()
+            nested: str | None = None
+            if low == "--pre" and i + 1 < len(sub_tokens):
+                nested = sub_tokens[i + 1]
+                i += 2
+            elif low.startswith("--pre="):
+                nested = tok.split("=", 1)[1]
+                i += 1
+            else:
+                i += 1
+                continue
+            if nested:
+                for seg in _split_top_level_segments(nested):
+                    results.extend(_unwrap_segment_tokens(_tokenize_lossy(seg)))
     return results
 
 
@@ -778,8 +931,8 @@ def _is_safe_env_assignment(name: str, value: str, *, case_insensitive: bool) ->
 
 
 def _split_whitelist_segments(command: str) -> list[str] | None:
-    """クォート外の ; と && のみで単純連結を分割し、危険なメタ文字を拒否する。"""
-    if DISALLOWED_WHITELIST_META_RE.search(command):
+    """クォート外の ; と && のみで単純連結を分割し、危険なメタ文字（クォート外の |>< も含む）を拒否する。"""
+    if DISALLOWED_WHITELIST_ANYWHERE_RE.search(command):
         return None
 
     segments: list[str] = []
@@ -808,6 +961,9 @@ def _split_whitelist_segments(command: str) -> list[str] | None:
             buf.append(ch)
             i += 1
             continue
+
+        if ch in ("|", ">", "<"):
+            return None
 
         if ch == ";":
             seg = "".join(buf).strip()

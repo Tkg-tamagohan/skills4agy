@@ -103,6 +103,7 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/gemini-decisions-api/s
 引数を省略した `git push` 単体や `git push origin HEAD` はコマンド文字列から対象ブランチを確定できないため意図的に第 1 段ホワイトリスト外とし、第 2 段判定（要確認）へ送る。
 第 1 段のホワイトリスト判定では、`PYTHONUTF8` や `PYTHONIOENCODING` などの安全な定数リテラル環境変数プレフィックス、ローカル FS パス限定の `Set-Location` / `cd` 類（PSDrive、UNC パス、ワイルドカード、`.ssh` や `.aws` 等の機密ディレクトリを除外）、PowerShell 5.1 の定型 fail-fast ガード（`if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` 等）、`;` と `&&` による許可コマンドの単純連結、および `python -B -m unittest` などの無害な短縮フラグを許容する。
 さらに、`.agents/teamwork` 配下への `.md` ファイル作成や更新コマンド（PowerShell スクリプトおよび POSIX 単一引用 heredoc）も、対象パスと静的式が厳格検証を通過し機密パターンを含まない限り第 1 段で即時 `allow` とする。
+また、`rg` の引用符内正規表現に含まれる `|`、`<`、`>` はシェル演算子として誤分割せず、第 1 段ホワイトリストでそのまま `allow` とする。
 外側コマンドにコード実行シンクや外部送信コマンドが含まれない場合は、PowerShell `@'...'@` および POSIX `<<'DELIM'` の逐語本文を第 1 段ブラックリスト走査から除外し、Markdown 本文内のコマンド例による誤検知を防ぐ。
 一方で、`git commit` など他の状態変更コマンドや一般の制御構文を 1 回の `run_command` へ混在させると第 1 段の即時許可や IDE 側のコマンド単位許可が適用されにくくなるため、変更系と確認系は別呼び出しへ分離する。
 API キー未設定や通信障害時は `ask` へ安全にフォールバックする。
