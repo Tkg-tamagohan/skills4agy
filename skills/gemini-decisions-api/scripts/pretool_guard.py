@@ -570,6 +570,42 @@ def _is_safe_rg_segment(segment: str) -> bool:
     return not has_pre
 
 
+def _is_shell_wrapper_segment(segment: str) -> bool:
+    """インライン実行フラグ（-c / -Command 等）付きのシェル起動セグメントか判定する。"""
+    try:
+        tokens = _tokenize_command(segment)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    idx = 0
+    while idx < len(tokens):
+        base = _command_basename(tokens[idx])
+        if base in COMMAND_WRAPPERS:
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                idx += 1
+            continue
+        if "=" in tokens[idx] and not tokens[idx].startswith("-") and idx + 1 < len(tokens):
+            idx += 1
+            continue
+        break
+    if idx >= len(tokens):
+        return False
+    head = _command_basename(tokens[idx])
+    if head not in SHELL_WRAPPERS:
+        return False
+    is_unix_shell = head in {"sh", "bash", "zsh", "dash"}
+    for i, tok in enumerate(tokens[idx + 1 :], start=idx + 1):
+        low = tok.lower()
+        is_cmd_flag = low in {"-c", "/c", "/k", "-command", "-encodedcommand"} or (
+            is_unix_shell and low.startswith("-") and not low.startswith("--") and "c" in low[1:]
+        )
+        if is_cmd_flag and i + 1 < len(tokens):
+            return True
+    return False
+
+
 def _find_matching_backtick(text: str, start: int, *, in_double_quote: bool) -> int | None:
     """` の直後から対応する閉じ ` の位置をエスケープを考慮して返す。未閉鎖時は None。"""
     escapable = {"$", "`", "\\"}
@@ -763,14 +799,14 @@ def _split_top_level_segments(command: str, *, posix_shell: bool = False) -> lis
         return _split_top_level_segments_raw(command, posix_shell=posix_shell)
 
     segments: list[str] = []
-    any_safe_rg = False
+    extract_outer_subs = False
     for part in unquoted_parts:
-        if _is_safe_rg_segment(part):
+        if _is_safe_rg_segment(part) or _is_shell_wrapper_segment(part):
             segments.append(part)
-            any_safe_rg = True
+            extract_outer_subs = True
         else:
             segments.extend(_split_top_level_segments_raw(part, posix_shell=posix_shell))
-    if any_safe_rg:
+    if extract_outer_subs:
         segments.extend(_extract_rg_substitutions(command, posix_shell=posix_shell))
     return segments
 
@@ -820,9 +856,9 @@ def _unwrap_segment_tokens(
             )
             if is_cmd_flag and i + 1 < len(sub_tokens):
                 nested = " ".join(sub_tokens[i + 1 :])
-                for seg in _split_top_level_segments(nested, posix_shell=posix_shell):
+                for seg in _split_top_level_segments(nested, posix_shell=is_unix_shell):
                     results.extend(
-                        _unwrap_segment_tokens(_tokenize_lossy(seg), posix_shell=posix_shell)
+                        _unwrap_segment_tokens(_tokenize_lossy(seg), posix_shell=is_unix_shell)
                     )
                 break
     elif head == "rg":
