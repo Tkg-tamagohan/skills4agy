@@ -5,7 +5,7 @@
 
 ## CLI の仕様
 
-使い方は `python3 scripts/slop_lint.py [ファイル] [--json] [--strict] [--fail-on {warn,error}]` で、ファイルを省略するか `-` を渡すと標準入力を読む。
+使い方は `python "$HOME/.gemini/config/plugins/shared-skills/skills/japanese-tech-writing/scripts/slop_lint.py" [ファイル] [--json] [--strict] [--fail-on {warn,error}]` で、ファイルを省略するか `-` を渡すと標準入力を読む。
 詳しい説明は `--help` で表示する。
 
 - `--json` は結果を JSON(形式2)で出力する。
@@ -39,7 +39,7 @@ CI では `--strict` か `counts` を使う。
 `.sloplintignore` を置かない構成では、各検査コマンド側で `references/slop-catalog.md` と対象外のディレクトリ（`.git` や依存パッケージ配下、作業用下書きなど）を除外する。
 
 Git 管理下のリポジトリで `.sloplintignore`（存在する場合）を適用して全対象を `--strict` で検査する手順は次のとおり。
-他リポジトリから呼び出す場合は、`skills/japanese-tech-writing/scripts/slop_lint.py` を実際のスキル配置パスへ読み替える。
+スキルを標準のプラグイン配置先以外に置いている場合は、`"$HOME/.gemini/config/plugins/shared-skills/skills/japanese-tech-writing/scripts/slop_lint.py"` を実際の配置パスへ読み替える。
 
 ```bash
 status=0
@@ -52,7 +52,7 @@ fi
 while IFS= read -r -d '' f; do
   grep -qzxF -- "$f" "$excluded" && continue
   case "$f" in references/slop-catalog.md|*/references/slop-catalog.md) continue ;; esac
-  python3 skills/japanese-tech-writing/scripts/slop_lint.py --strict "$f" || status=1
+  PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python "$HOME/.gemini/config/plugins/shared-skills/skills/japanese-tech-writing/scripts/slop_lint.py" --strict "$f" || status=1
 done < <(git ls-files -z -- '*.md')
 exit $status
 ```
@@ -63,7 +63,7 @@ PowerShell では `$env:PYTHONUTF8="1"` と `$env:PYTHONIOENCODING="utf-8"` の�
 Git 管理下のリポジトリでは、`git ls-files` と `.sloplintignore`（存在時）を用いて追跡対象だけを検査する。
 
 ```powershell
-$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"; python -c "import pathlib, subprocess, sys; git = lambda *a: subprocess.run(['git', '-c', 'core.quotePath=false', *a], capture_output=True, text=True, encoding='utf-8', check=True).stdout.split('\0')[:-1]; excl = set(git('ls-files', '-z', '-c', '-i', '-X', '.sloplintignore', '--', '*.md')) if pathlib.Path('.sloplintignore').is_file() else set(); files = [pathlib.Path(f) for f in sorted(git('ls-files', '-z', '--', '*.md')) if f not in excl and not f.endswith('references/slop-catalog.md')]; failed = [(str(p), (r.stdout + r.stderr).decode('utf-8', 'replace').strip()) for p in files for r in [subprocess.run([sys.executable, 'skills/japanese-tech-writing/scripts/slop_lint.py', '--strict', '-'], input=p.read_bytes(), capture_output=True)] if r.returncode != 0]; print('\n'.join(f'=== {f} ===\n{o}' for f, o in failed) if failed else 'ALL_CLEAN'); sys.exit(bool(failed))"
+$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"; python -c "import pathlib, subprocess, sys; lint = sys.argv[1]; git = lambda *a: subprocess.run(['git', '-c', 'core.quotePath=false', *a], capture_output=True, text=True, encoding='utf-8', check=True).stdout.split('\0')[:-1]; excl = set(git('ls-files', '-z', '-c', '-i', '-X', '.sloplintignore', '--', '*.md')) if pathlib.Path('.sloplintignore').is_file() else set(); files = [pathlib.Path(f) for f in sorted(git('ls-files', '-z', '--', '*.md')) if f not in excl and not f.endswith('references/slop-catalog.md')]; failed = [(str(p), (r.stdout + r.stderr).decode('utf-8', 'replace').strip()) for p in files for r in [subprocess.run([sys.executable, lint, '--strict', '-'], input=p.read_bytes(), capture_output=True)] if r.returncode != 0]; print('\n'.join(f'=== {f} ===\n{o}' for f, o in failed) if failed else 'ALL_CLEAN'); sys.exit(bool(failed))" "$HOME/.gemini/config/plugins/shared-skills/skills/japanese-tech-writing/scripts/slop_lint.py"
 ```
 
 Git 管理外のディレクトリや未追跡ファイルも検査する場合は `Path('.').rglob('*.md')` で走査できるが、`.sloplintignore` は解釈されないため、`.git` などの隠しディレクトリや不要ディレクトリと `slop-catalog.md` 以外の除外対象を条件へ明示的に追加する。

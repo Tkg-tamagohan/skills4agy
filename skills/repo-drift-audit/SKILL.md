@@ -1,6 +1,6 @@
 ---
 name: repo-drift-audit
-description: リポジトリの文書、スキル、テスト資産とコードの乖離や重複、手順の機械化余地を網羅的に洗い出し、Gemini Decision 1 による一次スクリーニングから計画と実装の 2 段サブエージェント（`run_workflow` または `invoke_subagent`）へ振る手順。走査観点のカタログ、一次スクリーニング CLI（`docs`、`backlog`、`candidates`）、計画ファンアウトと実装ファンアウトの構成、排他ファイル境界とトラック分割、集約書の形式、リファクタ系の検証技法を扱う。リポジトリ全体のドリフト監査や大掛かりな構造整理を計画するときに使用する。不要テストの判定基準と一次フィルタは test-suite-pruning、Decisions API の一般仕様は gemini-decisions-api、実装差分の不変条件検査は invariant-gate、要協議の提示形式は requirements-definition、既存設計文書を持たないコードベースからの単発契約抽出は codebase-contract-extract、動的ワークフローの記法は builtin の run-workflow に委ねる。
+description: 文書、スキル、テストとコードの乖離や重複を洗い出し、計画と実装の 2 段ファンアウトで整理する手順。リポジトリ全体のドリフト監査を計画するときに使用する。不要テスト整理は test-suite-pruning、単発契約抽出は codebase-contract-extract、差分不変条件検査は invariant-gate に委ねる。
 ---
 
 # リポジトリの網羅的ドリフト監査と 2 段ファンアウト
@@ -64,7 +64,7 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scrip
 ```
 
 2. 計画フェーズとして、`run_workflow` の `parallel()`（または `invoke_subagent` の `research`）で各項目を 1 ワーカーへ割り当てる。
-   - プロンプトは同ディレクトリの `child-prompts.md` の計画ワーカー定型を使い、現行ブランチで証拠を再検証させたうえで計画書を `<Artifact Directory Path>/scratch/plans/<slug>.md` に書かせる。
+   - プロンプトは同ディレクトリの `child-prompts.md` の計画ワーカー定型を使い、現行ブランチで証拠を再検証させたうえで計画書をワーカー自身の `<Worker Artifact Directory>/scratch/plans/<slug>.md` に書かせる。
    - `finish` スキーマ（`{summary, plan_path, recommendation, requires_discussion, out_of_scope_findings}`）で構造化出力を回収する。
 3. ワーカーから返った計画書を集約書 Artifact（`<Artifact Directory Path>/drift-audit-summary.md`）1 文書にまとめる。
    - 総表、推奨案つき要協議一覧、自律適用一覧、ワーカーの新規発見、実施順序と競合予測を含める。

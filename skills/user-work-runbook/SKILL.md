@@ -1,6 +1,6 @@
 ---
 name: user-work-runbook
-description: 実装計画の中にユーザー側の作業（実データ投入、手動運用、アカウント設定など）があるとき、その作業手順書を作成する手順。コード裏取りによる実在 UI の確認、定型構成、Artifact での納品を扱う。ユーザーが手作業で行う運用の手順書を求められたときに使用する。実装計画そのものの策定は requirements-definition、シークレットの発行案内は scoped-secret-provisioning、日本語の文体は japanese-tech-writing に委ねる。
+description: 実装計画に含まれるユーザー側の手作業（実データ投入、手動運用、アカウント設定）をコード裏取り済みの定型構成で手順書化する手順。ユーザー作業手順書を求められたときに使用する。実装計画の策定は requirements-definition に委ねる。
 ---
 
 # ユーザー作業手順書の作り方

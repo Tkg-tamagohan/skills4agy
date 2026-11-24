@@ -8,22 +8,22 @@
 調査対象ファイルの一覧は `discover_contract_scope.py` が出力したチャンクの `files` をそのまま渡し、対象外のテストや `.env` 系ファイルは読ませない。
 
 ```text
-あなたはコードベースの読み取り専用解析担当である。
-ファイルを一切編集せず、指定された対象ディレクトリおよびチャンク内ファイルだけを読んで次の JSON 1 オブジェクトだけを標準出力へ返せ。
+You are a read-only codebase contract analyzer.
+Do not edit any files. Read only the specified target directory and chunk files, and output a single JSON object to stdout (no preamble or trailing commentary).
 
-出力スキーマ（JSON 以外の前置きや説明文は付けない）:
+Output schema (write summary strings in Japanese, following `japanese-tech-writing`):
 {
-  "directory": "<対象の相対 POSIX パス>",
-  "interface": ["<公開関数、RPC、CLI 引数、HTTP エンドポイント、設定キー等の要約> [file:symbol_or_flag]"],
-  "invariants": ["<前提条件、境界値、型制約、ロック順、冪等性、エラー条件等> [file:symbol_or_flag]"],
-  "side_effects": ["<外部 API 呼び出し、DB/ファイル書込、環境変数参照、サブプロセス起動等> [file:symbol_or_flag]"]
+  "directory": "<target relative POSIX path>",
+  "interface": ["<summary of public functions, RPCs, CLI flags, HTTP endpoints, config keys, etc.> [file:symbol_or_flag]"],
+  "invariants": ["<preconditions, bounds, type constraints, lock order, idempotency, error conditions, etc.> [file:symbol_or_flag]"],
+  "side_effects": ["<external API calls, DB/file writes, env var reads, subprocess spawns, etc.> [file:symbol_or_flag]"]
 }
 
-厳守事項:
-1. ディレクトリ名やファイル名からの推測で RPC、不変条件、副作用を補完しない。
-2. 実際に読んだファイル内で確認できた項目だけを記録し、すべての項目末尾に `[file:symbol_or_flag]` 形式の引用を付ける。
-3. 該当項目が確認できない節には空配列ではなく `["None"]` を入れる。
-4. コード内に存在しないシンボル名やフラグ名を捏造しない。
+Strict Rules:
+1. Never infer RPCs, invariants, or side effects from directory or file names alone.
+2. Record only items verified in the files you actually read, and append `[file:symbol_or_flag]` to every item.
+3. If no items exist for a section, output `["None"]` (never an empty array).
+4. Never fabricate symbol names or flag names that do not exist in code.
 ```
 
 ## 中間ディレクトリ集約時の指針

@@ -1,6 +1,6 @@
 ---
 name: windows-cli-pitfalls
-description: Windows 上のシェル（PowerShell と Git Bash）でマルチバイト文字、環境変数、バックスラッシュ、gh CLI、git、curl を扱うときの罠と回避策。PowerShell セッションの非永続性、Python の cp932 ロケールによる UnicodeDecodeError、PowerShell 5.1 の && 非対応と curl エイリアス、Get-Content の -Encoding UTF8 欠落による文字化け、Start-Process -ArgumentList の空白パス分割、.NET 例外時の非停止、Select-Object -First による上流コマンドの非ゼロ終了、ワイルドカード引数の非展開（scripts/*.py）、チルダ（~）引数の非展開（"$HOME/..."）、ExecutionPolicy による .ps1 拒否（pnpm.cmd）、シングルクォート内を含む外部コマンド引数の引用符剥離と $ 展開、gh CLI や git commit -F への BOM なし UTF-8 本文渡し、引用でのバックスラッシュ消失を扱う。Windows マシンでシェルコマンドやスクリプトを組み立てるときに使用する。
+description: Windows 上の PowerShell と Git Bash におけるシェル罠と回避策。セッション非永続性、UTF-8 と cp932 文字コード、PowerShell 5.1 構文と curl エイリアス、パスとワイルドカード展開、外部コマンド引用符剥離、BOM なし UTF-8 ファイル渡しを扱い、Windows でコマンドやスクリプトを組むときに使用する。
 ---
 
 # Windows CLI の文字コードとシェルの罠

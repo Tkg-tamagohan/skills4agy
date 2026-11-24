@@ -154,7 +154,7 @@ OK: 請求一覧 / 公開状態 / バックアップ設定
 
 ```powershell
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python skills/gemini-decisions-api/scripts/run_decisions.py --media <screenshot.png> --resolution medium --questions skills/concise-ui-copy/presets/ui_visual_check.json --min-confidence 0.70 --format table
+python "$HOME/.gemini/config/plugins/shared-skills/skills/gemini-decisions-api/scripts/run_decisions.py" --media <screenshot.png> --resolution medium --questions "$HOME/.gemini/config/plugins/shared-skills/skills/concise-ui-copy/presets/ui_visual_check.json" --min-confidence 0.70 --format table
 ```
 
 `GEMINI_API_KEY` を設定せずにペイロードの事前検証だけを行う場合は、末尾へ `--dry-run` を付けて実行する。

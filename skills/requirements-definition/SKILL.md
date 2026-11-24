@@ -1,6 +1,6 @@
 ---
 name: requirements-definition
-description: 要件定義書、仕様書の策定と確定化を進める手順。ドラフトのレビュー、仕様の抜けや曖昧さの洗い出し、要協議事項と技術的改善の切り分け、推奨案付きの選択肢提示、決定記録の文書への保存、確定仕様の実装計画への分解を扱う。要件定義、仕様策定、仕様レビューを求められたときに使用する。日本語の文体規範は japanese-tech-writing、複数トラックのサブエージェントへの並列分割は repo-drift-audit と builtin の run-workflow、ユーザー手作業の手順書は user-work-runbook、フェーズ完了後のセッション移行は session-phase-split、確定後の実装前コールドレビューは spec-cold-review、既存コードベースの単発契約抽出は codebase-contract-extract に委ね、本スキルは要件定義と計画策定の進行だけを定める。
+description: 要件定義書や仕様書の曖昧さ洗い出し、要協議事項と推奨案提示、決定記録、実装計画への分解を進める手順。要件定義や仕様レビューを求められたときに使用する。コールドレビューは spec-cold-review、契約抽出は codebase-contract-extract、手作業手順は user-work-runbook、並列監査は repo-drift-audit に委ねる。
 ---
 
 # 要件定義の進め方
