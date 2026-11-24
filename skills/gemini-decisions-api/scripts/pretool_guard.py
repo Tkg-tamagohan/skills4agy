@@ -174,9 +174,7 @@ CODE_EXEC_SINKS = frozenset(
         "new-pssession",
     }
 )
-SAFE_POSIX_HEREDOC_COMMANDS = frozenset(
-    {"cat", "tee", "mkdir", "ls", "wc", "test", "echo", "printf", "touch", "cp", "mv"}
-)
+SAFE_POSIX_HEREDOC_RECEIVERS = frozenset({"cat", "tee"})
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -1690,20 +1688,21 @@ def _find_single_quoted_heredoc_opener(line_no_eol: str) -> tuple[bool, bool, st
     return True, bool(match.group(1)), match.group(2)
 
 
-def _strip_verbatim_herestrings_with_meta(command: str) -> tuple[str, list[str], bool]:
-    """PowerShell @'...'@ と POSIX <<'DELIM' の逐語本体を退避し (置換後コマンド, 本体一覧, POSIX heredoc 有無) を返す。
+def _strip_verbatim_herestrings_with_meta(command: str) -> tuple[str, list[str], list[str]]:
+    """PowerShell @'...'@ と POSIX <<'DELIM' の逐語本体を退避し (置換後コマンド, 本体一覧, POSIX heredoc 開始行一覧) を返す。
 
-    未閉鎖や曖昧な構文を検出した場合は安全側で (command, [], False) へフォールバックする。
+    未閉鎖や曖昧な構文を検出した場合は安全側で (command, [], []) へフォールバックする。
     """
     lines = command.splitlines(keepends=True)
     if not lines:
-        return command, [], False
+        return command, [], []
 
     mode: str | None = None
     in_quote: str | None = None
     heredoc_delim = ""
     heredoc_strip_tabs = False
-    has_posix_heredoc = False
+    pending_heredoc_line = ""
+    heredoc_opener_lines: list[str] = []
     bodies: list[str] = []
     current_body: list[str] = []
     out_parts: list[str] = []
@@ -1718,7 +1717,7 @@ def _strip_verbatim_herestrings_with_meta(command: str) -> tuple[str, list[str],
             ):
                 trailing = line_no_eol[2:]
                 if trailing.rstrip(" \t").endswith("@'"):
-                    return command, [], False
+                    return command, [], []
                 idx = len(bodies)
                 bodies.append("".join(current_body))
                 current_body = []
@@ -1735,7 +1734,8 @@ def _strip_verbatim_herestrings_with_meta(command: str) -> tuple[str, list[str],
                 bodies.append("".join(current_body))
                 current_body = []
                 mode = None
-                has_posix_heredoc = True
+                heredoc_opener_lines.append(pending_heredoc_line)
+                pending_heredoc_line = ""
             else:
                 current_body.append(line)
             continue
@@ -1789,18 +1789,19 @@ def _strip_verbatim_herestrings_with_meta(command: str) -> tuple[str, list[str],
         if in_quote is None and eol:
             found_hd, flag_or_fail, delim = _find_single_quoted_heredoc_opener(line_no_eol)
             if not found_hd and flag_or_fail:
-                return command, [], False
+                return command, [], []
             if found_hd:
                 heredoc_strip_tabs = flag_or_fail
                 heredoc_delim = delim
+                pending_heredoc_line = line_no_eol
                 mode = "posix_heredoc"
                 current_body = []
 
         out_parts.append(line)
 
     if mode is not None or in_quote is not None:
-        return command, [], False
-    return "".join(out_parts), bodies, has_posix_heredoc
+        return command, [], []
+    return "".join(out_parts), bodies, heredoc_opener_lines
 
 
 def _strip_verbatim_herestrings(command: str) -> tuple[str, list[str]]:
@@ -2034,13 +2035,61 @@ def _is_teamwork_conversation(
     return False
 
 
+def _are_posix_heredoc_receivers_safe(heredoc_opener_lines: list[str]) -> bool:
+    """POSIX heredoc を受け取るコマンド自体が安全なローカル書き出しコマンド（cat / tee）のみか検証する。"""
+    if not heredoc_opener_lines:
+        return True
+    for hd_line in heredoc_opener_lines:
+        parts = _split_unquoted_top_level(hd_line)
+        if parts is None:
+            return False
+        hd_parts = [p for p in parts if _find_single_quoted_heredoc_opener(p)[0]]
+        if not hd_parts:
+            return False
+        for part in hd_parts:
+            unwrapped = _unwrap_segment_tokens(_tokenize_lossy(part))
+            if not unwrapped or _command_basename(unwrapped[0][0]) not in SAFE_POSIX_HEREDOC_RECEIVERS:
+                return False
+    return True
+
+
+def _extract_teamwork_push_segments(
+    command_text: str, fallback_segments: list[list[str]]
+) -> list[list[str]]:
+    """引用境界を保ったまま実際のコマンドセグメントと展開式のみを抽出し git push 判定に使う。"""
+    unquoted_parts = _split_unquoted_top_level(command_text)
+    if unquoted_parts is None:
+        return fallback_segments
+
+    extracted: list[list[str]] = []
+    for part in unquoted_parts:
+        extracted.extend(_unwrap_segment_tokens(_tokenize_lossy(part)))
+        for sub in _extract_rg_substitutions(part):
+            extracted.extend(_unwrap_segment_tokens(_tokenize_lossy(sub)))
+    return extracted
+
+
+def _has_non_var_goog_header(text: str) -> bool:
+    """x-goog-api-key ヘッダに変数参照やプレースホルダ以外の生値が指定されているか検査する。"""
+    for m in GOOG_HEADER_QUOTED_RE.finditer(text):
+        raw_rhs = m.group(0)[len(m.group(1)) :].strip()
+        val = raw_rhs[1:-1].strip() if len(raw_rhs) >= 2 else ""
+        if val and not val.startswith(("$", "%", "<", "[")) and val.upper() != "REDACTED":
+            return True
+    for m in GOOG_HEADER_PLAIN_RE.finditer(text):
+        val = m.group(2).strip().strip("\"'")
+        if val and not val.startswith(("$", "%", "<", "[")) and val.upper() != "REDACTED":
+            return True
+    return False
+
+
 def _has_inline_secret_literal(text: str) -> bool:
     """コマンド文字列内の API トークン・秘密鍵ヘッダ・認証ヘッダ実値パターンを検出する。"""
     if dh.scan_text_for_secrets(text):
         return True
     if dh.BEARER_TOKEN_RE.search(text):
         return True
-    if GOOG_HEADER_QUOTED_RE.search(text) or GOOG_HEADER_PLAIN_RE.search(text):
+    if _has_non_var_goog_header(text):
         return True
     return False
 
@@ -2056,26 +2105,19 @@ def evaluate_stage1(
     if not command.strip():
         return ("ask", "Empty command line; fallback to standard confirmation.")
 
-    stripped_for_scan, herestring_bodies, has_posix_heredoc = (
+    stripped_for_scan, herestring_bodies, heredoc_opener_lines = (
         _strip_verbatim_herestrings_with_meta(command)
     )
+    use_stripped = False
     if herestring_bodies:
         outer_segments = _collect_all_command_segments(stripped_for_scan)
-        safe_posix_hd = (
-            not has_posix_heredoc
-            or (
-                bool(outer_segments)
-                and all(
-                    toks and _command_basename(toks[0]) in SAFE_POSIX_HEREDOC_COMMANDS
-                    for toks in outer_segments
-                )
-            )
-        )
+        safe_posix_hd = _are_posix_heredoc_receivers_safe(heredoc_opener_lines)
         if (
             safe_posix_hd
             and not _has_code_exec_sink(stripped_for_scan, outer_segments)
             and not _has_external_transfer(outer_segments)
         ):
+            use_stripped = True
             segments = outer_segments
             secret_hits = _extract_secret_file_hits(stripped_for_scan)
         else:
@@ -2114,7 +2156,8 @@ def evaluate_stage1(
                 "force_ask",
                 "Requires explicit confirmation: inline credential or private key pattern detected in command.",
             )
-        for seg_tokens in segments:
+        push_scan_text = stripped_for_scan if use_stripped else command
+        for seg_tokens in _extract_teamwork_push_segments(push_scan_text, segments):
             subcmd, _ = _extract_git_subcommand(seg_tokens, strict_safe_globals=False)
             if subcmd == "push" and not _classify_whitelisted_git(seg_tokens)[0]:
                 return (
