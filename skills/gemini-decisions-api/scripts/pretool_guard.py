@@ -157,7 +157,25 @@ CODE_EXEC_SINKS = frozenset(
         "cscript",
         "mshta",
         "rundll32",
+        "ssh",
+        "slogin",
+        "rsh",
+        "docker",
+        "podman",
+        "kubectl",
+        "wsl",
+        "su",
+        "doas",
+        "nsenter",
+        "chroot",
+        "winrm",
+        "psexec",
+        "enter-pssession",
+        "new-pssession",
     }
+)
+SAFE_POSIX_HEREDOC_COMMANDS = frozenset(
+    {"cat", "tee", "mkdir", "ls", "wc", "test", "echo", "printf", "touch", "cp", "mv"}
 )
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -961,7 +979,7 @@ def _is_safe_teamwork_temp_delete_target(target: str, *, cwd: str = "") -> bool:
     elif is_unix_abs and len(parts) >= 3 and low_parts[:2] == ["var", "tmp"]:
         anchor_index = 2
     elif is_win_abs and len(parts) >= 3 and low_parts[1] in {"temp", "tmp"}:
-        anchor_index = 2
+        anchor_index = 1
     elif (
         is_win_abs
         and len(parts) >= 6
@@ -970,14 +988,14 @@ def _is_safe_teamwork_temp_delete_target(target: str, *, cwd: str = "") -> bool:
     ):
         anchor_index = 6
     else:
-        # Antigravity scratch/<uuid>/scratch/<child...>
+        # Antigravity .gemini/antigravity/brain/<uuid>/scratch/<child...>
         for idx in range(len(low_parts) - 5):
             if (
                 low_parts[idx : idx + 3] == [".gemini", "antigravity", "brain"]
                 and UUID_RE.fullmatch(parts[idx + 3])
                 and low_parts[idx + 4] == "scratch"
             ):
-                anchor_index = idx + 5
+                anchor_index = idx
                 break
 
     if anchor_index is None:
@@ -994,7 +1012,7 @@ def _is_safe_teamwork_temp_delete_target(target: str, *, cwd: str = "") -> bool:
             else:
                 for idx in range(1, len(parts) - 1):
                     if low_parts[idx] in SAFE_TEMP_PARENT_NAMES:
-                        anchor_index = idx + 1
+                        anchor_index = idx
                         break
 
     if anchor_index is None:
@@ -1305,7 +1323,9 @@ def _is_safe_env_assignment(name: str, value: str, *, case_insensitive: bool) ->
     return validator is not None and validator.fullmatch(value) is not None
 
 
-def _split_whitelist_segments(command: str) -> list[str] | None:
+def _split_whitelist_segments(
+    command: str, *, posix_shell: bool = False
+) -> list[str] | None:
     """クォート外の ; と && のみで単純連結を分割し、危険なメタ文字（クォート外の |>< も含む）を拒否する。"""
     if DISALLOWED_WHITELIST_ANYWHERE_RE.search(command):
         return None
@@ -1327,7 +1347,11 @@ def _split_whitelist_segments(command: str) -> list[str] | None:
                 while j < n and command[j] == "\\":
                     j += 1
                 if j < n and command[j] == '"' and (j - i) % 2 == 1:
-                    return None
+                    if not posix_shell:
+                        return None
+                    buf.append(command[i : j + 1])
+                    i = j + 1
+                    continue
                 buf.append(command[i:j])
                 i = j
                 continue
@@ -1520,12 +1544,14 @@ def _is_whitelisted_single_command(segment: str) -> bool:
     return _classify_whitelisted_single_command(segment)[0]
 
 
-def _classify_whitelisted_command(command: str) -> tuple[bool, bool]:
+def _classify_whitelisted_command(
+    command: str, *, posix_shell: bool = False
+) -> tuple[bool, bool]:
     """安全な環境変数・ローカル cd・定型 fail-fast ガード・単純連結を含む厳格ホワイトリスト判定。"""
     stripped = command.strip()
     if not stripped:
         return False, False
-    segments = _split_whitelist_segments(stripped)
+    segments = _split_whitelist_segments(stripped, posix_shell=posix_shell)
     if segments is None or len(segments) > MAX_WHITELIST_SEGMENTS:
         return False, False
 
@@ -1664,19 +1690,20 @@ def _find_single_quoted_heredoc_opener(line_no_eol: str) -> tuple[bool, bool, st
     return True, bool(match.group(1)), match.group(2)
 
 
-def _strip_verbatim_herestrings(command: str) -> tuple[str, list[str]]:
-    """PowerShell @'...'@ と POSIX <<'DELIM' の逐語本体を退避し (置換後コマンド, 本体一覧) を返す。
+def _strip_verbatim_herestrings_with_meta(command: str) -> tuple[str, list[str], bool]:
+    """PowerShell @'...'@ と POSIX <<'DELIM' の逐語本体を退避し (置換後コマンド, 本体一覧, POSIX heredoc 有無) を返す。
 
-    未閉鎖や曖昧な構文を検出した場合は安全側で (command, []) へフォールバックする。
+    未閉鎖や曖昧な構文を検出した場合は安全側で (command, [], False) へフォールバックする。
     """
     lines = command.splitlines(keepends=True)
     if not lines:
-        return command, []
+        return command, [], False
 
     mode: str | None = None
     in_quote: str | None = None
     heredoc_delim = ""
     heredoc_strip_tabs = False
+    has_posix_heredoc = False
     bodies: list[str] = []
     current_body: list[str] = []
     out_parts: list[str] = []
@@ -1691,7 +1718,7 @@ def _strip_verbatim_herestrings(command: str) -> tuple[str, list[str]]:
             ):
                 trailing = line_no_eol[2:]
                 if trailing.rstrip(" \t").endswith("@'"):
-                    return command, []
+                    return command, [], False
                 idx = len(bodies)
                 bodies.append("".join(current_body))
                 current_body = []
@@ -1708,6 +1735,7 @@ def _strip_verbatim_herestrings(command: str) -> tuple[str, list[str]]:
                 bodies.append("".join(current_body))
                 current_body = []
                 mode = None
+                has_posix_heredoc = True
             else:
                 current_body.append(line)
             continue
@@ -1761,7 +1789,7 @@ def _strip_verbatim_herestrings(command: str) -> tuple[str, list[str]]:
         if in_quote is None and eol:
             found_hd, flag_or_fail, delim = _find_single_quoted_heredoc_opener(line_no_eol)
             if not found_hd and flag_or_fail:
-                return command, []
+                return command, [], False
             if found_hd:
                 heredoc_strip_tabs = flag_or_fail
                 heredoc_delim = delim
@@ -1771,8 +1799,14 @@ def _strip_verbatim_herestrings(command: str) -> tuple[str, list[str]]:
         out_parts.append(line)
 
     if mode is not None or in_quote is not None:
-        return command, []
-    return "".join(out_parts), bodies
+        return command, [], False
+    return "".join(out_parts), bodies, has_posix_heredoc
+
+
+def _strip_verbatim_herestrings(command: str) -> tuple[str, list[str]]:
+    """PowerShell @'...'@ と POSIX <<'DELIM' の逐語本体を退避し (置換後コマンド, 本体一覧) を返す。"""
+    stripped, bodies, _ = _strip_verbatim_herestrings_with_meta(command)
+    return stripped, bodies
 
 
 def _extract_executable_text_chunks(stripped_command: str) -> str:
@@ -2000,18 +2034,47 @@ def _is_teamwork_conversation(
     return False
 
 
+def _has_inline_secret_literal(text: str) -> bool:
+    """コマンド文字列内の API トークン・秘密鍵ヘッダ・認証ヘッダ実値パターンを検出する。"""
+    if dh.scan_text_for_secrets(text):
+        return True
+    if dh.BEARER_TOKEN_RE.search(text):
+        return True
+    if GOOG_HEADER_QUOTED_RE.search(text) or GOOG_HEADER_PLAIN_RE.search(text):
+        return True
+    return False
+
+
 def evaluate_stage1(
-    command: str, *, is_teamwork: bool = False, cwd: str = ""
+    command: str,
+    *,
+    is_teamwork: bool = False,
+    cwd: str = "",
+    posix_shell: bool = False,
 ) -> tuple[str, str] | None:
     """第 1 段の決定論的ローカル判定を行う。決着しない場合は None を返す。"""
     if not command.strip():
         return ("ask", "Empty command line; fallback to standard confirmation.")
 
-    stripped_for_scan, herestring_bodies = _strip_verbatim_herestrings(command)
+    stripped_for_scan, herestring_bodies, has_posix_heredoc = (
+        _strip_verbatim_herestrings_with_meta(command)
+    )
     if herestring_bodies:
         outer_segments = _collect_all_command_segments(stripped_for_scan)
-        if not _has_code_exec_sink(stripped_for_scan, outer_segments) and not _has_external_transfer(
-            outer_segments
+        safe_posix_hd = (
+            not has_posix_heredoc
+            or (
+                bool(outer_segments)
+                and all(
+                    toks and _command_basename(toks[0]) in SAFE_POSIX_HEREDOC_COMMANDS
+                    for toks in outer_segments
+                )
+            )
+        )
+        if (
+            safe_posix_hd
+            and not _has_code_exec_sink(stripped_for_scan, outer_segments)
+            and not _has_external_transfer(outer_segments)
         ):
             segments = outer_segments
             secret_hits = _extract_secret_file_hits(stripped_for_scan)
@@ -2040,13 +2103,33 @@ def evaluate_stage1(
             )
 
     if is_teamwork:
+        if _has_inline_secret_literal(command):
+            if _has_external_transfer(segments):
+                return (
+                    "deny",
+                    "Blocked by local secret-exfiltration policy: inline credential "
+                    "or token passed to an external transfer command.",
+                )
+            return (
+                "force_ask",
+                "Requires explicit confirmation: inline credential or private key pattern detected in command.",
+            )
+        for seg_tokens in segments:
+            subcmd, _ = _extract_git_subcommand(seg_tokens, strict_safe_globals=False)
+            if subcmd == "push" and not _classify_whitelisted_git(seg_tokens)[0]:
+                return (
+                    "force_ask",
+                    "Requires explicit confirmation: git push outside explicit non-protected origin branch whitelist.",
+                )
         return (
             "allow",
             "Allowed in active /teamwork subagent session (safety blacklists passed).",
         )
 
     if not secret_hits and not _has_env_dump(segments):
-        allowed, includes_push = _classify_whitelisted_command(command)
+        allowed, includes_push = _classify_whitelisted_command(
+            command, posix_shell=posix_shell
+        )
         if allowed:
             if includes_push:
                 return (
@@ -2305,7 +2388,10 @@ def main(
             artifact_dir=artifact_dir,
         )
 
-    stage1 = evaluate_stage1(command_line, is_teamwork=is_teamwork, cwd=cwd)
+    is_posix_shell = (os.name != "nt") and (not cwd or cwd.startswith("/"))
+    stage1 = evaluate_stage1(
+        command_line, is_teamwork=is_teamwork, cwd=cwd, posix_shell=is_posix_shell
+    )
     if stage1 is not None:
         decision, reason = stage1
         out: dict[str, Any] = {"decision": decision, "reason": reason}
