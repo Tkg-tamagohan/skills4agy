@@ -1,6 +1,6 @@
 ---
 name: invariant-gate
-description: 任意の Git リポジトリの git diff とルール文書を Gemini Decision 1 で一括突合し、規約違反候補を抽出する。PR 作成前や実装完了時に差分の不変条件を検査するときに使用する。Decisions API 仕様は gemini-decisions-api、常駐システム監査は systems-pre-pr-audit に委ねる。
+description: 任意の Git リポジトリの git diff とルール文書を Gemini Decision 1 で一括突合し、規約違反候補を抽出する。PR 作成前や実装完了時に差分の不変条件を検査するとき、または .agents/invariants.json や --questions-file 用のカスタム質問を作成または改訂するときに使用する。Decisions API 仕様は gemini-decisions-api、常駐システム監査は systems-pre-pr-audit に委ねる。
 ---
 
 # Gemini Decision 1 による汎用不変条件検査
