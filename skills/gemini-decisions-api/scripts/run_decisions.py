@@ -26,6 +26,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import decision_common  # noqa: E402
 import decision_hygiene  # noqa: E402
 
 DEFAULT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/decisions"
@@ -556,7 +557,7 @@ def enrich_response(raw: dict[str, Any], min_confidence: float | None = None) ->
                 item["top_level"] = top_level
                 if isinstance(legend, dict) and top_level in legend:
                     item["top_level_label"] = legend[top_level]
-            if isinstance(score_val, (int, float)):
+            if decision_common.is_real_number(score_val):
                 max_index = 0
                 if isinstance(legend, dict) and len(legend) >= 2:
                     max_index = len(legend) - 1
@@ -567,7 +568,7 @@ def enrich_response(raw: dict[str, Any], min_confidence: float | None = None) ->
 
         if min_confidence is not None:
             conf = item.get("confidence")
-            if isinstance(conf, (int, float)):
+            if decision_common.is_real_number(conf):
                 item["needs_escalation"] = float(conf) < min_confidence
 
         enriched_answers[q_key] = item
@@ -633,17 +634,17 @@ def format_table(enriched: dict[str, Any]) -> str:
     for q_key, ans in answers.items():
         q_type = str(ans.get("type", ""))
         conf = ans.get("confidence")
-        conf_str = f"{float(conf):.2f}" if isinstance(conf, (int, float)) else "-"
+        conf_str = f"{float(conf):.2f}" if decision_common.is_real_number(conf) else "-"
         extras: list[str] = []
 
         if q_type == "noul":
             val = ans.get("noul")
-            val_str = f"P(yes)={float(val):.2f}" if isinstance(val, (int, float)) else "-"
+            val_str = f"P(yes)={float(val):.2f}" if decision_common.is_real_number(val) else "-"
         elif q_type == "choice":
             val_str = str(ans.get("choice", "-"))
         elif q_type == "score":
             val = ans.get("score")
-            val_str = f"{float(val):.2f}" if isinstance(val, (int, float)) else "-"
+            val_str = f"{float(val):.2f}" if decision_common.is_real_number(val) else "-"
             if "top_level" in ans:
                 label = ans.get("top_level_label")
                 if label:
@@ -651,7 +652,9 @@ def format_table(enriched: dict[str, Any]) -> str:
                 else:
                     extras.append(f"top={ans['top_level']}")
             if "normalized_score" in ans:
-                extras.append(f"norm={float(ans['normalized_score']):.2f}")
+                norm_score = ans.get("normalized_score")
+                if decision_common.is_real_number(norm_score):
+                    extras.append(f"norm={float(norm_score):.2f}")
         else:
             val_str = "-"
 
@@ -659,7 +662,13 @@ def format_table(enriched: dict[str, Any]) -> str:
             extras.append("ESCALATE")
 
         extra_str = "; ".join(extras) if extras else "-"
-        lines.append(f"| {q_key} | {q_type} | {val_str} | {conf_str} | {extra_str} |")
+        lines.append(
+            f"| {decision_common.escape_md_cell(q_key)} "
+            f"| {decision_common.escape_md_cell(q_type)} "
+            f"| {decision_common.escape_md_cell(val_str)} "
+            f"| {conf_str} "
+            f"| {decision_common.escape_md_cell(extra_str)} |"
+        )
 
     usage = enriched.get("usage")
     if isinstance(usage, dict):
@@ -755,6 +764,10 @@ def _build_input_blocks(
     if args.mime_type and len(args.mime_type) != len(args.media):
         raise ValueError("--mime-type の個数は --media と一致させてください。")
     for idx, media_str in enumerate(args.media):
+        if decision_hygiene.is_blocked_env_path(media_str):
+            raise ValueError(
+                f"機密環境ファイル (.env) は --media に指定できません: {media_str}"
+            )
         explicit_mime = args.mime_type[idx] if args.mime_type else None
         blocks.append(build_media_block(Path(media_str), mime_type=explicit_mime, resolution=args.resolution))
 

@@ -24,6 +24,7 @@ _DECISIONS_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "gemini-decisions
 if str(_DECISIONS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_DECISIONS_SCRIPTS_DIR))
 
+import decision_common  # noqa: E402
 import decision_hygiene  # noqa: E402
 import run_decisions  # noqa: E402
 
@@ -270,30 +271,9 @@ def assert_text_has_no_secrets(text: str, label: str) -> None:
         )
 
 
-def _iter_string_fields(value: Any, prefix: str) -> list[tuple[str, str]]:
-    items: list[tuple[str, str]] = []
-    if isinstance(value, str):
-        items.append((prefix, value))
-    elif isinstance(value, list):
-        for idx, elem in enumerate(value):
-            items.extend(_iter_string_fields(elem, f"{prefix}[{idx}]"))
-    elif isinstance(value, dict):
-        for k, v in value.items():
-            items.extend(_iter_string_fields(v, f"{prefix}.{k}"))
-    return items
-
-
-def _is_real_number(val: Any) -> bool:
-    return isinstance(val, (int, float)) and not isinstance(val, bool)
-
-
-def _extract_number(mapping: Any, key: str) -> float | None:
-    if not isinstance(mapping, dict):
-        return None
-    val = mapping.get(key)
-    if _is_real_number(val):
-        return float(val)
-    return None
+_iter_string_fields = decision_hygiene.iter_string_fields
+_is_real_number = decision_common.is_real_number
+_extract_number = decision_common.extract_number
 
 
 def _run_git_command(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
@@ -586,35 +566,7 @@ def extract_missing_path_hints(doc_text: str, doc_relpath: str, ctx: RepoContext
     return sorted(missing)
 
 
-def _glob_to_regex(pattern: str) -> re.Pattern[str]:
-    """POSIX 形式のグロブ（** 対応）を正規表現へ変換する。"""
-    norm = pattern.strip().replace("\\", "/")
-    if norm.startswith("./"):
-        norm = norm[2:]
-    regex_parts: list[str] = ["^"]
-    i = 0
-    n = len(norm)
-    while i < n:
-        ch = norm[i]
-        if ch == "*":
-            if i + 1 < n and norm[i + 1] == "*":
-                if i + 2 < n and norm[i + 2] == "/":
-                    regex_parts.append("(?:.+/)?")
-                    i += 3
-                    continue
-                regex_parts.append(".*")
-                i += 2
-                continue
-            regex_parts.append("[^/]*")
-            i += 1
-        elif ch == "?":
-            regex_parts.append("[^/]")
-            i += 1
-        else:
-            regex_parts.append(re.escape(ch))
-            i += 1
-    regex_parts.append("$")
-    return re.compile("".join(regex_parts))
+_glob_to_regex = decision_common.glob_to_regex
 
 
 def select_doc_files(ctx: RepoContext, path_patterns: list[str] | None) -> list[str]:
@@ -1431,32 +1383,8 @@ def classify_candidate_answers(
     return result
 
 
-def _aggregate_usage(rows: list[dict[str, Any]]) -> dict[str, int] | None:
-    has_usage = False
-    in_total = 0
-    out_total = 0
-    for row in rows:
-        usage = row.get("usage")
-        if isinstance(usage, dict):
-            has_usage = True
-            if isinstance(usage.get("total_input_tokens"), int):
-                in_total += usage["total_input_tokens"]
-            if isinstance(usage.get("total_output_tokens"), int):
-                out_total += usage["total_output_tokens"]
-    if not has_usage:
-        return None
-    return {
-        "total_input_tokens": in_total,
-        "total_output_tokens": out_total,
-        "total_tokens": in_total + out_total,
-    }
-
-
-def _escape_md_cell(value: Any) -> str:
-    if value is None:
-        return "-"
-    text = str(value).replace("\r\n", " ").replace("\n", " ").replace("|", "\\|").strip()
-    return text or "-"
+_aggregate_usage = decision_common.aggregate_usage
+_escape_md_cell = decision_common.escape_md_cell
 
 
 def format_report_table(report: dict[str, Any]) -> str:
@@ -1652,17 +1580,7 @@ def _emit_error(
     output_format: str,
     api_key: str,
 ) -> None:
-    safe_msg = mask_secret(message, api_key)
-    if output_format == "json":
-        err_obj = {
-            "status": "error",
-            "exit_code": exit_code,
-            "code": code,
-            "error": safe_msg,
-        }
-        print(json.dumps(err_obj, ensure_ascii=False, indent=2), file=sys.stderr)
-    else:
-        print(f"ERROR [{code}]: {safe_msg}", file=sys.stderr)
+    decision_common.emit_cli_error(code, message, exit_code, output_format, api_key)
 
 
 def _require_api_key(api_key: str) -> None:

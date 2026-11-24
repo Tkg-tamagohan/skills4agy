@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import sys
+from typing import Any
 import urllib.parse
 
 SAFE_ENV_BASENAMES: frozenset[str] = frozenset(
@@ -51,6 +52,12 @@ SECRET_DETECT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("API シークレットキー (sk-...)", SECRET_KEY_PREFIX_RE),
     ("AWS アクセスキー (AKIA...)", AWS_ACCESS_KEY_RE),
     ("Devin API キー (cog_...)", DEVIN_API_KEY_RE),
+)
+
+SECRET_TOKEN_DETECT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (label, pattern)
+    for label, pattern in SECRET_DETECT_PATTERNS
+    if pattern is not PRIVATE_KEY_HEADER_RE
 )
 
 # 複数行ブロックを単独ヘッダより先に置換し、中間行や閉じ行の残留を防ぐ
@@ -123,3 +130,17 @@ def mask_secrets(
 def mask_secret(text: str, secret: str | None = None) -> str:
     """単一の任意シークレット実値と共通秘密パターンをマスクする互換ヘルパー。"""
     return mask_secrets(text, secrets=(secret,) if secret else ())
+
+
+def iter_string_fields(value: Any, prefix: str) -> list[tuple[str, str]]:
+    """任意の JSON 値から検査対象の文字列フィールド名と値の組を再帰抽出する。"""
+    items: list[tuple[str, str]] = []
+    if isinstance(value, str):
+        items.append((prefix, value))
+    elif isinstance(value, list):
+        for idx, elem in enumerate(value):
+            items.extend(iter_string_fields(elem, f"{prefix}[{idx}]"))
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            items.extend(iter_string_fields(v, f"{prefix}.{k}"))
+    return items

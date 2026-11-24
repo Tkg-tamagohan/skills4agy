@@ -20,6 +20,7 @@ _DECISIONS_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "gemini-decisions
 if str(_DECISIONS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_DECISIONS_SCRIPTS_DIR))
 
+import decision_common  # noqa: E402
 import decision_hygiene  # noqa: E402
 import run_decisions  # noqa: E402
 
@@ -314,8 +315,7 @@ def build_item_payload(
     return payload
 
 
-def _is_real_number(val: Any) -> bool:
-    return isinstance(val, (int, float)) and not isinstance(val, bool)
+_is_real_number = decision_common.is_real_number
 
 
 def evaluate_item_response(
@@ -410,11 +410,7 @@ def evaluate_item_response(
     return result
 
 
-def _sanitize_cell(value: Any) -> str:
-    if value is None:
-        return "-"
-    text = str(value).replace("\r\n", " ").replace("\n", " ").replace("|", "\\|").strip()
-    return text or "-"
+_sanitize_cell = decision_common.escape_md_cell
 
 
 def _format_location(path: str | None, line: int | None) -> str:

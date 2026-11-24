@@ -22,6 +22,7 @@ _DECISIONS_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "gemini-decisions
 if str(_DECISIONS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_DECISIONS_SCRIPTS_DIR))
 
+import decision_common  # noqa: E402
 import decision_hygiene  # noqa: E402
 import run_decisions  # noqa: E402
 
@@ -75,18 +76,7 @@ def mask_secret(text: str, secret: str | None = None) -> str:
     return decision_hygiene.mask_secret(text, secret)
 
 
-def _iter_string_fields(value: Any, prefix: str) -> list[tuple[str, str]]:
-    """任意 JSON 値から検査対象の文字列表現とフィールド名一覧を抽出する。"""
-    items: list[tuple[str, str]] = []
-    if isinstance(value, str):
-        items.append((prefix, value))
-    elif isinstance(value, list):
-        for idx, elem in enumerate(value):
-            items.extend(_iter_string_fields(elem, f"{prefix}[{idx}]"))
-    elif isinstance(value, dict):
-        for k, v in value.items():
-            items.extend(_iter_string_fields(v, f"{prefix}.{k}"))
-    return items
+_iter_string_fields = decision_hygiene.iter_string_fields
 
 
 def check_candidates_secrets(raw_items: list[Any]) -> list[str]:
@@ -341,13 +331,7 @@ def build_candidate_payload(
     return payload
 
 
-def _extract_number(mapping: Any, key: str) -> float | None:
-    if not isinstance(mapping, dict):
-        return None
-    val = mapping.get(key)
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        return float(val)
-    return None
+_extract_number = decision_common.extract_number
 
 
 def classify_candidate_answers(answers: dict[str, Any]) -> dict[str, Any]:
@@ -499,7 +483,7 @@ def screen_candidates(
 
 
 def _escape_md_cell(value: Any) -> str:
-    return str(value).replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+    return decision_common.escape_md_cell(value, empty="", strip=False)
 
 
 def _summarize_actions(results: list[dict[str, Any]]) -> dict[str, int]:
@@ -515,25 +499,7 @@ def _summarize_actions(results: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
-def _aggregate_usage(results: list[dict[str, Any]]) -> dict[str, int] | None:
-    has_usage = False
-    in_total = 0
-    out_total = 0
-    for row in results:
-        usage = row.get("usage")
-        if isinstance(usage, dict):
-            has_usage = True
-            if isinstance(usage.get("total_input_tokens"), int):
-                in_total += usage["total_input_tokens"]
-            if isinstance(usage.get("total_output_tokens"), int):
-                out_total += usage["total_output_tokens"]
-    if not has_usage:
-        return None
-    return {
-        "total_input_tokens": in_total,
-        "total_output_tokens": out_total,
-        "total_tokens": in_total + out_total,
-    }
+_aggregate_usage = decision_common.aggregate_usage
 
 
 def format_screening_table(report: dict[str, Any]) -> str:
@@ -665,17 +631,7 @@ def _emit_error(
     output_format: str,
     api_key: str,
 ) -> None:
-    safe_msg = mask_secret(message, api_key)
-    if output_format == "json":
-        err_obj = {
-            "status": "error",
-            "exit_code": exit_code,
-            "code": code,
-            "error": safe_msg,
-        }
-        print(json.dumps(err_obj, ensure_ascii=False, indent=2), file=sys.stderr)
-    else:
-        print(f"ERROR [{code}]: {safe_msg}", file=sys.stderr)
+    decision_common.emit_cli_error(code, message, exit_code, output_format, api_key)
 
 
 def run_cli(

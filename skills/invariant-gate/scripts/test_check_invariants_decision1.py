@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""check_invariants_decision1.py の仕様準拠単体テスト（INV-01〜INV-17 / P1-01〜P1-06）。
+"""check_invariants_decision1.py の仕様準拠単体テスト（INV-01〜INV-19 / P1-01〜P1-06）。
 
 外部ネットワーク通信を行わず、SDK・REST・git diff・エラー経路をモックして検証する。
 """
@@ -705,6 +705,7 @@ class TestInvariantGate(unittest.TestCase):
             ("github_pat_", "github_pat_" + "F" * 24),
             ("sk-", "sk-" + "proj-" + "G" * 24),
             ("AKIA", "AKIA" + "01234567" + "ABCDEFGH"),
+            ("cog_", "cog_" + "H" * 24),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -779,6 +780,7 @@ class TestInvariantGate(unittest.TestCase):
             "github_pat_" + "B" * 24,
             "sk-" + "C" * 24,
             "AKIA" + "01234567" + "ABCDEFGH",
+            "cog_" + "D" * 24,
         ]
         env_secret = "custom-env-" + "S" * 16
         raw_msg = "failed with " + " ".join(tokens) + f" and {env_secret}"
@@ -1024,6 +1026,72 @@ class TestInvariantGate(unittest.TestCase):
             parsed = json.loads(proc.stdout.decode("utf-8"))
             self.assertEqual(parsed["status"], "dry_run")
             self.assertIn("🚀", json.dumps(parsed, ensure_ascii=False))
+
+    def test_INV_18_cog_token_pattern_unification_and_boundaries(self) -> None:
+        """INV-18: SECRET_TOKEN_PATTERNS が cog_ を含み、削除行や識別子途中の cog_ を誤遮断しない。"""
+        self.assertEqual(len(gate.SECRET_TOKEN_PATTERNS), 6)
+        self.assertTrue(any(pat is gate.DEVIN_API_KEY_RE for _, pat in gate.SECRET_TOKEN_PATTERNS))
+
+        dummy_cog = "cog_" + "AbCdEf0123456789_-XyZ"
+        diff_blocked = (
+            "diff --git a/src/client.py b/src/client.py\n"
+            "--- a/src/client.py\n"
+            "+++ b/src/client.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            f"+DEVIN_KEY = \"{dummy_cog}\"\n"
+        )
+        findings = gate.check_diff_secrets(["src/client.py"], diff_blocked)
+        self.assertEqual(len(findings), 1)
+        self.assertNotIn(dummy_cog, findings[0])
+        self.assertIn("cog_...", findings[0])
+
+        # 削除行のみの cog_ および識別子途中の my_cog_worker_... は誤遮断しない
+        diff_safe = (
+            "diff --git a/src/client.py b/src/client.py\n"
+            "--- a/src/client.py\n"
+            "+++ b/src/client.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            f"-OLD_DEVIN_KEY = \"{dummy_cog}\"\n"
+            "+WORKER_ID = \"my_cog_worker_service_1234567890\"\n"
+        )
+        self.assertEqual(gate.check_diff_secrets(["src/client.py"], diff_safe), [])
+
+    def test_INV_19_english_excluded_headings_and_nested_skip(self) -> None:
+        """INV-19: 正規化後の英語除外見出しと併記見出しをスキップし、類似名非除外と入れ子見出し維持を検証する。"""
+        md = (
+            "# Rules\n\n"
+            "## 1. Out of Scope (Deferred):\n"
+            "- Skip outer out of scope rule.\n\n"
+            "### Non-Goals\n"
+            "- Skip nested non-goals rule.\n\n"
+            "### Inner Details\n"
+            "- Skip inner detail inside out of scope.\n\n"
+            "## 2.1 Non-Goal:\n"
+            "- Skip numbered non-goal.\n\n"
+            "## 対象外 / Out of Scope\n"
+            "- Skip slash-joined exclusion.\n\n"
+            "## 対象外の発見\n"
+            "- Keep discovery rule whose heading only starts with target word.\n\n"
+            "## Out of Scope Items\n"
+            "- Keep non-exact English heading.\n\n"
+            "## Scope / Out of Scope\n"
+            "- Keep mixed non-exclusion heading.\n\n"
+            "## Active Rules\n"
+            "- Keep active rule after excluded sections.\n"
+        )
+        rules = gate.extract_rules_from_markdown(md, "RULES.md")
+        texts = [r.text for r in rules]
+
+        self.assertFalse(any("Skip outer out of scope rule." in t for t in texts))
+        self.assertFalse(any("Skip nested non-goals rule." in t for t in texts))
+        self.assertFalse(any("Skip inner detail inside out of scope." in t for t in texts))
+        self.assertFalse(any("Skip numbered non-goal." in t for t in texts))
+        self.assertFalse(any("Skip slash-joined exclusion." in t for t in texts))
+
+        self.assertTrue(any("Keep discovery rule" in t for t in texts))
+        self.assertTrue(any("Keep non-exact English heading." in t for t in texts))
+        self.assertTrue(any("Keep mixed non-exclusion heading." in t for t in texts))
+        self.assertTrue(any("Keep active rule after excluded sections." in t for t in texts))
 
 
 if __name__ == "__main__":

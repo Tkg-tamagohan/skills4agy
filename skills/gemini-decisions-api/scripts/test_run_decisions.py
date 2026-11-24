@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""run_decisions.py の単体テスト（テスト ID: GD-01–GD-16）。
+"""run_decisions.py の単体テスト（テスト ID: GD-01–GD-17）。
 
 Gemini Decisions API 公式仕様（2026年11月版）を根拠とし、
 通信部分はモックオープナー注入で決定論的に検証する。
@@ -579,6 +579,82 @@ class TestRunDecisions(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
         parsed = json.loads(proc.stdout.decode("utf-8"))
         self.assertIn("\U0001f680", parsed["input"][0]["text"])
+
+    def test_gd17_media_env_blocking_bool_exclusion_and_table_escaping(self) -> None:
+        """GD-17: --media の .env 遮断、bool の数値除外、および Markdown 表セルのエスケープを検証する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            env_media = tmp_dir / ".env"
+            env_media.write_text("SECRET=1\n", encoding="utf-8")
+            env_local = tmp_dir / ".env.local"
+            env_local.write_text("SECRET=2\n", encoding="utf-8")
+            env_example = tmp_dir / ".env.example"
+            env_example.write_text("SAMPLE=ok\n", encoding="utf-8")
+
+            for blocked in (env_media, env_local):
+                with self.subTest(media=str(blocked)):
+                    out_b, err_b = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out_b), contextlib.redirect_stderr(err_b):
+                        rc_b = rd.main(
+                            [
+                                "--media",
+                                str(blocked),
+                                "--mime-type",
+                                "text/csv",
+                                "--noul",
+                                "q1=ok?",
+                                "--dry-run",
+                            ],
+                            env={},
+                        )
+                    self.assertEqual(rc_b, 2)
+                    self.assertIn(".env", err_b.getvalue())
+
+            out_ok, err_ok = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out_ok), contextlib.redirect_stderr(err_ok):
+                rc_ok = rd.main(
+                    [
+                        "--media",
+                        str(env_example),
+                        "--mime-type",
+                        "text/csv",
+                        "--noul",
+                        "q1=ok?",
+                        "--dry-run",
+                    ],
+                    env={},
+                )
+            self.assertEqual(rc_ok, 0, msg=err_ok.getvalue())
+
+        raw_resp = {
+            "answers": {
+                "q_bool": {
+                    "type": "score",
+                    "score": True,
+                    "confidence": False,
+                    "legend": {"0": "zero", "1": "one"},
+                },
+                "q_noul_bool": {
+                    "type": "noul",
+                    "noul": True,
+                    "confidence": True,
+                },
+                "q_pipe": {
+                    "type": "choice",
+                    "choice": "opt|1\nline2",
+                    "confidence": 0.9,
+                },
+            }
+        }
+        enriched = rd.enrich_response(raw_resp, min_confidence=0.5)
+        self.assertNotIn("normalized_score", enriched["answers"]["q_bool"])
+        self.assertNotIn("needs_escalation", enriched["answers"]["q_bool"])
+        self.assertNotIn("needs_escalation", enriched["answers"]["q_noul_bool"])
+
+        table = rd.format_table(enriched)
+        self.assertIn("| q_bool | score | - | - | - |", table)
+        self.assertIn("| q_noul_bool | noul | - | - | - |", table)
+        self.assertIn("| q_pipe | choice | opt\\|1 line2 | 0.90 | - |", table)
 
 
 if __name__ == "__main__":
