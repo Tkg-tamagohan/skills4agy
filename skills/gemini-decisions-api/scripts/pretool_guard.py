@@ -799,6 +799,205 @@ def _extract_rg_substitutions(
     return subs
 
 
+CONTROL_SEGMENT_HEAD_RE = re.compile(
+    r"^(?:[@({]|(?:if|then|else|elif|for|do|while|until)(?=$|[\s({]))",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_control_or_group_segment(segment: str) -> bool:
+    """制御構文キーワード（if/then/else/for/do 等）やグループ括弧・@ で始まるセグメントか判定する。"""
+    return bool(CONTROL_SEGMENT_HEAD_RE.match(segment.lstrip()))
+
+
+def _scan_flat_control_tokens(
+    chunk: str, *, posix_shell: bool = False
+) -> list[tuple[str, int, int, bool]]:
+    """平坦な制御構文チャンクをクォート境界付きでトークン化し (token, start, end, was_quoted) を返す。"""
+    tokens: list[tuple[str, int, int, bool]] = []
+    n = len(chunk)
+    i = 0
+    while i < n:
+        while i < n and chunk[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        start = i
+        quote: str | None = None
+        was_quoted = False
+        while i < n:
+            ch = chunk[i]
+            if quote == "'":
+                if ch == "'":
+                    quote = None
+                i += 1
+                continue
+            if quote == '"':
+                if posix_shell and ch == "\\" and i + 1 < n and chunk[i + 1] in ('"', "\\"):
+                    i += 2
+                    continue
+                if ch == '"':
+                    quote = None
+                i += 1
+                continue
+            if ch.isspace():
+                break
+            if ch in ("'", '"'):
+                quote = ch
+                was_quoted = True
+                i += 1
+                continue
+            if posix_shell and ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            i += 1
+        tokens.append((chunk[start:i], start, i, was_quoted))
+    return tokens
+
+
+def _split_flat_control_chunk(chunk: str, *, posix_shell: bool = False) -> list[str]:
+    """括弧グループ除去後の平坦な制御構文チャンクから実コマンド句を抽出する。"""
+    toks = _scan_flat_control_tokens(chunk, posix_shell=posix_shell)
+    if not toks:
+        return []
+
+    slices: list[list[tuple[str, int, int, bool]]] = []
+    cur: list[tuple[str, int, int, bool]] = []
+    for item in toks:
+        tok, _, _, quoted = item
+        low = tok.lower()
+        if not quoted and low in {"then", "else", "elif", "do"}:
+            if cur:
+                slices.append(cur)
+            cur = [item]
+            continue
+        cur.append(item)
+    if cur:
+        slices.append(cur)
+
+    clauses: list[str] = []
+    for sl in slices:
+        if not sl:
+            continue
+        first_tok, _, _, first_quoted = sl[0]
+        first_low = first_tok.lower()
+        cmd_idx = 0
+        if not first_quoted:
+            if first_low in {"fi", "done", "esac"} and len(sl) == 1:
+                continue
+            if first_low in {"then", "else", "do"}:
+                cmd_idx = 1
+            elif first_low == "for":
+                continue
+            elif first_low in {"if", "elif"}:
+                k = 1
+                if k < len(sl) and not sl[k][3] and sl[k][0].lower() == "not":
+                    k += 1
+                if k < len(sl) and not sl[k][3] and sl[k][0].lower() == "/i":
+                    k += 1
+                if k < len(sl) and not sl[k][3] and sl[k][0].lower() in {"exist", "errorlevel", "defined"}:
+                    cmd_idx = k + 2
+                elif k < len(sl) and not sl[k][3] and "==" in sl[k][0]:
+                    cmd_idx = k + 1
+                elif (
+                    k + 2 < len(sl)
+                    and not sl[k + 1][3]
+                    and sl[k + 1][0].lower() in {"==", "equ", "neq", "lss", "leq", "gtr", "geq"}
+                ):
+                    cmd_idx = k + 3
+                else:
+                    cmd_idx = 1
+        while cmd_idx < len(sl) and not sl[cmd_idx][3] and sl[cmd_idx][0].lower() in {"fi", "done", "esac"}:
+            if cmd_idx == len(sl) - 1:
+                cmd_idx = len(sl)
+                break
+            break
+        if cmd_idx < len(sl):
+            sub_start = sl[cmd_idx][1]
+            sub_end = sl[-1][2]
+            clause = chunk[sub_start:sub_end].strip()
+            if clause:
+                clauses.append(clause)
+    return clauses
+
+
+def _extract_control_clauses_from_text(
+    segment: str, *, posix_shell: bool = False
+) -> list[str]:
+    """制御構文や (...) / {...} グループから実際にコマンド位置へ現れる内側句のみを抽出する。"""
+    s = segment.strip()
+    if not s:
+        return []
+    if s.startswith("@") and not s.startswith(("@'", '@"')):
+        rest = s[1:].strip()
+        return [rest] if rest else []
+
+    clauses: list[str] = []
+    flat_chunks: list[str] = []
+    quote: str | None = None
+    stack: list[tuple[str, int]] = []
+    flat_start = 0
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if posix_shell and ch == "\\" and i + 1 < n and s[i + 1] in ('"', "\\"):
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if posix_shell and ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch in ("(", "{"):
+            is_sigil = i > 0 and s[i - 1] in ("$", "@")
+            closing = ")" if ch == "(" else "}"
+            if not stack:
+                if not is_sigil:
+                    flat_chunks.append(s[flat_start:i])
+                    stack.append((closing, i + 1))
+                elif is_sigil and ch == "(":
+                    # $(...) は内側テキスト内のグループと区別するため無視してそのまま通過
+                    pass
+            else:
+                stack.append((closing, i + 1))
+            i += 1
+            continue
+        if stack and ch == stack[-1][0]:
+            _, opened_at = stack.pop()
+            if not stack:
+                inner = s[opened_at:i].strip()
+                if inner:
+                    clauses.append(inner)
+                flat_start = i + 1
+            i += 1
+            continue
+        i += 1
+
+    if stack:
+        _, outermost_open = stack[0]
+        flat_chunks.append(s[outermost_open - 1 :])
+    else:
+        flat_chunks.append(s[flat_start:])
+
+    combined_flat = " ".join(c.strip() for c in flat_chunks if c.strip())
+    if combined_flat:
+        clauses.extend(_split_flat_control_chunk(combined_flat, posix_shell=posix_shell))
+    return clauses
+
+
 def _split_top_level_segments(
     command: str, *, posix_shell: bool = False, allow_cmd_subst: bool = True
 ) -> list[str]:
@@ -815,6 +1014,29 @@ def _split_top_level_segments(
         if _is_safe_rg_segment(part) or _is_shell_wrapper_segment(part):
             segments.append(part)
             extract_outer_subs = True
+        elif _looks_like_control_or_group_segment(part):
+            clauses = _extract_control_clauses_from_text(part, posix_shell=posix_shell)
+            if clauses and not (len(clauses) == 1 and clauses[0].strip() == part.strip()):
+                for clause in clauses:
+                    segments.extend(
+                        _split_top_level_segments(
+                            clause,
+                            posix_shell=posix_shell,
+                            allow_cmd_subst=allow_cmd_subst,
+                        )
+                    )
+                if allow_cmd_subst:
+                    segments.extend(
+                        _extract_rg_substitutions(
+                            part, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+                        )
+                    )
+            else:
+                segments.extend(
+                    _split_top_level_segments_raw(
+                        part, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+                    )
+                )
         else:
             segments.extend(
                 _split_top_level_segments_raw(
@@ -893,31 +1115,6 @@ def _unwrap_segment_tokens(
                     results.extend(
                         _unwrap_segment_tokens(_tokenize_lossy(seg), posix_shell=posix_shell)
                     )
-    elif (
-        head.lstrip("(@{") in {"if", "then", "else", "elif", "for", "do", "while", "until"}
-        or sub_tokens[0].strip("\"'").startswith(("(", "@", "{"))
-    ):
-        destructive_or_shell_heads = (
-            SHELL_WRAPPERS
-            | CODE_EXEC_SINKS
-            | {"git", "rm", "remove-item", "ri", "del", "erase", "rmdir", "rd", "dd", "chmod", "format"}
-        )
-        for k, raw_tok in enumerate(sub_tokens):
-            stripped_tok = raw_tok.strip("\"'")
-            cleaned_tok = stripped_tok.lstrip("(@{")
-            if not cleaned_tok:
-                continue
-            cand_base = _command_basename(cleaned_tok)
-            if cand_base in destructive_or_shell_heads:
-                tail_tokens = [cleaned_tok] + list(sub_tokens[k + 1 :])
-                if stripped_tok.startswith("(") and tail_tokens[-1].endswith(")"):
-                    tail_tokens[-1] = tail_tokens[-1][:-1]
-                elif stripped_tok.startswith("{") and tail_tokens[-1].endswith("}"):
-                    tail_tokens[-1] = tail_tokens[-1][:-1]
-                if not (k == 0 and tail_tokens == sub_tokens):
-                    results.extend(_unwrap_segment_tokens(tail_tokens, posix_shell=posix_shell))
-                if cand_base in SHELL_WRAPPERS:
-                    break
     return results
 
 
@@ -2263,6 +2460,22 @@ def _collect_quote_aware_segments(
 
     extracted: list[list[str]] = []
     for part in unquoted_parts:
+        if _looks_like_control_or_group_segment(part):
+            clauses = _extract_control_clauses_from_text(part, posix_shell=posix_shell)
+            if clauses and not (len(clauses) == 1 and clauses[0].strip() == part.strip()):
+                for clause in clauses:
+                    sub_extracted = _collect_quote_aware_segments(
+                        clause, posix_shell=posix_shell
+                    )
+                    if sub_extracted is not None:
+                        extracted.extend(sub_extracted)
+                    else:
+                        extracted.extend(
+                            _unwrap_segment_tokens(
+                                _tokenize_lossy(clause), posix_shell=posix_shell
+                            )
+                        )
+                continue
         extracted.extend(
             _unwrap_segment_tokens(_tokenize_lossy(part), posix_shell=posix_shell)
         )

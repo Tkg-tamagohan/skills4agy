@@ -1167,6 +1167,18 @@ class TestPretoolGuard(unittest.TestCase):
             self.assertEqual(res_cmd_tw[0], "allow")
             self.assertIsNone(pg.evaluate_stage1(cmd_exe_text_cmd, is_teamwork=False, posix_shell=True))
 
+            group_and_branch_allow_cmds = [
+                ("(rm -rf ./tmp/job-cache)", False),
+                ("( rm -rf ./tmp/job-cache )", False),
+                ("if test -d .git; then echo git push origin main; fi", True),
+                ("cmd.exe /c 'if exist README.md (git push origin feature/docs) else (git status)'", True),
+            ]
+            for cmd, ps_flag in group_and_branch_allow_cmds:
+                with self.subTest(group_allow=cmd, posix_shell=ps_flag):
+                    res_ga = pg.evaluate_stage1(cmd, is_teamwork=True, posix_shell=ps_flag)
+                    self.assertIsNotNone(res_ga)
+                    self.assertEqual(res_ga[0], "allow")
+
     def test_p2_25_verbatim_herestring_and_scriptblock_literal_no_false_positive(self) -> None:
         """P2-25: 逐語 @'...'@ と文字列リテラル内の ScriptBlock 記述で第 1 段の誤検知（force_ask/deny）を起こさない。"""
         cmd_plain = (
@@ -1334,6 +1346,9 @@ class TestPretoolGuard(unittest.TestCase):
             ('cmd.exe /c \'if exist foo powershell -Command "Write-Output $(git push origin main)"\'', True),
             ('cmd.exe /c \'if exist foo (powershell -Command "Write-Output $(git push origin main)")\'', True),
             ("cmd.exe /c 'if exist foo git status else git push origin main'", True),
+            ('cmd /c "if exist a (powershell -c Write-Output) else (git push origin main)"', False),
+            ('cmd /c "if exist a (bash -c true) else (git push origin main)"', False),
+            ('cmd /c "if exist a (powershell -NoProfile) else (git push origin main)"', False),
         ]
         for cmd, ps_flag in unsafe_child_shell_cmds:
             with self.subTest(unsafe_child_cmd=cmd, posix_shell=ps_flag):
