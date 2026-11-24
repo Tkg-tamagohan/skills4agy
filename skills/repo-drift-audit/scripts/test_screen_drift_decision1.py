@@ -18,7 +18,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from unittest import mock
 import urllib.error
@@ -267,13 +266,16 @@ class DocsModeTests(unittest.TestCase):
             )
             lock = threading.Lock()
             seen_docs: list[str] = []
+            mech_finished = threading.Event()
+            completion_order: list[str] = []
 
             def mock_opener(req: object, timeout: float = 30.0) -> _FakeHTTPResponse:
                 body = json.loads(req.data.decode("utf-8"))  # type: ignore[attr-defined]
                 doc_text = body["input"][1]["text"]
                 if "Document Path: docs/clean.md" in doc_text:
-                    # 意図的に遅延させて並列完了順をずらす
-                    time.sleep(0.05)
+                    # docs/mech.md が別ワーカーで完了するまで待機し、完了順の逆転を確定させる
+                    if not mech_finished.wait(timeout=2.0):
+                        raise TimeoutError("docs/mech.md did not complete concurrently within timeout")
                     resp = _make_docs_response(action="likely_clean", action_conf=0.95)
                 elif "Document Path: docs/broken.md" in doc_text:
                     # モデルが likely_clean を返しても missing_path_hints で安全側へ倒れること
@@ -289,7 +291,11 @@ class DocsModeTests(unittest.TestCase):
                 else:
                     resp = _make_docs_response(action="likely_clean", action_conf=0.91)
                 with lock:
-                    seen_docs.append(doc_text.splitlines()[0])
+                    header = doc_text.splitlines()[0]
+                    seen_docs.append(header)
+                    completion_order.append(header)
+                if "Document Path: docs/mech.md" in doc_text:
+                    mech_finished.set()
                 return _FakeHTTPResponse(resp)
 
             code, out, err = _run_cli(
@@ -308,6 +314,9 @@ class DocsModeTests(unittest.TestCase):
             self.assertEqual(code, 0, msg=err)
             report = json.loads(out)
             self.assertEqual(len(seen_docs), 4)
+            mech_idx = next(i for i, h in enumerate(completion_order) if "docs/mech.md" in h)
+            clean_idx = next(i for i, h in enumerate(completion_order) if "docs/clean.md" in h)
+            self.assertLess(mech_idx, clean_idx)
             self.assertEqual(
                 [r["file"] for r in report["results"]],
                 ["README.md", "docs/broken.md", "docs/clean.md", "docs/mech.md"],
@@ -574,18 +583,30 @@ class CandidatesModeTests(unittest.TestCase):
             },
         ]
 
+        c2_finished = threading.Event()
+        completion_order: list[str] = []
+        lock = threading.Lock()
+
         def mock_opener(req: object, timeout: float = 30.0) -> _FakeHTTPResponse:
             body = json.loads(req.data.decode("utf-8"))  # type: ignore[attr-defined]
             text = body["input"][0]["text"]
             if "Candidate ID: C-1" in text:
-                time.sleep(0.05)
+                if not c2_finished.wait(timeout=2.0):
+                    raise TimeoutError("C-2 did not complete concurrently within timeout")
+                with lock:
+                    completion_order.append("C-1")
                 return _FakeHTTPResponse(
                     _make_candidate_response(discuss=0.10, route="plan_worker_autonomous", route_conf=0.92)
                 )
             if "Candidate ID: C-2" in text:
+                with lock:
+                    completion_order.append("C-2")
+                c2_finished.set()
                 return _FakeHTTPResponse(
                     _make_candidate_response(discuss=0.65, route="plan_worker_discussion", route_conf=0.88)
                 )
+            with lock:
+                completion_order.append("C-3")
             return _FakeHTTPResponse(
                 _make_candidate_response(discuss=0.20, route="plan_worker_autonomous", route_conf=0.55)
             )
@@ -598,6 +619,7 @@ class CandidatesModeTests(unittest.TestCase):
         )
         self.assertEqual(code, 0, msg=err)
         report = json.loads(out)
+        self.assertLess(completion_order.index("C-2"), completion_order.index("C-1"))
         self.assertEqual([r["id"] for r in report["results"]], ["C-1", "C-2", "C-3"])
         by_id = {r["id"]: r for r in report["results"]}
         self.assertFalse(by_id["C-1"]["needs_parent_review"])

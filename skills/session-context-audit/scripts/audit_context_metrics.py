@@ -155,7 +155,7 @@ CMD_GIT_WRITE_RE = re.compile(
 )
 CMD_LINT_CHECK_RE = re.compile(
     r"(?i)(?:^|[;&|(\s])(?:ruff|flake8|mypy|pyright|eslint|prettier|tsc|biome|golangci-lint|shellcheck)\b"
-    r"|\b(?:slop_lint|check_plugin)\.py\b|\bnode\s+--check\b|\bpy_compile\b"
+    r"|\b(?:slop_lint|check_plugin|check_hygiene)\.py\b|\bnode\s+--check\b|\bpy_compile\b"
     r"|\bcargo\s+(?:check|clippy|fmt)\b"
     r"|\b(?:npm|pnpm|yarn|bun)(?:\.cmd)?\s+(?:run\s+)?(?:lint|typecheck|check|build)\b"
 )
