@@ -893,6 +893,31 @@ def _unwrap_segment_tokens(
                     results.extend(
                         _unwrap_segment_tokens(_tokenize_lossy(seg), posix_shell=posix_shell)
                     )
+    elif (
+        head.lstrip("(@{") in {"if", "then", "else", "elif", "for", "do", "while", "until"}
+        or sub_tokens[0].strip("\"'").startswith(("(", "@", "{"))
+    ):
+        destructive_or_shell_heads = (
+            SHELL_WRAPPERS
+            | CODE_EXEC_SINKS
+            | {"git", "rm", "remove-item", "ri", "del", "erase", "rmdir", "rd", "dd", "chmod", "format"}
+        )
+        for k, raw_tok in enumerate(sub_tokens):
+            stripped_tok = raw_tok.strip("\"'")
+            cleaned_tok = stripped_tok.lstrip("(@{")
+            if not cleaned_tok:
+                continue
+            cand_base = _command_basename(cleaned_tok)
+            if cand_base in destructive_or_shell_heads:
+                tail_tokens = [cleaned_tok] + list(sub_tokens[k + 1 :])
+                if stripped_tok.startswith("(") and tail_tokens[-1].endswith(")"):
+                    tail_tokens[-1] = tail_tokens[-1][:-1]
+                elif stripped_tok.startswith("{") and tail_tokens[-1].endswith("}"):
+                    tail_tokens[-1] = tail_tokens[-1][:-1]
+                if not (k == 0 and tail_tokens == sub_tokens):
+                    results.extend(_unwrap_segment_tokens(tail_tokens, posix_shell=posix_shell))
+                if cand_base in SHELL_WRAPPERS:
+                    break
     return results
 
 
@@ -2675,6 +2700,11 @@ def _configure_utf8_stdio() -> None:
     dh.configure_utf8_stdio()
 
 
+def _is_posix_host_os() -> bool:
+    """実行ホスト OS が POSIX 系かを返す（単体テストでの差し替え用ヘルパー）。"""
+    return os.name != "nt"
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -2728,7 +2758,7 @@ def main(
             artifact_dir=artifact_dir,
         )
 
-    is_posix_shell = (os.name != "nt") and (not cwd or cwd.startswith("/"))
+    is_posix_shell = _is_posix_host_os() and (not cwd or cwd.startswith("/"))
     stage1 = evaluate_stage1(
         command_line, is_teamwork=is_teamwork, cwd=cwd, posix_shell=is_posix_shell
     )

@@ -1121,7 +1121,7 @@ class TestPretoolGuard(unittest.TestCase):
                 'bash -c \'rg -F \\"\\$(git push origin main)\\" README.md\'',
                 'bash -c \'rg -F "\\$(git push origin main)" README.md\'',
             ]
-            with mock.patch("pretool_guard.os.name", "nt"):
+            with mock.patch.object(pg, "_is_posix_host_os", return_value=False):
                 for bash_cmd in bash_on_win_cmds:
                     with self.subTest(bash_on_win=bash_cmd):
                         payload_win = json.dumps(
@@ -1331,6 +1331,9 @@ class TestPretoolGuard(unittest.TestCase):
             ('cmd.exe /c "echo $(git push origin main)"', True),
             ("cmd.exe /c 'echo ok & git push origin main'", True),
             ('cmd.exe /c \'powershell -Command "Write-Output $(git push origin main)"\'', True),
+            ('cmd.exe /c \'if exist foo powershell -Command "Write-Output $(git push origin main)"\'', True),
+            ('cmd.exe /c \'if exist foo (powershell -Command "Write-Output $(git push origin main)")\'', True),
+            ("cmd.exe /c 'if exist foo git status else git push origin main'", True),
         ]
         for cmd, ps_flag in unsafe_child_shell_cmds:
             with self.subTest(unsafe_child_cmd=cmd, posix_shell=ps_flag):
@@ -1445,7 +1448,7 @@ class TestPretoolGuard(unittest.TestCase):
         self.assertIsNone(
             pg.evaluate_stage1('rg -n "class=\\"(foo|bar)\\"" docs/ > out.txt', posix_shell=True)
         )
-        with mock.patch("pretool_guard.os.name", "posix"):
+        with mock.patch.object(pg, "_is_posix_host_os", return_value=True):
             code, out, err = _run_guard_stdin(
                 'rg -n "class=\\"(foo|bar)\\"" docs/',
                 opener=fail_opener,
@@ -1479,7 +1482,7 @@ class TestPretoolGuard(unittest.TestCase):
             self.assertEqual(err_wc, "")
             self.assertGreater(win_cwd_calls, 0)
             self.assertNotEqual(out_wc["decision"], "allow")
-        with mock.patch("pretool_guard.os.name", "nt"):
+        with mock.patch.object(pg, "_is_posix_host_os", return_value=False):
             self.assertIsNone(
                 pg.evaluate_stage1('rg -n "class=\\"(foo|bar)\\"" docs/', posix_shell=False)
             )
