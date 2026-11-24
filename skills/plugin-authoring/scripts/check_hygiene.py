@@ -270,7 +270,7 @@ def _compile_gitignore_pattern(
             parts.append("(?:.*/)?")
             i += 3
         elif pat.startswith("/**", i) and i + 3 == n:
-            parts.append("(?:/.*)?")
+            parts.append("/.+")
             i += 3
         elif pat.startswith("**", i):
             parts.append(".*")

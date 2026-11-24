@@ -269,8 +269,12 @@ class TestCheckHygiene(unittest.TestCase):
                 rc, out = self.run_cli("--root", str(root))
                 self.assertEqual(rc, 0, out)
 
-                # 親ディレクトリを再包含した場合、または docs/* を使った場合は !docs/keep.md が有効になる
-                for pat in ("docs/\n!docs/\n!docs/keep.md\n", "docs/*\n!docs/keep.md\n"):
+                # 親ディレクトリを再包含した場合、または docs/* / docs/** を使った場合は !docs/keep.md が有効になる
+                for pat in (
+                    "docs/\n!docs/\n!docs/keep.md\n",
+                    "docs/*\n!docs/keep.md\n",
+                    "docs/**\n!docs/keep.md\n",
+                ):
                     (root / ".sloplintignore").write_text(
                         "\\[Draft\\].md\n./docs/draft.md\n" + pat, encoding="utf-8"
                     )
@@ -278,6 +282,29 @@ class TestCheckHygiene(unittest.TestCase):
                     self.assertEqual(rc_keep, 1, out_keep)
                     self.assertIn("docs/keep.md", out_keep)
                     self.assertNotIn("draft.md", out_keep)
+
+                # docs/** では配下サブディレクトリ（docs/sub/deep.md）を除外しつつ直下再包含（!docs/keep.md）を検査する
+                (root / "docs" / "sub").mkdir()
+                (root / "docs" / "sub" / "deep.md").write_text(
+                    "# 深層\n\n機能の追加・変更を行う。\n", encoding="utf-8"
+                )
+                if use_git:
+                    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+                    subprocess.run(
+                        ["git", "commit", "-qm", "add deep doc"],
+                        cwd=root,
+                        check=True,
+                        capture_output=True,
+                    )
+                (root / ".sloplintignore").write_text(
+                    "\\[Draft\\].md\n./docs/draft.md\ndocs/**\n!docs/keep.md\n",
+                    encoding="utf-8",
+                )
+                rc_deep, out_deep = self.run_cli("--root", str(root))
+                self.assertEqual(rc_deep, 1, out_deep)
+                self.assertIn("docs/keep.md", out_deep)
+                self.assertNotIn("docs/draft.md", out_deep)
+                self.assertNotIn("docs/sub/deep.md", out_deep)
 
         # 2. Git リポジトリのサブディレクトリを --root に指定しても .gitignore と --tracked-only が効く
         sub_repo = self.make_repo(init_git=True)
