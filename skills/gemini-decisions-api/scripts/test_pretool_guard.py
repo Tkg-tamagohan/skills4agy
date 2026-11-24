@@ -1182,6 +1182,9 @@ class TestPretoolGuard(unittest.TestCase):
                 ("for script in scripts/{pre-,post-}reboot; do printf '%s\\n' \"$script\"; done", True),
                 ("rg 'status|reboot' docs/notes\\(draft.md", True),
                 ('ForEach-Object { echo "git push origin main" }', False),
+                ('example=(git push origin main); printf \'%s\\n\' "${example[*]}"', True),
+                ('example=( git push origin main ); printf \'%s\\n\' "${example[*]}"', True),
+                ('rg -F "$(printf \'%s\' { reboot })" docs/', True),
             ]
             for cmd, ps_flag in group_and_branch_allow_cmds:
                 with self.subTest(group_allow=cmd, posix_shell=ps_flag):
@@ -1371,6 +1374,9 @@ class TestPretoolGuard(unittest.TestCase):
             ("ForEach-Object { echo a; git push origin }", False),
             ("foreach ($x in $list) { git push origin release/1.0 }", False),
             ("rg 'status|reboot' docs/notes\\\\(draft.md", True),
+            ("example=( $(git push origin main) )", True),
+            ("cat <(git push origin main)", True),
+            ("$x=(git push origin main)", False),
         ]
         for cmd, ps_flag in unsafe_child_shell_cmds:
             with self.subTest(unsafe_child_cmd=cmd, posix_shell=ps_flag):

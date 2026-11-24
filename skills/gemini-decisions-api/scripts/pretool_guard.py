@@ -451,16 +451,43 @@ def _split_top_level_segments_raw(
     return segments
 
 
+POSIX_GROUP_PREFIX_KEYWORDS = frozenset(
+    {"if", "then", "else", "elif", "do", "while", "until", "time", "!"}
+)
+
+
+def _is_posix_command_start_pos(
+    text: str, idx: int, *, extra_trailing: tuple[str, ...] = ()
+) -> bool:
+    """POSIX シェルで text[idx] がコマンド開始位置（行頭・区切り記号・制御語直後）か判定する。"""
+    before = text[:idx].rstrip()
+    if not before:
+        return True
+    trailing = (";", "|", "&", "(", "{", "\n", "\r") + extra_trailing
+    if before.endswith(trailing):
+        return True
+    return before.split()[-1].lower() in POSIX_GROUP_PREFIX_KEYWORDS
+
+
 def _is_group_brace_open(text: str, idx: int, *, posix_shell: bool) -> bool:
-    """text[idx] == '{' が単語内ブレース展開ではなくコマンドグループ/ブロック開始か判定する。"""
+    """text[idx] == '{' が単語内ブレース展開・表示引数ではなくコマンドグループ/ブロック開始か判定する。"""
     prev_ch = text[idx - 1] if idx > 0 else ""
     if prev_ch in ("$", "@"):
         return False
     if posix_shell:
-        prev_ok = idx == 0 or prev_ch.isspace() or prev_ch in ";|&({"
         next_ok = idx + 1 >= len(text) or text[idx + 1].isspace() or text[idx + 1] in "\r\n"
-        return prev_ok and next_ok
+        return next_ok and _is_posix_command_start_pos(text, idx)
     return idx == 0 or prev_ch.isspace() or prev_ch in ";|&(){"
+
+
+def _is_group_paren_open(text: str, idx: int, *, posix_shell: bool) -> bool:
+    """text[idx] == '(' が配列代入 var=(...) や変数リテラルではなく実行グループ/置換か判定する。"""
+    prev_ch = text[idx - 1] if idx > 0 else ""
+    if prev_ch in ("$", "@"):
+        return False
+    if posix_shell:
+        return _is_posix_command_start_pos(text, idx, extra_trailing=("<", ">"))
+    return True
 
 
 def _split_unquoted_top_level(command: str, *, posix_shell: bool = False) -> list[str] | None:
@@ -629,7 +656,12 @@ def _is_shell_wrapper_segment(segment: str) -> bool:
             while idx < len(tokens) and tokens[idx].startswith("-"):
                 idx += 1
             continue
-        if "=" in tokens[idx] and not tokens[idx].startswith("-") and idx + 1 < len(tokens):
+        if (
+            "=" in tokens[idx]
+            and not tokens[idx].startswith("-")
+            and idx + 1 < len(tokens)
+            and not tokens[idx].split("=", 1)[1].startswith("(")
+        ):
             idx += 1
             continue
         break
@@ -1034,7 +1066,7 @@ def _scan_group_and_flat_chunks(
             closing = ")" if ch == "(" else "}"
             if not stack:
                 is_group_open = (
-                    not (i > 0 and s[i - 1] in ("$", "@"))
+                    _is_group_paren_open(s, i, posix_shell=posix_shell)
                     if ch == "("
                     else _is_group_brace_open(s, i, posix_shell=posix_shell)
                 )
@@ -1209,7 +1241,12 @@ def _unwrap_segment_tokens(
             while idx < len(tokens) and tokens[idx].startswith("-"):
                 idx += 1
             continue
-        if "=" in tokens[idx] and not tokens[idx].startswith("-") and idx + 1 < len(tokens):
+        if (
+            "=" in tokens[idx]
+            and not tokens[idx].startswith("-")
+            and idx + 1 < len(tokens)
+            and not tokens[idx].split("=", 1)[1].startswith("(")
+        ):
             idx += 1
             continue
         break
