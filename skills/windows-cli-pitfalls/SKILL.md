@@ -144,7 +144,7 @@ PowerShell 5.1 の `Get-Content` は既定エンコーディングがシステ�
 `Start-Process -ArgumentList` へ空白を含むパス（`C:\Program Files\...` 等）をそのまま渡すと引数分割されるため、要素内を内側ダブルクォートで囲む。
 PowerShell 5.1 の `-Command` 等では `.NET` メソッド（`TcpClient.Connect` 等）が例外を投げても既定では後続文が実行され終了コード 0 になるため、冒頭で `$ErrorActionPreference = 'Stop'` を設定し `try/finally` で後処理と失敗終了を両立させる。
 また、`.NET` メソッド例外は `System.Management.Automation.MethodInvocationException` に包まれるため、リトライや原因種別の判定では `$_.Exception` 単体ではなく `.InnerException` 連鎖を展開して照合する。
-PowerShell 6/7（`pwsh`）配下や混在環境から Windows PowerShell 5.1（`powershell.exe`）を起動すると引き継いだ `PSModulePath` で `Get-Acl` や `Set-Acl` 等のセキュリティモジュール読込が壊れるため、起動直後に PS 6/7 由来パスを除去し `$PSHOME\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1` を明示インポートする。
+PowerShell 6/7（`pwsh`）配下や混在環境から Windows PowerShell 5.1（`powershell.exe`）を起動すると引き継いだ `PSModulePath` で `Get-Acl` や `Set-Acl` 等のセキュリティモジュール読込が壊れるため、起動直後に既定配置の PS 6/7 パス（独自の 5.1 モジュールパスに `PowerShell` を含む場合やカスタム配置の `pwsh` がある場合は固有パスで絞る）を除去し `$PSHOME\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1` を明示インポートする。
 
 ```powershell
 # UTF-8 読み取り / Start-Process の空白パス保護
@@ -153,7 +153,7 @@ Start-Process -FilePath $exe -ArgumentList @("--config", "`"C:\Program Files\App
 # .NET 例外で失敗終了させ、原因判定時は InnerException 連鎖を辿る
 $ErrorActionPreference = 'Stop'; $c = New-Object Net.Sockets.TcpClient
 try { $c.Connect('127.0.0.1', 8080) } finally { $c.Dispose() }
-# PS 5.1 起動時の PSModulePath 汚染を除去し Security モジュールを明示読込
+# 既定配置の PS 6/7 由来 PSModulePath を除去し Security モジュールを明示読込
 $env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '\\PowerShell(\\|$)' }) -join ';'
 Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -Force
 ```

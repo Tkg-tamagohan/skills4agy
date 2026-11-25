@@ -82,9 +82,9 @@ for name, info in needs.items():
 
 長時間のクロスプラットフォームビルドを始める前に明らかな不備を弾き、公開直前に配布物全体を検査する。
 
-1. 先頭に `preflight` ジョブを置き、対象コミット（フル `source_sha`）の確定、文書整合、タグ文字列と設定ファイルのバージョン一致（`--expect-tag`）、署名秘密鍵 Secrets の非空を数秒で確認する。
-   後続の全ジョブの `actions/checkout` は確定した `source_sha` へ固定し、本番リリース時はタグが指すコミットとの一致検証および署名タグ検証（`--verify-tag` 等）を強制する。
-2. `dry_run` 経路では本番署名鍵を使わず専用のテスト鍵識別子（例: `--key-id dry-run-test`）を明示し、成果物の非信頼境界と本番公開ジョブへの非流入条件を明記する。
+1. 先頭に `preflight` ジョブを置き、対象コミット（フル `source_sha`）の確定、文書整合、タグ文字列と設定ファイルのバージョン一致（`--expect-tag`）を数秒で確認し、本番リリース経路では本番署名秘密鍵 Secrets の非空を検証する。
+   後続の全ジョブの `actions/checkout` は確定した `source_sha` へ固定し、本番リリース時はタグが指すコミットとの一致検証と `git verify-tag` 等によるタグ署名検証を行い、公開時は `gh release create --verify-tag` でリモートタグ実在を確認する。
+2. `dry_run` 経路では本番署名秘密鍵 Secrets を参照も検査もせず、専用のテスト鍵識別子（例: `--key-id dry-run-test`）とテスト鍵の存在確認だけを使い、成果物の非信頼境界と本番公開ジョブへの非流入条件を明記する。
 3. Linux と Windows が混在するビルドマトリクスでの共通スクリプト検査には `shell: bash` を明示し、Windows 固有のリリース／インストーラスクリプト検証は `windows-latest` でも実行する。
 4. `gh release create` や `gh release upload` の直前で検証スクリプトを実行し、署名中間ファイル（`.sig` 等）や廃止拡張子の非残存、自動更新マニフェスト（`latest.json` 等）のバージョン一致と成果物実在、パッケージ内へのテスト混入なしを確認する。
 5. 既存リリースのアセット削除では `for x in $names` による空白分割を避け、`while IFS= read -r name` で 1 行ずつ処理する。
