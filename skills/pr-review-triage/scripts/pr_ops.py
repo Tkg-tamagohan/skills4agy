@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import difflib
 import json
 import os
 from pathlib import Path
@@ -59,7 +60,6 @@ REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 SAFE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-SAFE_BASE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/~^-]*$")
 DEFAULT_EXCLUDE_LOCKS = (
     "Cargo.lock",
     "package-lock.json",
@@ -836,29 +836,53 @@ def handle_status(args: argparse.Namespace, *, runner: CommandRunner) -> int:
     return devin_code
 
 
-def _validate_base_ref(base_ref: str) -> str:
+def _resolve_base_commit(base_ref: str, cwd: Path, runner: CommandRunner) -> str:
+    """--base 引数のオプション注入を拒否し、Git 上の単一コミット SHA へ解決する。"""
     cleaned = (base_ref or "").strip()
-    if not cleaned or cleaned.startswith("-") or ".." in cleaned or not SAFE_BASE_REF_RE.fullmatch(cleaned):
+    if (
+        not cleaned
+        or cleaned.startswith("-")
+        or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in cleaned)
+    ):
         raise PrOpsError("invalid_base_ref", f"安全でない --base 参照です: {base_ref}")
-    return cleaned
+    res = runner(
+        ["git", "rev-parse", "--verify", "--end-of-options", f"{cleaned}^{{commit}}"],
+        cwd,
+        None,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        raise PrOpsError(
+            "invalid_base_ref",
+            f"--base '{cleaned}' を有効なコミットとして解決できません: {_mask(res.stderr.strip())}",
+        )
+    resolved = res.stdout.strip()
+    if not COMMIT_SHA_RE.fullmatch(resolved):
+        raise PrOpsError("invalid_base_ref", f"--base の解決結果が不正です: {resolved}")
+    return resolved
 
 
-def _format_untracked_file_diff(rel_posix: str, file_path: Path) -> str | None:
-    """未追跡の新規テキストファイルを unified diff セクションへ整形する。"""
+def _read_untracked_text(rel_posix: str, file_path: Path) -> tuple[str | None, str | None]:
+    """未追跡ファイルを検査付きで読み込む。(text, skip_reason) を返す。"""
     base_name = rel_posix.rsplit("/", 1)[-1]
     if base_name in DEFAULT_EXCLUDE_LOCKS:
-        return None
-    if _is_reparse_or_symlink(file_path) or not file_path.is_file():
-        return None
+        return None, None
+    if _is_reparse_or_symlink(file_path):
+        return None, "symlink"
+    if not file_path.is_file():
+        return None, "not_regular_file"
     try:
         if file_path.stat().st_size > MAX_FILE_SECRET_SCAN_BYTES:
-            return None
+            return None, "exceeds_2MiB_limit"
         raw = file_path.read_bytes()
     except OSError:
-        return None
+        return None, "read_error"
     if b"\x00" in raw:
-        return None
-    text = raw.decode("utf-8", errors="replace")
+        return None, "binary"
+    return raw.decode("utf-8", errors="replace"), None
+
+
+def _format_untracked_file_diff(rel_posix: str, text: str) -> str:
+    """未追跡の新規テキストファイルを unified diff セクションへ整形する。"""
     lines = text.splitlines()
     if not lines:
         return (
@@ -877,16 +901,77 @@ def _format_untracked_file_diff(rel_posix: str, file_path: Path) -> str | None:
     return header + "\n".join(f"+{line}" for line in lines) + "\n"
 
 
-def _build_combined_worktree_diff(base_ref: str, cwd: Path, runner: CommandRunner) -> str | None:
-    """作業ツリーに未コミット変更がある場合、リポジトリルート基準で merge-base(base, HEAD) からの統合 diff（未追跡含む）を返す。"""
-    safe_base = _validate_base_ref(base_ref)
+def _format_replaced_file_diff(rel_posix: str, base_text: str, new_text: str) -> str | None:
+    """ベースに存在したファイル（削除コミット後に再作成）の差分を unified diff として生成する。"""
+    if base_text == new_text:
+        return None
+    base_lines = base_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+    udiff = list(
+        difflib.unified_diff(
+            base_lines,
+            new_lines,
+            fromfile=f"a/{rel_posix}",
+            tofile=f"b/{rel_posix}",
+            n=15,
+        )
+    )
+    if not udiff:
+        return None
+    return f"diff --git a/{rel_posix} b/{rel_posix}\n" + "".join(udiff)
+
+
+def _filter_out_deleted_sections(diff_text: str, replaced_paths: set[str]) -> str:
+    """統合 diff から、未追跡ファイルにより再作成されたパスの削除セクションを除く。"""
+    if not diff_text or not replaced_paths:
+        return diff_text
+    sections: list[list[str]] = []
+    current: list[str] = []
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current:
+                sections.append(current)
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        sections.append(current)
+
+    kept: list[str] = []
+    for sec in sections:
+        header = sec[0].rstrip("\r\n")
+        deleted_path = ""
+        is_deleted = False
+        for ln in sec[1:10]:
+            if ln.startswith("+++ /dev/null"):
+                is_deleted = True
+            elif ln.startswith("--- a/"):
+                deleted_path = ln[6:].rstrip("\r\n")
+        if not deleted_path and header.startswith("diff --git a/"):
+            parts = header.split(" b/", 1)
+            if len(parts) == 2:
+                deleted_path = parts[0][len("diff --git a/") :]
+        if is_deleted and deleted_path in replaced_paths:
+            continue
+        kept.append("".join(sec))
+    return "".join(kept)
+
+
+def _build_combined_worktree_diff(
+    resolved_base_sha: str, cwd: Path, runner: CommandRunner
+) -> tuple[str | None, list[str]]:
+    """作業ツリーに未コミット変更がある場合、リポジトリルート基準の統合 diff（未追跡含む）とスキップ一覧を返す。"""
     top_res = runner(["git", "rev-parse", "--show-toplevel"], cwd, None)
     git_cwd = Path(top_res.stdout.strip()) if top_res.returncode == 0 and top_res.stdout.strip() else cwd
-    status_res = runner(["git", "-c", "core.quotePath=false", "status", "--porcelain"], git_cwd, None)
+    status_res = runner(
+        ["git", "-c", "core.quotePath=false", "status", "--porcelain", "--untracked-files=normal"],
+        git_cwd,
+        None,
+    )
     if status_res.returncode != 0 or not status_res.stdout.strip():
-        return None
-    mb_res = runner(["git", "merge-base", safe_base, "HEAD"], git_cwd, None)
-    diff_base = mb_res.stdout.strip() if mb_res.returncode == 0 and mb_res.stdout.strip() else safe_base
+        return None, []
+    mb_res = runner(["git", "merge-base", resolved_base_sha, "HEAD"], git_cwd, None)
+    diff_base = mb_res.stdout.strip() if mb_res.returncode == 0 and mb_res.stdout.strip() else resolved_base_sha
     if diff_base.startswith("-"):
         raise PrOpsError("invalid_base_ref", f"安全でない merge-base 結果です: {diff_base}")
     diff_cmd = [
@@ -903,31 +988,62 @@ def _build_combined_worktree_diff(base_ref: str, cwd: Path, runner: CommandRunne
     ]
     diff_res = runner(diff_cmd, git_cwd, None)
     if diff_res.returncode != 0:
-        return None
+        return None, []
 
-    chunks = [diff_res.stdout] if diff_res.stdout else []
+    tracked_diff = diff_res.stdout or ""
+    skipped_untracked: list[str] = []
+    extra_sections: list[str] = []
+
     untracked_res = runner(
-        ["git", "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "--", "."],
+        ["git", "-c", "core.quotePath=false", "ls-files", "-z", "--others", "--exclude-standard", "--", "."],
         git_cwd,
         None,
     )
-    if untracked_res.returncode == 0 and untracked_res.stdout.strip():
-        for raw_rel in untracked_res.stdout.splitlines():
-            rel_posix = raw_rel.strip().replace("\\", "/")
-            if not rel_posix:
-                continue
-            section = _format_untracked_file_diff(rel_posix, git_cwd / rel_posix)
-            if section:
-                chunks.append(section)
+    untracked_paths: list[str] = []
+    if untracked_res.returncode == 0 and untracked_res.stdout:
+        untracked_paths = [
+            raw.replace("\\", "/") for raw in untracked_res.stdout.split("\x00") if raw
+        ]
 
-    return "\n".join(chunks)
+    base_paths: set[str] = set()
+    if untracked_paths:
+        tree_res = runner(["git", "-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", "-z", diff_base], git_cwd, None)
+        if tree_res.returncode == 0 and tree_res.stdout:
+            base_paths = {p.replace("\\", "/") for p in tree_res.stdout.split("\x00") if p}
+
+    replaced_paths: set[str] = set()
+    for rel_posix in untracked_paths:
+        text, skip_reason = _read_untracked_text(rel_posix, git_cwd / rel_posix)
+        if text is None:
+            if skip_reason is not None:
+                skipped_untracked.append(f"{rel_posix} ({skip_reason})")
+            continue
+        if rel_posix in base_paths:
+            blob_res = runner(["git", "show", f"{diff_base}:{rel_posix}"], git_cwd, None)
+            if blob_res.returncode == 0:
+                replaced_paths.add(rel_posix)
+                sec = _format_replaced_file_diff(rel_posix, blob_res.stdout, text)
+                if sec:
+                    extra_sections.append(sec)
+                continue
+        extra_sections.append(_format_untracked_file_diff(rel_posix, text))
+
+    if replaced_paths:
+        tracked_diff = _filter_out_deleted_sections(tracked_diff, replaced_paths)
+
+    chunks = [tracked_diff] if tracked_diff else []
+    chunks.extend(extra_sections)
+    return "\n".join(chunks), skipped_untracked
 
 
 def handle_invariant_check(args: argparse.Namespace, *, runner: CommandRunner) -> int:
     cwd = _resolve_cwd(args.cwd)
-    safe_base = _validate_base_ref(args.base)
     for extra_rule in args.rules or []:
         _validate_non_secret_path(extra_rule, "--rules", cwd=cwd)
+
+    top_res = runner(["git", "rev-parse", "--show-toplevel"], cwd, None)
+    git_cwd = Path(top_res.stdout.strip()) if top_res.returncode == 0 and top_res.stdout.strip() else cwd
+    resolved_base_sha = _resolve_base_commit(args.base, git_cwd, runner)
 
     if args.pr_json:
         pr_data = _read_json_file_checked(args.pr_json, "--pr-json", cwd=cwd, forbid_ufffd=False)
@@ -944,8 +1060,16 @@ def handle_invariant_check(args: argparse.Namespace, *, runner: CommandRunner) -
         )
 
     combined_diff: str | None = None
+    skipped_untracked: list[str] = []
     if not getattr(args, "committed_only", False):
-        combined_diff = _build_combined_worktree_diff(safe_base, cwd, runner)
+        combined_diff, skipped_untracked = _build_combined_worktree_diff(resolved_base_sha, cwd, runner)
+
+    if skipped_untracked:
+        sys.stderr.write(
+            "[WARN] 未追跡ファイルを検査対象外としました（サイズ上限超過・バイナリ・リンク等）: "
+            + ", ".join(skipped_untracked)
+            + "\n"
+        )
 
     with tempfile.TemporaryDirectory(prefix="pr_ops_inv_") as tmpdir:
         cmd = [
@@ -959,7 +1083,7 @@ def handle_invariant_check(args: argparse.Namespace, *, runner: CommandRunner) -
             _write_utf8_file(diff_path, combined_diff)
             cmd.extend(["--diff-file", str(diff_path)])
         else:
-            cmd.extend(["--base", safe_base])
+            cmd.extend(["--base", resolved_base_sha])
 
         all_rules: list[str] = [
             str(_resolve_path_from_cwd(extra_rule, cwd)) for extra_rule in (args.rules or [])

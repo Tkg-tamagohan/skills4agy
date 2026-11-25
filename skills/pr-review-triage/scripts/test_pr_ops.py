@@ -310,6 +310,8 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
                 return pr_ops.CmdResult(0, "", "")
             if cmd[:3] == ["git", "rev-parse", "--show-toplevel"]:
                 return pr_ops.CmdResult(0, str(cwd), "")
+            if cmd[:3] == ["git", "rev-parse", "--verify"]:
+                return pr_ops.CmdResult(0, "deadbeef1234567890abcdef1234567890abcdef\n", "")
             if len(cmd) >= 2 and cmd[1].endswith("check_invariants_decision1.py"):
                 observed_cmd = list(cmd)
                 rules_idx = cmd.index("--rules")
@@ -358,6 +360,8 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
             nonlocal observed_cmd, observed_diff
             if cmd[:3] == ["git", "rev-parse", "--show-toplevel"]:
                 return pr_ops.CmdResult(0, str(cwd), "")
+            if cmd[:3] == ["git", "rev-parse", "--verify"]:
+                return pr_ops.CmdResult(0, "deadbeef1234567890abcdef1234567890abcdef\n", "")
             if cmd[:4] == ["git", "-c", "core.quotePath=false", "status"]:
                 return pr_ops.CmdResult(0, " M app.py\n", "")
             if cmd[:2] == ["git", "merge-base"]:
@@ -498,6 +502,85 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
             )
             self.assertEqual(code, 0, stderr)
             self.assertEqual(reverted_diff.strip(), "")
+
+            # 4. status.showUntrackedFiles=no でも未追跡新規ファイル・先頭空白ファイル・2MiB超スキップ警告を検証
+            subprocess.run(["git", "-C", str(work), "checkout", "--", "temp_commit.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "config", "status.showUntrackedFiles", "no"], check=True, capture_output=True)
+            (work / " leading_space.py").write_text("lead = 1\n", encoding="utf-8", newline="\n")
+            (work / "oversize.txt").write_bytes(b"a" * (pr_ops.MAX_FILE_SECRET_SCAN_BYTES + 10))
+            captured_untracked = ""
+
+            def untracked_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+                nonlocal captured_untracked
+                if len(cmd) >= 2 and cmd[1].endswith("check_invariants_decision1.py"):
+                    captured_untracked = Path(cmd[cmd.index("--diff-file") + 1]).read_text(encoding="utf-8")
+                    return pr_ops.CmdResult(0, json.dumps({"status": "dry_run"}), "")
+                return pr_ops._default_runner(cmd, cwd, input_text)
+
+            code, _, err_untracked = _run_cli_capture(
+                ["invariant-check", "--pr-json", str(pr_json), "--cwd", str(work), "--base", prev_sha, "--dry-run"],
+                runner=untracked_runner,
+            )
+            self.assertEqual(code, 0, err_untracked)
+            self.assertIn(" leading_space.py", captured_untracked)
+            self.assertIn("oversize.txt (exceeds_2MiB_limit)", err_untracked)
+            (work / " leading_space.py").unlink()
+            (work / "oversize.txt").unlink()
+            subprocess.run(["git", "-C", str(work), "config", "--unset", "status.showUntrackedFiles"], check=True, capture_output=True)
+
+            # 5. 削除をコミット済みのファイルを元と同じ内容で作り直した場合は削除・追加の重複が出ない
+            (work / "recreated.py").write_text("orig = 1\n", encoding="utf-8", newline="\n")
+            subprocess.run(["git", "-C", str(work), "add", "recreated.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "commit", "-m", "add recreated"], check=True, capture_output=True)
+            base_with_rec = subprocess.run(
+                ["git", "-C", str(work), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(["git", "-C", str(work), "rm", "recreated.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "commit", "-m", "rm recreated"], check=True, capture_output=True)
+            (work / "recreated.py").write_text("orig = 1\n", encoding="utf-8", newline="\n")
+            rec_same_diff = "NOT_SET"
+
+            def rec_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+                nonlocal rec_same_diff
+                if len(cmd) >= 2 and cmd[1].endswith("check_invariants_decision1.py"):
+                    rec_same_diff = Path(cmd[cmd.index("--diff-file") + 1]).read_text(encoding="utf-8")
+                    return pr_ops.CmdResult(0, json.dumps({"status": "skipped_empty_diff"}), "")
+                return pr_ops._default_runner(cmd, cwd, input_text)
+
+            code, _, stderr = _run_cli_capture(
+                ["invariant-check", "--pr-json", str(pr_json), "--cwd", str(work), "--base", base_with_rec, "--dry-run"],
+                runner=rec_runner,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(rec_same_diff.strip(), "")
+
+            # 内容が変わった場合は削除＋新規ではなく通常の変更 diff になる
+            (work / "recreated.py").write_text("orig = 2\n", encoding="utf-8", newline="\n")
+            code, _, stderr = _run_cli_capture(
+                ["invariant-check", "--pr-json", str(pr_json), "--cwd", str(work), "--base", base_with_rec, "--dry-run"],
+                runner=rec_runner,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertNotIn("deleted file mode", rec_same_diff)
+            self.assertNotIn("new file mode", rec_same_diff)
+            self.assertIn("+orig = 2", rec_same_diff)
+            (work / "recreated.py").unlink()
+
+            # 6. _release など有効な Git ブランチ名を --base に指定して --committed-only 有無とも動作する
+            subprocess.run(["git", "-C", str(work), "branch", "_release", base_with_rec], check=True, capture_output=True)
+            for extra in ([], ["--committed-only"]):
+                code, _, stderr = _run_cli_capture(
+                    ["invariant-check", "--pr-json", str(pr_json), "--cwd", str(work), "--base", "_release", *extra, "--dry-run"],
+                    runner=lambda c, cw, inp: (
+                        pr_ops.CmdResult(0, json.dumps({"status": "dry_run"}), "")
+                        if len(c) >= 2 and c[1].endswith("check_invariants_decision1.py")
+                        else pr_ops._default_runner(c, cw, inp)
+                    ),
+                )
+                self.assertEqual(code, 0, stderr)
 
 
 class TestPrOpsApplyTriage(unittest.TestCase):
@@ -922,6 +1005,77 @@ class TestPrOpsApplyTriage(unittest.TestCase):
             )
             self.assertEqual(code, 0, stderr)
             self.assertTrue(json.loads(stdout)["ok"])
+
+    def test_apply_triage_fork_fallback_resolves_origin_pr_when_implicit_gh_fails(self) -> None:
+        observed_cmds: list[list[str]] = []
+
+        def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+            observed_cmds.append(cmd)
+            if cmd[:3] == ["gh", "pr", "view"] and "--repo" not in cmd:
+                return pr_ops.CmdResult(1, "", "no pull requests found for branch")
+            if cmd[:4] == ["git", "remote", "get-url", "origin"]:
+                return pr_ops.CmdResult(0, "https://github.com/fork-user/repo.git\n", "")
+            if cmd[:3] == ["git", "branch", "--show-current"]:
+                return pr_ops.CmdResult(0, "feat/shared-name\n", "")
+            if cmd[:3] == ["gh", "pr", "view"] and "--repo" in cmd:
+                if "number" == cmd[cmd.index("--json") + 1]:
+                    return pr_ops.CmdResult(0, json.dumps({"number": 88}), "")
+                return pr_ops.CmdResult(
+                    0,
+                    json.dumps(
+                        {
+                            "headRefOid": "1234567890abcdef1234567890abcdef12345678",
+                            "body": "",
+                            "comments": [],
+                            "reviews": [],
+                        }
+                    ),
+                    "",
+                )
+            if cmd[:3] == ["gh", "api", "graphql"]:
+                payload = json.loads(input_text or "{}")
+                q = payload.get("query") or ""
+                if "reviewThreads" in q:
+                    self.assertEqual(payload["variables"]["owner"], "fork-user")
+                    self.assertEqual(payload["variables"]["number"], 88)
+                    return pr_ops.CmdResult(
+                        0,
+                        json.dumps(
+                            {
+                                "data": {
+                                    "repository": {
+                                        "pullRequest": {
+                                            "headRefOid": "1234567890abcdef1234567890abcdef12345678",
+                                            "reviewThreads": {
+                                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                "nodes": [{"id": "PRRT_fork_1234"}],
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        ),
+                        "",
+                    )
+                if "resolveReviewThread" in q:
+                    return pr_ops.CmdResult(0, json.dumps({"data": {"resolveReviewThread": {"thread": {"id": "PRRT_fork_1234", "isResolved": True}}}}), "")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            plan_path.write_text(json.dumps({"resolve_only": ["PRRT_fork_1234"]}), encoding="utf-8")
+            code, stdout, stderr = _run_cli_capture(
+                ["apply-triage", "--cwd", tmp, "--plan", str(plan_path), "--no-verify"],
+                runner=fake_runner,
+            )
+            self.assertEqual(code, 0, stderr)
+            out = json.loads(stdout)
+            self.assertEqual(out["repo"], "fork-user/repo")
+            self.assertEqual(out["pr_number"], 88)
+            self.assertIn(
+                ["gh", "pr", "view", "feat/shared-name", "--repo", "fork-user/repo", "--json", "number"],
+                observed_cmds,
+            )
 
 
 class TestPrOpsCommitPush(unittest.TestCase):
