@@ -34,8 +34,9 @@ if (-not $hasExpectedSid) {
 
 ## Windows ランナーでの配布検証スクリプト試験
 
-パッケージ組み立てや署名検証を行う補助スクリプトの単体テストを Linux ランナーだけで実行すると、パス区切り文字の違い、既定ロケール（cp932 等）での UTF-8 読み書き失敗、および閉じ忘れたファイルハンドルによる一時ファイル削除失敗を見逃す。
-配布スクリプトの構文検査と単体テストは `github-actions-ci` に従い、`windows-latest` ランナー上でも厳格警告モード（例として Python の `python -W error -m unittest`）で実行し、`ResourceWarning` やエンコーディング不整合を CI 段階で早期検出する。
+パッケージ組み立てや署名検証を行う補助スクリプトの単体テストを Linux ランナーだけで実行すると、パス区切り文字の違い、既定ロケール（cp932 等）での UTF-8 読み書き失敗、および閉じ忘れたファイルハンドルによる一時ファイル削除失敗（`PermissionError`）を見逃す。
+配布スクリプトの構文検査と単体テストは `github-actions-ci` に従い、`windows-latest` ランナー上でも厳格警告モード（例として Python の `python -W error -m unittest`）で実行し、直接発火する警告やエンコーディング不整合を CI 段階で早期検出する。
+なお Python の `-W error` だけではファイル破棄時（`__del__`）の `ResourceWarning` が `sys.unraisablehook` へ送られて `unittest` が合格扱いになるため、閉じ忘れは `with` 文を徹底したうえで `windows-latest` 上の一時ディレクトリ削除時のファイルロック失敗または `sys.unraisablehook` 検証で捕捉する。
 
 ## 原則
 

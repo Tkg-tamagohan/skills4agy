@@ -89,7 +89,7 @@ for name, info in needs.items():
 3. Linux と Windows が混在するビルドマトリクスでの共通スクリプト検査には `shell: bash` を明示し、Windows 固有のリリース／インストーラスクリプト検証は `windows-latest` でも実行する。
 4. `gh release create` や `gh release upload` の直前で検証スクリプトを実行し、署名中間ファイル（`.sig` 等）や廃止拡張子の非残存、自動更新マニフェスト（`latest.json` 等）のバージョン一致と成果物実在、パッケージ内へのテスト混入なしを確認する。
 5. 既存リリースのアセット削除では `for x in $names` による空白分割を避け、`while IFS= read -r name` で 1 行ずつ処理する。
-6. 本番公開は `gh release view` で既存の公開済みリリース上書きを拒否したうえで `gh release create --draft` を作成し、実体成果物とチェックサムを先にアップロードし、参照元となるインデックスやメタデータ（更新マニフェスト、パッケージインデックス等）を末尾にアップロードしてから `gh release edit --draft=false` で公開する。
+6. 本番公開は `gh release view <tag>` で既存の公開済みリリース上書きを拒否したうえで `gh release create <tag> --draft` を作成し、実体成果物とチェックサムを先にアップロードし、参照元となるインデックスやメタデータ（更新マニフェスト、パッケージインデックス等）を末尾にアップロードしてから `gh release edit <tag> --draft=false` で公開する。
 
 ## 脆弱性監査の定期分離と重大度管理
 
