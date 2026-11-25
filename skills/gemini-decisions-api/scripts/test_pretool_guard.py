@@ -1191,6 +1191,12 @@ class TestPretoolGuard(unittest.TestCase):
                 ("echo coproc { git push origin main }", True),
                 ("echo time { git push origin main }", True),
                 ('echo "a; function f" { git push origin main }', True),
+                ("if ! { rg -F 'ready | reboot' docs/; }; then echo 'No match'; fi", True),
+                ("if \\\n! { rg -F 'ready | reboot' docs/; }; then echo 'No match'; fi", True),
+                ("if \\\r\n! { rg -F 'ready | reboot' docs/; }; then echo 'No match'; fi", True),
+                ("echo 'if \\\n!' { git push origin main }", True),
+                ("echo [[ -n x ]] then { git push origin main }", True),
+                ("if (true) then echo time { git push origin main }; fi", True),
             ]
             for cmd, ps_flag in group_and_branch_allow_cmds:
                 with self.subTest(group_allow=cmd, posix_shell=ps_flag):
@@ -1392,6 +1398,12 @@ class TestPretoolGuard(unittest.TestCase):
             ("FOO=(a b) git push origin main", True),
             ("function f () { git push origin main; }; f", True),
             ("if true; then coproc (git push origin main); fi", True),
+            ("if (true) then { git push origin main; }; fi", True),
+            ("while (true) do { rm -rf ~/proj; }; done", True),
+            ("if [[ -n x ]] then { git push origin main; }; fi", True),
+            ("if [[ ( -n x ) ]] then { git push origin main; }; fi", True),
+            ("if (( 1 )) then { git push origin main; }; fi", True),
+            ("if { true; } then { git push origin main; }; fi", True),
         ]
         for cmd, ps_flag in unsafe_child_shell_cmds:
             with self.subTest(unsafe_child_cmd=cmd, posix_shell=ps_flag):

@@ -456,20 +456,74 @@ POSIX_GROUP_PREFIX_KEYWORDS = frozenset(
 )
 
 
+def _strip_posix_line_continuations(text: str) -> str:
+    """単一引用外（非引用・二重引用内）の POSIX 行継続（\\+LF / \\+CRLF）を除去する。"""
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_single:
+            out.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 2 < n and text[i + 1 : i + 3] == "\r\n":
+                i += 3
+                continue
+            if i + 1 < n and text[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 1 < n:
+                out.append(ch)
+                out.append(text[i + 1])
+                i += 2
+                continue
+        if not in_double and ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = not in_double
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _is_posix_prefix_at_command_start(prefix: str) -> bool:
+    """現在コマンドの接頭辞（制御語・前置代入）だけがグループ直前にあるか判定する。"""
+    stripped = prefix.strip()
+    if not stripped:
+        return True
+    cur = _strip_leading_assignments_text(stripped, posix_shell=True)
+    words = cur.split()
+    if not words:
+        return False
+    while words and words[0].lower() in POSIX_GROUP_PREFIX_KEYWORDS:
+        words.pop(0)
+    return not words
+
+
 def _is_posix_command_start_pos(
     text: str, idx: int, *, extra_trailing: tuple[str, ...] = ()
 ) -> bool:
     """POSIX シェルで text[idx] がコマンド開始位置（行頭・区切り記号・制御語・関数定義直後）か判定する。"""
-    if idx < len(text) and text[idx] == "(" and idx > 0 and text[idx - 1] == "=":
+    raw_before = _strip_posix_line_continuations(text[:idx])
+    if idx < len(text) and text[idx] == "(" and raw_before.endswith("="):
         return False
-    before = text[:idx].rstrip()
+    before = raw_before.rstrip(" \t")
     if not before:
         return True
     trailing = (";", "|", "&", "(", "{", "\n", "\r") + extra_trailing
     if before.endswith(trailing):
         return True
     last_sep = -1
-    group_stack: list[tuple[str, int]] = []
+    group_stack: list[tuple[str, int, bool]] = []
+    in_double_bracket = False
+    db_prev_sep = -1
+    db_is_compound = False
     in_single = False
     in_double = False
     pos = 0
@@ -493,12 +547,54 @@ def _is_posix_command_start_pos(
                 in_single = True
             elif ch == '"':
                 in_double = True
-            elif ch in ("(", "{"):
-                group_stack.append((")" if ch == "(" else "}", last_sep))
+            elif (
+                not in_double_bracket
+                and before[pos : pos + 2] == "[["
+                and (pos == 0 or before[pos - 1].isspace() or before[pos - 1] in ";|&(")
+                and (pos + 2 >= n or before[pos + 2].isspace())
+            ):
+                in_double_bracket = True
+                db_prev_sep = last_sep
+                db_is_compound = _is_posix_prefix_at_command_start(
+                    before[last_sep + 1 : pos]
+                )
+                last_sep = pos + 1
+                pos += 2
+                continue
+            elif (
+                in_double_bracket
+                and before[pos : pos + 2] == "]]"
+                and (pos == 0 or before[pos - 1].isspace())
+                and (pos + 2 >= n or before[pos + 2].isspace() or before[pos + 2] in ";|&)")
+            ):
+                in_double_bracket = False
+                last_sep = pos + 1 if db_is_compound else db_prev_sep
+                pos += 2
+                continue
+            elif not in_double_bracket and ch == "(":
+                prev_ch = before[pos - 1] if pos > 0 else ""
+                is_compound = (
+                    False
+                    if prev_ch in ("$", "@", "=")
+                    else _is_posix_prefix_at_command_start(before[last_sep + 1 : pos])
+                )
+                group_stack.append((")", last_sep, is_compound))
                 last_sep = pos
-            elif group_stack and ch == group_stack[-1][0]:
-                _, last_sep = group_stack.pop()
-            elif ch in (";", "|", "&", "\n", "\r"):
+            elif (
+                not in_double_bracket
+                and ch == "{"
+                and (pos == 0 or before[pos - 1] not in ("$", "@"))
+                and (pos + 1 >= n or before[pos + 1].isspace() or before[pos + 1] in "\r\n")
+            ):
+                is_compound = _is_posix_prefix_at_command_start(
+                    before[last_sep + 1 : pos]
+                )
+                group_stack.append(("}", last_sep, is_compound))
+                last_sep = pos
+            elif not in_double_bracket and group_stack and ch == group_stack[-1][0]:
+                _, prev_sep, is_compound = group_stack.pop()
+                last_sep = pos if is_compound else prev_sep
+            elif not in_double_bracket and ch in (";", "|", "&", "\n", "\r"):
                 last_sep = pos
         pos += 1
     cur = _strip_leading_assignments_text(
@@ -528,7 +624,16 @@ def _is_group_brace_open(text: str, idx: int, *, posix_shell: bool) -> bool:
     if prev_ch in ("$", "@"):
         return False
     if posix_shell:
-        next_ok = idx + 1 >= len(text) or text[idx + 1].isspace() or text[idx + 1] in "\r\n"
+        k = idx + 1
+        while k < len(text) and text[k] == "\\":
+            if k + 2 < len(text) and text[k + 1 : k + 3] == "\r\n":
+                k += 3
+                continue
+            if k + 1 < len(text) and text[k + 1] == "\n":
+                k += 2
+                continue
+            break
+        next_ok = k >= len(text) or text[k].isspace() or text[k] in "\r\n"
         return next_ok and _is_posix_command_start_pos(text, idx)
     return idx == 0 or prev_ch.isspace() or prev_ch in ";|&(){"
 
@@ -565,11 +670,16 @@ def _split_unquoted_top_level(command: str, *, posix_shell: bool = False) -> lis
             i += 1
             continue
 
-        if posix_shell and ch == "\\" and i + 1 < n:
-            buf.append(ch)
-            buf.append(command[i + 1])
-            i += 2
-            continue
+        if posix_shell and ch == "\\":
+            if i + 2 < n and command[i + 1 : i + 3] == "\r\n":
+                buf.append(command[i : i + 3])
+                i += 3
+                continue
+            if i + 1 < n:
+                buf.append(ch)
+                buf.append(command[i + 1])
+                i += 2
+                continue
 
         if ch in ("'", '"'):
             quote = ch
@@ -896,9 +1006,13 @@ def _find_matching_paren_subst(text: str, start: int, *, posix_shell: bool = Fal
                 quote = None
             i += 1
             continue
-        if posix_shell and ch == "\\" and i + 1 < n:
-            i += 2
-            continue
+        if posix_shell and ch == "\\":
+            if i + 2 < n and text[i + 1 : i + 3] == "\r\n":
+                i += 3
+                continue
+            if i + 1 < n:
+                i += 2
+                continue
         if ch in ("'", '"'):
             quote = ch
             i += 1
@@ -1182,9 +1296,13 @@ def _scan_group_and_flat_chunks(
                 quote = None
             i += 1
             continue
-        if posix_shell and ch == "\\" and i + 1 < n:
-            i += 2
-            continue
+        if posix_shell and ch == "\\":
+            if i + 2 < n and s[i + 1 : i + 3] == "\r\n":
+                i += 3
+                continue
+            if i + 1 < n:
+                i += 2
+                continue
         if ch in ("'", '"'):
             quote = ch
             i += 1
