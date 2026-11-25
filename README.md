@@ -40,6 +40,7 @@ Antigravity セッション全体で共有するルールとスキルをまと�
 | `pr-review-triage` | PR レビュー指摘の実物照合トリアージ、統合 PR 運用 CLI（`pr_ops.py`）、Decision 1 一次プリラベル CLI、PR 内再発防止策の引き継ぎと `invariant-gate` 連携 CLI、複数セッション分別、未 Resolve スレッド整理、Stage 3 後の Devin Review 状態確認と再トリガ CLI、および事後検証の手順 |
 | `repo-drift-audit` | リポジトリの文書、スキル、テストとコードの乖離や重複を Decision 1 一次スクリーニングと 2 段サブエージェントで監査する手順 |
 | `requirements-definition` | 要件定義書や仕様書のレビュー、協議、決定記録、実装計画への分解を進める手順 |
+| `rust-release-distribution` | Rust アプリの安全なリリース配布、Ed25519 署名検証、2 段階鍵ローテーション、フェイルクローズ自己更新、Windows パッケージング罠、リリースランブックの設計手順 |
 | `session-context-audit` | 過去セッションの transcript.jsonl を横断解析し、コンテキスト消費、キャッシュヒット率、ルール遵守、品質代理指標の前後比較と Decision 1 タスク層別診断を行う手順と CLI |
 | `session-handoff` | 現在のセッションを軽量に区切り、Decision 1 による重要ステップ事前選別 CLI を使い、引き継ぎメモと再開プロンプトで次セッションへ渡す手順 |
 | `spec-cold-review` | 実装前の仕様書や計画書を履歴ゼロの視点で監査する手順、Heilmeier と TRIZ の観点、Decision 1 事前検査プリセット |

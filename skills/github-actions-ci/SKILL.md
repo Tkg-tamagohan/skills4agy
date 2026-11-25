@@ -1,6 +1,6 @@
 ---
 name: github-actions-ci
-description: GitHub Actions の CI、リリース、定期セキュリティ監査の設計と監査手順。必須チェックを壊さない変更判定スキップ、権限最小化、リネーム検出や除外対象の盲点対策を扱い、CI やリリースワークフローを構築、改善、レビューするときに使用する。
+description: GitHub Actions の CI、リリース、定期セキュリティ監査の設計と監査手順。必須チェックを壊さない変更判定スキップ、権限最小化、リネーム検出や除外対象の盲点対策を扱い、CI やリリースワークフローを構築、改善、レビューするときに使用する。Rust の署名配布、鍵ローテーション、自己更新設計は rust-release-distribution に委ねる。
 ---
 
 # GitHub Actions における CI とリリース基盤の設計
@@ -15,6 +15,7 @@ CI やリリースワークフローにおける未検査領域、暗黙の素�
 - **新規パッケージ導入**：CI 改善のために Action 以外の外部パッケージやツールを導入するときは `library-license` に従う。
 - **シークレット登録依頼**：署名鍵などの Secrets 登録をユーザーへ案内する手順は `scoped-secret-provisioning` に委ねる。
 - **Windows ローカル検証のシェル罠**：PowerShell の引用規則や文字コード対策は `windows-cli-pitfalls` に委ねる。
+- **Rust の署名配布と自己更新設計**：ワークフロー骨格、権限最小化、言語非依存の原子的公開順序は本スキルが担い、公開鍵埋め込み、鍵ローテーション、ドライラン一時鍵と埋め込み鍵の整合、Windows 向け Rust パッケージング罠、リリースランブック構成は `rust-release-distribution` に委ねる。
 
 ## 必須チェックを壊さない変更ファイル別スキップ
 
@@ -88,10 +89,11 @@ for name, info in needs.items():
 3. Linux と Windows が混在するビルドマトリクスでの共通スクリプト検査には `shell: bash` を明示し、Windows 固有のリリース／インストーラスクリプト検証は `windows-latest` でも実行する。
 4. `gh release create` や `gh release upload` の直前で検証スクリプトを実行し、署名中間ファイル（`.sig` 等）や廃止拡張子の非残存、自動更新マニフェスト（`latest.json` 等）のバージョン一致と成果物実在、パッケージ内へのテスト混入なしを確認する。
 5. 既存リリースのアセット削除では `for x in $names` による空白分割を避け、`while IFS= read -r name` で 1 行ずつ処理する。
+6. 本番公開は `gh release view` で既存の公開済みリリース上書きを拒否したうえで `gh release create --draft` を作成し、実体成果物とチェックサムを先にアップロードし、参照元となるインデックスやメタデータ（更新マニフェスト、パッケージインデックス等）を末尾にアップロードしてから `gh release edit --draft=false` で公開する。
 
 ## 脆弱性監査の定期分離と重大度管理
 
-- `npm audit` や `pnpm audit` を通常 PR の必須条件に入れると、コード変更と無関係な外部アドバイザリの公開時に全 PR のマージが止まる。
+- `npm audit`、`pnpm audit`、`cargo audit` などの脆弱性監査を通常 PR の必須条件に入れると、コード変更と無関係な外部アドバイザリの公開時に全 PR のマージが止まる。
 - 依存パッケージの脆弱性監査は週次の `schedule` と `workflow_dispatch` を持つ独立ワークフロー（`security.yml`）へ分離する。
 - 開発依存に低重大度や中重大度の未修正アドバイザリが残る現実を踏まえ、`--prod` と `--audit-level high` を失敗条件、`--ignore-registry-errors` を一時的なレジストリ障害耐性として設定し、全件サマリは `continue-on-error: true` でログ可視化に留める。
 
