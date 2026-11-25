@@ -582,6 +582,93 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
                 )
                 self.assertEqual(code, 0, stderr)
 
+    def test_invariant_check_round4_git_index_diff_cases(self) -> None:
+        # 64 桁 SHA-256 形式のコミット ID を _resolve_base_commit が受理する
+        sha256_id = "a" * 64
+        resolved = pr_ops._resolve_base_commit(
+            "origin/main",
+            Path("."),
+            lambda c, cw, inp: pr_ops.CmdResult(0, f"{sha256_id}\n", ""),
+        )
+        self.assertEqual(resolved, sha256_id)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            repo.mkdir()
+            env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+            }
+            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "config", "core.autocrlf", "false"], check=True, capture_output=True)
+
+            # ベース作成: rename 元、空白名・空ファイル、末尾改行なし、LF、実行モード(100755)
+            (repo / "old_name.txt").write_text("same body\n", encoding="utf-8", newline="\n")
+            (repo / "release notes.md").write_text("notes line\n", encoding="utf-8", newline="\n")
+            (repo / "__init__.py").write_bytes(b"")
+            (repo / "no_nl.txt").write_bytes(b"first_line_no_nl")
+            (repo / "crlf_test.txt").write_bytes(b"line1\nline2\n")
+            (repo / "tool.sh").write_bytes(b"#!/bin/sh\necho ok\n")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "update-index", "--chmod=+x", "tool.sh"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True, env=env)
+            base_sha = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            # コミット: rename + 各ファイルを削除
+            subprocess.run(["git", "-C", str(repo), "mv", "old_name.txt", "new_name.txt"], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "rm", "release notes.md", "__init__.py", "no_nl.txt", "crlf_test.txt", "tool.sh"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "rename and delete"], check=True, capture_output=True, env=env)
+
+            # 未追跡として再作成
+            (repo / "old_name.txt").write_text("recreated old content\n", encoding="utf-8", newline="\n")
+            (repo / "release notes.md").write_text("notes line\n", encoding="utf-8", newline="\n")
+            (repo / "__init__.py").write_bytes(b"")
+            dummy_tok = "ghp_" + ("Z" * 36)
+            (repo / "no_nl.txt").write_bytes(f"token={dummy_tok}".encode("utf-8"))
+            subprocess.run(["git", "-C", str(repo), "config", "core.autocrlf", "true"], check=True, capture_output=True)
+            (repo / "crlf_test.txt").write_bytes(b"line1\r\nline2\r\n")
+            (repo / "tool.sh").write_bytes(b"#!/bin/sh\necho ok\n")
+
+            # 実インデックスに別ファイルをステージして汚染しないことも確認
+            (repo / "staged_only.txt").write_text("staged\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "staged_only.txt"], check=True, capture_output=True)
+            index_before = (repo / ".git" / "index").read_bytes()
+
+            diff_text, skipped = pr_ops._build_combined_worktree_diff(base_sha, repo, pr_ops._default_runner)
+            index_after = (repo / ".git" / "index").read_bytes()
+
+            self.assertEqual(index_before, index_after)
+            self.assertEqual(skipped, [])
+            self.assertIsNotNone(diff_text)
+            assert diff_text is not None
+
+            # BUG_0001: rename 先が存在し、旧パス再作成分の差分も含まれる
+            self.assertIn("new_name.txt", diff_text)
+            self.assertIn("+recreated old content\n", diff_text)
+            # BUG_0002: 空白名ファイルと空ファイルの同内容再作成には削除セクションが残らない
+            self.assertNotIn("release notes.md", diff_text)
+            self.assertNotIn("__init__.py", diff_text)
+            # BUG_0003: 実行モード 100755 -> 100644 の差分が残る
+            self.assertIn("tool.sh", diff_text)
+            self.assertIn("old mode 100755", diff_text)
+            self.assertIn("new mode 100644", diff_text)
+            # BUG_0004: core.autocrlf=true 下の CRLF 同内容再作成は無差分
+            self.assertNotIn("crlf_test.txt", diff_text)
+            # SEC_0001: 末尾改行なしファイルの再作成で削除行と追加行が分離される
+            self.assertIn("-first_line_no_nl\n", diff_text)
+            self.assertIn(f"+token={dummy_tok}\n", diff_text)
+            self.assertNotIn(f"first_line_no_nl+token=", diff_text)
+
 
 class TestPrOpsApplyTriage(unittest.TestCase):
     def test_apply_triage_dry_run_replaces_placeholders_and_never_mutates(self) -> None:
