@@ -460,16 +460,64 @@ def _is_posix_command_start_pos(
     text: str, idx: int, *, extra_trailing: tuple[str, ...] = ()
 ) -> bool:
     """POSIX シェルで text[idx] がコマンド開始位置（行頭・区切り記号・制御語・関数定義直後）か判定する。"""
+    if idx < len(text) and text[idx] == "(" and idx > 0 and text[idx - 1] == "=":
+        return False
     before = text[:idx].rstrip()
     if not before:
         return True
     trailing = (";", "|", "&", "(", "{", "\n", "\r") + extra_trailing
-    if before.endswith(trailing) or before.endswith("()"):
+    if before.endswith(trailing):
         return True
-    words = before.split()
-    if words[-1].lower() in (POSIX_GROUP_PREFIX_KEYWORDS | {"coproc"}):
+    last_sep = -1
+    group_stack: list[tuple[str, int]] = []
+    in_single = False
+    in_double = False
+    pos = 0
+    n = len(before)
+    while pos < n:
+        ch = before[pos]
+        if in_single:
+            if ch == "'":
+                in_single = False
+        elif in_double:
+            if ch == "\\" and pos + 1 < n:
+                pos += 2
+                continue
+            if ch == '"':
+                in_double = False
+        else:
+            if ch == "\\" and pos + 1 < n:
+                pos += 2
+                continue
+            if ch == "'":
+                in_single = True
+            elif ch == '"':
+                in_double = True
+            elif ch in ("(", "{"):
+                group_stack.append((")" if ch == "(" else "}", last_sep))
+                last_sep = pos
+            elif group_stack and ch == group_stack[-1][0]:
+                _, last_sep = group_stack.pop()
+            elif ch in (";", "|", "&", "\n", "\r"):
+                last_sep = pos
+        pos += 1
+    cur = _strip_leading_assignments_text(
+        before[last_sep + 1 :].strip(), posix_shell=True
+    )
+    words = cur.split()
+    if not words:
+        return False
+    while words and words[0].lower() in POSIX_GROUP_PREFIX_KEYWORDS:
+        words.pop(0)
+    if not words:
         return True
-    if len(words) >= 2 and words[-2].lower() in {"function", "coproc"}:
+    if len(words) == 1 and (words[0].endswith("()") or words[0].lower() == "coproc"):
+        return True
+    if len(words) == 2 and (
+        words[0].lower() in {"function", "coproc"} or words[1] == "()"
+    ):
+        return True
+    if len(words) == 3 and words[0].lower() == "function" and words[2] == "()":
         return True
     return False
 

@@ -1187,6 +1187,10 @@ class TestPretoolGuard(unittest.TestCase):
                 ('rg -F "$(printf \'%s\' { reboot })" docs/', True),
                 ("PS4='(trace) ' bash -xc \"rg -F 'ready | reboot' docs/\"", True),
                 ("PS4='(trace) ' cat > doc.md <<'EOF'\nrm -rf /\nEOF", True),
+                ("echo function f { git push origin main }", True),
+                ("echo coproc { git push origin main }", True),
+                ("echo time { git push origin main }", True),
+                ('echo "a; function f" { git push origin main }', True),
             ]
             for cmd, ps_flag in group_and_branch_allow_cmds:
                 with self.subTest(group_allow=cmd, posix_shell=ps_flag):
@@ -1386,6 +1390,8 @@ class TestPretoolGuard(unittest.TestCase):
             ("coproc myproc { git push origin main; }", True),
             ("FOO=(a) git push origin main", True),
             ("FOO=(a b) git push origin main", True),
+            ("function f () { git push origin main; }; f", True),
+            ("if true; then coproc (git push origin main); fi", True),
         ]
         for cmd, ps_flag in unsafe_child_shell_cmds:
             with self.subTest(unsafe_child_cmd=cmd, posix_shell=ps_flag):
