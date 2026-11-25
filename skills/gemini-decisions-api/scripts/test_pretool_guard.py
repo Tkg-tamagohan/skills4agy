@@ -1102,7 +1102,7 @@ class TestPretoolGuard(unittest.TestCase):
                         self.assertIn("/teamwork", out["reason"])
 
             # 通常会話では /teamwork 専用コマンド群は Stage 1 allow にならず（Stage 2 送り）、
-            # v0.5.3 で通常ホワイトリスト化された安全 git commit / gh pr create --body-file のみ通常 allow となる
+            # v0.5.4 で通常ホワイトリスト化された安全 git commit / gh pr create --body-file のみ通常 allow となる
             normal_whitelisted_in_teamwork_cmds = {
                 'git commit -m "feat: add updater"',
                 'git commit -m "docs: explain git status; git push origin main"',
