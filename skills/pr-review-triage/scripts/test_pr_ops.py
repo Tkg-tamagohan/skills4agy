@@ -731,13 +731,50 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
             self.assertIn("report[12].txt", diff_text)
             self.assertNotIn("report1.txt", diff_text)
 
-            # 4. BUG_0001: core.safecrlf=true で git add -u が失敗したときに暗黙成功へ倒さない
+            # 4. BUG_0001: core.safecrlf=true で追跡済みファイルの git add -u 自体が失敗したときに暗黙成功へ倒さない
+            for p_name in ("secret_untracked.py", ".env", "report[12].txt", "report1.txt"):
+                (repo / p_name).unlink()
             subprocess.run(["git", "-C", str(repo), "config", "core.autocrlf", "true"], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(repo), "config", "core.safecrlf", "true"], check=True, capture_output=True)
-            (repo / "base.txt").write_bytes(b"line1\r\nline2\r\n")
+            (repo / "base.txt").write_bytes(b"line1\nline2\r\n")
             with self.assertRaises(pr_ops.PrOpsError) as cm:
                 pr_ops._build_combined_worktree_diff(base_sha, repo, pr_ops._default_runner)
             self.assertEqual(cm.exception.code, "worktree_diff_failed")
+            self.assertIn("git add -u", str(cm.exception))
+
+            # 4b. Round 6 BUG_0002: GIT_GLOB_PATHSPECS=1 / GIT_ICASE_PATHSPECS=1 環境でも未追跡ファイル追加が競合しない
+            subprocess.run(["git", "-C", str(repo), "config", "core.safecrlf", "false"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "config", "core.autocrlf", "false"], check=True, capture_output=True)
+            (repo / "base.txt").write_bytes(b"line1\nline2\n")
+            (repo / "glob_env_test.py").write_text("ok = True\n", encoding="utf-8", newline="\n")
+            with mock.patch.dict(os.environ, {"GIT_GLOB_PATHSPECS": "1", "GIT_ICASE_PATHSPECS": "1"}):
+                glob_diff, glob_skipped = pr_ops._build_combined_worktree_diff(
+                    base_sha, repo, pr_ops._default_runner
+                )
+            self.assertEqual(glob_skipped, [])
+            self.assertIsNotNone(glob_diff)
+            assert glob_diff is not None
+            self.assertIn("glob_env_test.py", glob_diff)
+
+            # 4c. Round 6 BUG_0001: 二重引用符(POSIX)または os.pathsep(Windows) を含むリポジトリパスで alternate objects が C エスケープされる
+            special_parent = root / ('Client "A"' if os.name != "nt" else "Client;A")
+            special_repo = special_parent / "repo"
+            special_repo.mkdir(parents=True)
+            subprocess.run(["git", "init", "-b", "main", str(special_repo)], check=True, capture_output=True)
+            (special_repo / "init.txt").write_text("v1\n", encoding="utf-8", newline="\n")
+            subprocess.run(["git", "-C", str(special_repo), "add", "init.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(special_repo), "commit", "-m", "init"], check=True, capture_output=True, env=env)
+            special_base = subprocess.run(
+                ["git", "-C", str(special_repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+            ).stdout.strip()
+            (special_repo / "init.txt").write_text("v2\n", encoding="utf-8", newline="\n")
+            special_diff, special_skipped = pr_ops._build_combined_worktree_diff(
+                special_base, special_repo, pr_ops._default_runner
+            )
+            self.assertEqual(special_skipped, [])
+            self.assertIsNotNone(special_diff)
+            assert special_diff is not None
+            self.assertIn("+v2", special_diff)
 
             # 5. ANALYSIS_0001: 外部 GIT_DIR + GIT_WORK_TREE（ルートに .git なし）で未追跡ファイルを検出する
             ext_git = root / "ext_git"

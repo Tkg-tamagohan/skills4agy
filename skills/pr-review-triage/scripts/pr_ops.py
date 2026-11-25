@@ -992,7 +992,8 @@ def _build_combined_worktree_diff(
         tmp_env["GIT_OBJECT_DIRECTORY"] = str(tmp_objects)
         real_obj_str = str(real_objects)
         if os.pathsep in real_obj_str or '"' in real_obj_str:
-            quoted_real_obj = '"' + real_obj_str.replace("\\", "/") + '"'
+            escaped_real_obj = real_obj_str.replace("\\", "\\\\").replace('"', '\\"')
+            quoted_real_obj = '"' + escaped_real_obj + '"'
         else:
             quoted_real_obj = real_obj_str
         existing_alt = tmp_env.get("GIT_ALTERNATE_OBJECT_DIRECTORIES", "").strip()
@@ -1018,10 +1019,15 @@ def _build_combined_worktree_diff(
             )
 
         if safe_untracked:
+            add_untracked_env = {
+                k: v
+                for k, v in tmp_env.items()
+                if k not in ("GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS")
+            }
             add_untracked_res = _run_git_env(
                 ["git", "--literal-pathspecs", "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
                 git_cwd,
-                tmp_env,
+                add_untracked_env,
                 input_text="\x00".join(safe_untracked) + "\x00",
             )
             if add_untracked_res.returncode != 0:
