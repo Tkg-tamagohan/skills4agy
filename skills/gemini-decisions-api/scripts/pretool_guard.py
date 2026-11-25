@@ -459,14 +459,19 @@ POSIX_GROUP_PREFIX_KEYWORDS = frozenset(
 def _is_posix_command_start_pos(
     text: str, idx: int, *, extra_trailing: tuple[str, ...] = ()
 ) -> bool:
-    """POSIX シェルで text[idx] がコマンド開始位置（行頭・区切り記号・制御語直後）か判定する。"""
+    """POSIX シェルで text[idx] がコマンド開始位置（行頭・区切り記号・制御語・関数定義直後）か判定する。"""
     before = text[:idx].rstrip()
     if not before:
         return True
     trailing = (";", "|", "&", "(", "{", "\n", "\r") + extra_trailing
-    if before.endswith(trailing):
+    if before.endswith(trailing) or before.endswith("()"):
         return True
-    return before.split()[-1].lower() in POSIX_GROUP_PREFIX_KEYWORDS
+    words = before.split()
+    if words[-1].lower() in (POSIX_GROUP_PREFIX_KEYWORDS | {"coproc"}):
+        return True
+    if len(words) >= 2 and words[-2].lower() in {"function", "coproc"}:
+        return True
+    return False
 
 
 def _is_group_brace_open(text: str, idx: int, *, posix_shell: bool) -> bool:
@@ -619,10 +624,105 @@ def _extract_rg_pre_info(args: list[str]) -> tuple[bool, list[str]]:
     return has_pre, pre_cmds
 
 
-def _is_safe_rg_segment(segment: str) -> bool:
+LEADING_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+
+
+def _strip_leading_assignments_text(
+    segment: str, *, posix_shell: bool = False
+) -> str:
+    """クォート除去前の生文字列から先頭の環境変数・配列代入（VAR=val / VAR=(...)）を読み飛ばす。"""
+    n = len(segment)
+    pos = 0
+    while pos < n:
+        while pos < n and segment[pos].isspace():
+            pos += 1
+        if pos >= n:
+            return ""
+        m = LEADING_ASSIGN_RE.match(segment[pos:])
+        if not m:
+            break
+        j = pos + m.end()
+        if j < n and segment[j] == "(":
+            depth = 1
+            quote: str | None = None
+            k = j + 1
+            while k < n and depth > 0:
+                ch = segment[k]
+                if quote == "'":
+                    if ch == "'":
+                        quote = None
+                    k += 1
+                    continue
+                if quote == '"':
+                    if posix_shell and ch == "\\" and k + 1 < n and segment[k + 1] in ('"', "\\"):
+                        k += 2
+                        continue
+                    if ch == '"':
+                        quote = None
+                    k += 1
+                    continue
+                if posix_shell and ch == "\\" and k + 1 < n:
+                    k += 2
+                    continue
+                if ch in ("'", '"'):
+                    quote = ch
+                    k += 1
+                    continue
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            if depth > 0 or k >= n:
+                break
+            if k + 1 < n and not segment[k + 1].isspace():
+                break
+            pos = k + 1
+            continue
+
+        quote = None
+        k = j
+        while k < n:
+            ch = segment[k]
+            if quote == "'":
+                if ch == "'":
+                    quote = None
+                k += 1
+                continue
+            if quote == '"':
+                if posix_shell and ch == "\\" and k + 1 < n and segment[k + 1] in ('"', "\\"):
+                    k += 2
+                    continue
+                if ch == '"':
+                    quote = None
+                k += 1
+                continue
+            if posix_shell and ch == "\\" and k + 1 < n:
+                k += 2
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                k += 1
+                continue
+            if ch.isspace():
+                break
+            k += 1
+        if quote is not None:
+            break
+        pos = k
+
+    return segment[pos:].strip()
+
+
+def _is_safe_rg_segment(segment: str, *, posix_shell: bool = False) -> bool:
     """--pre / --pre-glob を含まない単一の rg コマンドセグメントか判定する。"""
+    cleaned = _strip_leading_assignments_text(segment, posix_shell=posix_shell)
+    if not cleaned:
+        return False
     try:
-        tokens = _tokenize_command(segment)
+        tokens = _tokenize_command(cleaned)
     except ValueError:
         return False
     if not tokens:
@@ -640,10 +740,13 @@ def _is_safe_rg_segment(segment: str) -> bool:
     return not has_pre
 
 
-def _is_shell_wrapper_segment(segment: str) -> bool:
+def _is_shell_wrapper_segment(segment: str, *, posix_shell: bool = False) -> bool:
     """インライン実行フラグ（-c / -Command 等）付きのシェル起動セグメントか判定する。"""
+    cleaned = _strip_leading_assignments_text(segment, posix_shell=posix_shell)
+    if not cleaned:
+        return False
     try:
-        tokens = _tokenize_command(segment)
+        tokens = _tokenize_command(cleaned)
     except ValueError:
         return False
     if not tokens:
@@ -656,12 +759,7 @@ def _is_shell_wrapper_segment(segment: str) -> bool:
             while idx < len(tokens) and tokens[idx].startswith("-"):
                 idx += 1
             continue
-        if (
-            "=" in tokens[idx]
-            and not tokens[idx].startswith("-")
-            and idx + 1 < len(tokens)
-            and not tokens[idx].split("=", 1)[1].startswith("(")
-        ):
+        if "=" in tokens[idx] and not tokens[idx].startswith("-") and idx + 1 < len(tokens):
             idx += 1
             continue
         break
@@ -1175,7 +1273,9 @@ def _split_top_level_segments(
     segments: list[str] = []
     extract_outer_subs = False
     for part in unquoted_parts:
-        if _is_safe_rg_segment(part) or _is_shell_wrapper_segment(part):
+        if _is_safe_rg_segment(part, posix_shell=posix_shell) or _is_shell_wrapper_segment(
+            part, posix_shell=posix_shell
+        ):
             segments.append(part)
             extract_outer_subs = True
         elif _looks_like_control_or_group_segment(part):
@@ -1241,12 +1341,7 @@ def _unwrap_segment_tokens(
             while idx < len(tokens) and tokens[idx].startswith("-"):
                 idx += 1
             continue
-        if (
-            "=" in tokens[idx]
-            and not tokens[idx].startswith("-")
-            and idx + 1 < len(tokens)
-            and not tokens[idx].split("=", 1)[1].startswith("(")
-        ):
+        if "=" in tokens[idx] and not tokens[idx].startswith("-") and idx + 1 < len(tokens):
             idx += 1
             continue
         break
@@ -1272,19 +1367,25 @@ def _unwrap_segment_tokens(
                     posix_shell=is_unix_shell,
                     allow_cmd_subst=child_allow_cmd_subst,
                 ):
-                    results.extend(
-                        _unwrap_segment_tokens(_tokenize_lossy(seg), posix_shell=is_unix_shell)
-                    )
+                    results.extend(_tokenize_and_unwrap(seg, posix_shell=is_unix_shell))
                 break
     elif head == "rg":
         _, pre_cmds = _extract_rg_pre_info(sub_tokens[1:])
         for nested in pre_cmds:
             if nested:
                 for seg in _split_top_level_segments(nested, posix_shell=posix_shell):
-                    results.extend(
-                        _unwrap_segment_tokens(_tokenize_lossy(seg), posix_shell=posix_shell)
-                    )
+                    results.extend(_tokenize_and_unwrap(seg, posix_shell=posix_shell))
     return results
+
+
+def _tokenize_and_unwrap(
+    segment: str, *, posix_shell: bool = False
+) -> list[list[str]]:
+    """先頭代入を除外した上でセグメント文字列をトークン化・展開して返す。"""
+    cleaned = _strip_leading_assignments_text(segment, posix_shell=posix_shell)
+    if not cleaned:
+        return []
+    return _unwrap_segment_tokens(_tokenize_lossy(cleaned), posix_shell=posix_shell)
 
 
 def _collect_all_command_segments(
@@ -1292,8 +1393,7 @@ def _collect_all_command_segments(
 ) -> list[list[str]]:
     all_segments: list[list[str]] = []
     for seg in _split_top_level_segments(command, posix_shell=posix_shell):
-        tokens = _tokenize_lossy(seg)
-        all_segments.extend(_unwrap_segment_tokens(tokens, posix_shell=posix_shell))
+        all_segments.extend(_tokenize_and_unwrap(seg, posix_shell=posix_shell))
     return all_segments
 
 
@@ -2642,15 +2742,9 @@ def _collect_quote_aware_segments(
                     if sub_extracted is not None:
                         extracted.extend(sub_extracted)
                     else:
-                        extracted.extend(
-                            _unwrap_segment_tokens(
-                                _tokenize_lossy(clause), posix_shell=posix_shell
-                            )
-                        )
+                        extracted.extend(_tokenize_and_unwrap(clause, posix_shell=posix_shell))
                 continue
-        extracted.extend(
-            _unwrap_segment_tokens(_tokenize_lossy(part), posix_shell=posix_shell)
-        )
+        extracted.extend(_tokenize_and_unwrap(part, posix_shell=posix_shell))
         for body in _extract_embedded_group_bodies(part, posix_shell=posix_shell):
             if body.strip() != part.strip():
                 sub_extracted = _collect_quote_aware_segments(
@@ -2662,15 +2756,9 @@ def _collect_quote_aware_segments(
                     for raw_seg in _split_top_level_segments_raw(
                         body, posix_shell=posix_shell
                     ):
-                        extracted.extend(
-                            _unwrap_segment_tokens(
-                                _tokenize_lossy(raw_seg), posix_shell=posix_shell
-                            )
-                        )
+                        extracted.extend(_tokenize_and_unwrap(raw_seg, posix_shell=posix_shell))
     for sub in _extract_rg_substitutions(command_text, posix_shell=posix_shell):
-        extracted.extend(
-            _unwrap_segment_tokens(_tokenize_lossy(sub), posix_shell=posix_shell)
-        )
+        extracted.extend(_tokenize_and_unwrap(sub, posix_shell=posix_shell))
     return extracted
 
 
@@ -2696,9 +2784,7 @@ def _are_posix_heredoc_receivers_safe(
         if not hd_parts:
             return False
         for part in hd_parts:
-            unwrapped = _unwrap_segment_tokens(
-                _tokenize_lossy(part), posix_shell=posix_shell
-            )
+            unwrapped = _tokenize_and_unwrap(part, posix_shell=posix_shell)
             if not unwrapped or _command_basename(unwrapped[0][0]) not in SAFE_POSIX_HEREDOC_RECEIVERS:
                 return False
     return True
