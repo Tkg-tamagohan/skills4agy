@@ -1,6 +1,6 @@
 {
   "name": "shared-skills",
   "displayName": "Shared Skills",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Antigravity セッション全体で共有するルールとスキル（常時適用の rules/AGENTS.md、状況別ルール、専門スキル）"
 }
