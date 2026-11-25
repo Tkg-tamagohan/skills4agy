@@ -1729,6 +1729,12 @@ class TestPretoolGuard(unittest.TestCase):
                     cwd=str(repo_root),
                 )
             )
+            self.assertIsNone(
+                pg.evaluate_stage1(
+                    "python skills/pr-review-triage/scripts/pr_ops.py invariant-check --base=--output=evil.txt",
+                    cwd=str(repo_root),
+                )
+            )
             # --cwd 指定時は --cwd 先基準で --output を検査し、別ディレクトリの scratch/ リンクを許さない
             with tempfile.TemporaryDirectory() as other_tmp:
                 other_dir = Path(other_tmp)

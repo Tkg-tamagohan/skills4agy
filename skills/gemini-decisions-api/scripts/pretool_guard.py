@@ -2871,6 +2871,16 @@ def _is_trusted_plugin_script(
         elif opt_name in input_opts:
             if opt_val and opt_val != "-" and not _is_safe_non_secret_existing_file(opt_val, cwd=effective_script_cwd):
                 return False
+        elif arg == "--base" or arg.startswith("--base="):
+            if arg == "--base":
+                if i + 1 >= n:
+                    return False
+                base_val = script_args[i + 1]
+                i += 1
+            else:
+                base_val = arg.split("=", 1)[1]
+            if not base_val or base_val.startswith("-"):
+                return False
         i += 1
 
     return True

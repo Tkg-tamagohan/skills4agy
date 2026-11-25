@@ -193,8 +193,12 @@ class TestPrOpsStatus(unittest.TestCase):
                     return pr_ops.CmdResult(0, "feat/current\n", "")
                 if cmd[:3] == ["gh", "pr", "view"]:
                     observed_pr_cmds.append(cmd)
-                    if "--json" in cmd and cmd[cmd.index("--json") + 1] == "number":
-                        return pr_ops.CmdResult(0, json.dumps({"number": 77}), "")
+                    if "--json" in cmd and cmd[cmd.index("--json") + 1] in {"number", "number,url"}:
+                        return pr_ops.CmdResult(
+                            0,
+                            json.dumps({"number": 77, "url": "https://github.com/upstream/repo/pull/77"}),
+                            "",
+                        )
                     return pr_ops.CmdResult(
                         0,
                         json.dumps(
@@ -263,13 +267,14 @@ class TestPrOpsStatus(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             pr_file = Path(tmp) / "saved_pr.json"
-            # --pr と --repo を両方省略時は `gh pr view --json number` を呼び、秘密マスク＋終了コード伝播を検証
+            # --pr と --repo を両方省略時は `gh pr view --json number,url` の repo/number を一致させて使い、秘密マスク＋終了コード伝播を検証
             code, stdout, _ = _run_cli_capture(
                 ["status", "--cwd", tmp, "--check-devin", "--save-pr-json", str(pr_file)],
                 runner=make_runner(devin_code=3),
             )
             self.assertEqual(code, 3)
-            self.assertEqual(observed_pr_cmds[0], ["gh", "pr", "view", "--json", "number"])
+            self.assertEqual(observed_pr_cmds[0], ["gh", "pr", "view", "--json", "number,url"])
+            self.assertEqual(json.loads(stdout)["repo"], "upstream/repo")
             self.assertNotIn(fake_gh_token, stdout)
             self.assertIn("[REDACTED]", stdout)
             self.assertNotIn(fake_gh_token, pr_file.read_text(encoding="utf-8"))
@@ -303,6 +308,8 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
             nonlocal observed_rules_text, observed_cmd
             if cmd[:4] == ["git", "-c", "core.quotePath=false", "status"]:
                 return pr_ops.CmdResult(0, "", "")
+            if cmd[:3] == ["git", "rev-parse", "--show-toplevel"]:
+                return pr_ops.CmdResult(0, str(cwd), "")
             if len(cmd) >= 2 and cmd[1].endswith("check_invariants_decision1.py"):
                 observed_cmd = list(cmd)
                 rules_idx = cmd.index("--rules")
@@ -349,12 +356,16 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
 
         def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
             nonlocal observed_cmd, observed_diff
+            if cmd[:3] == ["git", "rev-parse", "--show-toplevel"]:
+                return pr_ops.CmdResult(0, str(cwd), "")
             if cmd[:4] == ["git", "-c", "core.quotePath=false", "status"]:
                 return pr_ops.CmdResult(0, " M app.py\n", "")
             if cmd[:2] == ["git", "merge-base"]:
                 return pr_ops.CmdResult(0, "base123\n", "")
             if cmd[:4] == ["git", "-c", "core.quotePath=false", "diff"]:
                 return pr_ops.CmdResult(0, "diff --git a/app.py b/app.py\n+print('uncommitted')\n", "")
+            if cmd[:4] == ["git", "-c", "core.quotePath=false", "ls-files"]:
+                return pr_ops.CmdResult(0, "", "")
             if len(cmd) >= 2 and cmd[1].endswith("check_invariants_decision1.py"):
                 observed_cmd = list(cmd)
                 df_idx = cmd.index("--diff-file")
@@ -410,6 +421,83 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
             self.assertEqual(observed_cmd.count("--rules"), 1)
             r_idx = observed_cmd.index("--rules")
             self.assertEqual(len(observed_cmd[r_idx + 1 : r_idx + 4]), 3)
+
+    def test_invariant_check_real_git_untracked_subdir_reverted_and_base_flag_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            work, _ = _init_git_repo_with_bare_remote(tmp_dir, branch="feat/inv-worktree")
+            (work / "sub").mkdir()
+            (work / "sibling.py").write_text("sibling = 1\n", encoding="utf-8", newline="\n")
+            subprocess.run(["git", "-C", str(work), "add", "sibling.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "commit", "-m", "add sibling"], check=True, capture_output=True)
+
+            # 1. --base への Git オプション注入は拒否
+            pr_json = tmp_dir / "pr.json"
+            pr_json.write_text(json.dumps({"body": "", "comments": []}), encoding="utf-8")
+            code, _, _ = _run_cli_capture(
+                ["invariant-check", "--pr-json", str(pr_json), "--cwd", str(work), "--base=--output=evil.txt", "--dry-run"]
+            )
+            self.assertEqual(code, 2)
+
+            # 2. サブディレクトリ実行でも兄弟ファイルの変更＋未追跡新規ファイルが統合 --diff-file へ含まれ、ロックファイルは除外される
+            (work / "sibling.py").write_text("sibling = 2\n", encoding="utf-8", newline="\n")
+            (work / "Cargo.lock").write_text("lock = 1\n", encoding="utf-8", newline="\n")
+            (work / "sub" / "untracked_new.py").write_text("x = 42\n", encoding="utf-8", newline="\n")
+            captured_diff = ""
+
+            def inspect_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+                nonlocal captured_diff
+                if len(cmd) >= 2 and cmd[1].endswith("check_invariants_decision1.py"):
+                    self.assertIn("--diff-file", cmd)
+                    captured_diff = Path(cmd[cmd.index("--diff-file") + 1]).read_text(encoding="utf-8")
+                    return pr_ops.CmdResult(0, json.dumps({"status": "dry_run"}), "")
+                return pr_ops._default_runner(cmd, cwd, input_text)
+
+            code, _, stderr = _run_cli_capture(
+                ["invariant-check", "--pr-json", str(pr_json), "--cwd", str(work / "sub"), "--base", "main", "--dry-run"],
+                runner=inspect_runner,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("sibling.py", captured_diff)
+            self.assertIn("sub/untracked_new.py", captured_diff)
+            self.assertIn("+x = 42", captured_diff)
+            self.assertNotIn("Cargo.lock", captured_diff)
+
+            # 3. コミット済み変更を作業ツリーで打ち消して空差分にしたときは --base へ戻らず空 --diff-file を渡す
+            (work / "Cargo.lock").unlink()
+            (work / "sub" / "untracked_new.py").unlink()
+            (work / "sibling.py").unlink()
+            # main の内容から sibling.py を削除状態にし、untracked なしで未コミット差分が空でない状態ではなく
+            # 実際に「commit した変更を作業ツリーで元に戻す」ケースを作る
+            subprocess.run(["git", "-C", str(work), "checkout", "--", "sibling.py"], check=True, capture_output=True)
+            (work / "temp_commit.txt").write_text("v1\n", encoding="utf-8", newline="\n")
+            subprocess.run(["git", "-C", str(work), "add", "temp_commit.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "commit", "-m", "temp commit"], check=True, capture_output=True)
+            # 1 コミット前（main + sibling）を base にして、作業ツリーで temp_commit.txt を消した状態にする
+            prev_sha = subprocess.run(
+                ["git", "-C", str(work), "rev-parse", "HEAD~1"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            (work / "temp_commit.txt").unlink()
+            reverted_diff = "NOT_SET"
+
+            def reverted_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+                nonlocal reverted_diff
+                if len(cmd) >= 2 and cmd[1].endswith("check_invariants_decision1.py"):
+                    self.assertIn("--diff-file", cmd)
+                    self.assertNotIn("--base", cmd)
+                    reverted_diff = Path(cmd[cmd.index("--diff-file") + 1]).read_text(encoding="utf-8")
+                    return pr_ops.CmdResult(0, json.dumps({"status": "skipped_empty_diff"}), "")
+                return pr_ops._default_runner(cmd, cwd, input_text)
+
+            code, _, stderr = _run_cli_capture(
+                ["invariant-check", "--pr-json", str(pr_json), "--cwd", str(work), "--base", prev_sha, "--dry-run"],
+                runner=reverted_runner,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(reverted_diff.strip(), "")
 
 
 class TestPrOpsApplyTriage(unittest.TestCase):
@@ -786,6 +874,55 @@ class TestPrOpsApplyTriage(unittest.TestCase):
             self.assertEqual(out["commit_sha"], "1234567890abcdef1234567890abcdef12345678")
             self.assertIn("1234567890abcdef1234567890abcdef12345678", out["summary_preview"])
 
+    def test_apply_triage_membership_check_uses_id_only_query_without_comment_limit(self) -> None:
+        def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+            if cmd[:4] == ["git", "remote", "get-url", "origin"]:
+                return pr_ops.CmdResult(0, "https://github.com/octo/repo.git\n", "")
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return pr_ops.CmdResult(
+                    0,
+                    json.dumps({"headRefOid": "1234567890abcdef1234567890abcdef12345678", "body": "", "comments": [], "reviews": []}),
+                    "",
+                )
+            if cmd[:3] == ["gh", "api", "graphql"]:
+                payload = json.loads(input_text or "{}")
+                q = payload.get("query") or ""
+                if "reviewThreads" in q:
+                    # 事前所属確認クエリには comments フィールドが含まれないこと
+                    self.assertNotIn("comments(", q)
+                    return pr_ops.CmdResult(
+                        0,
+                        json.dumps(
+                            {
+                                "data": {
+                                    "repository": {
+                                        "pullRequest": {
+                                            "headRefOid": "1234567890abcdef1234567890abcdef12345678",
+                                            "reviewThreads": {
+                                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                "nodes": [{"id": "PRRT_target_1234"}],
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        ),
+                        "",
+                    )
+                if "resolveReviewThread" in q:
+                    return pr_ops.CmdResult(0, json.dumps({"data": {"resolveReviewThread": {"thread": {"id": "PRRT_target_1234", "isResolved": True}}}}), "")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            plan_path.write_text(json.dumps({"resolve_only": ["PRRT_target_1234"]}), encoding="utf-8")
+            code, stdout, stderr = _run_cli_capture(
+                ["apply-triage", "--pr", "6", "--cwd", tmp, "--plan", str(plan_path), "--no-verify"],
+                runner=fake_runner,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue(json.loads(stdout)["ok"])
+
 
 class TestPrOpsCommitPush(unittest.TestCase):
     def test_commit_push_real_git_repo_success_and_guards(self) -> None:
@@ -970,6 +1107,45 @@ class TestPrOpsCommitPush(unittest.TestCase):
                 os.chdir(prev_cwd)
             self.assertEqual(code, 0, stderr)
             self.assertTrue(json.loads(stdout)["ok"])
+
+            # サブディレクトリから実行しても、同サブディレクトリ内でステージ済みファイルをコミットでき、リネーム旧パス漏れは拒否する
+            (work / "app").mkdir()
+            (work / "app" / "handler.py").write_text("h = 1\n", encoding="utf-8", newline="\n")
+            (work / "app" / "msg.txt").write_text("feat: subdir commit\n", encoding="utf-8", newline="\n")
+            subprocess.run(["git", "-C", str(work), "add", "app/handler.py"], check=True, capture_output=True)
+            code, stdout, stderr = _run_cli_capture(
+                [
+                    "commit-push",
+                    "--cwd",
+                    str(work / "app"),
+                    "--files",
+                    "handler.py",
+                    "--message-file",
+                    "msg.txt",
+                    "--no-push",
+                ]
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue(json.loads(stdout)["ok"])
+
+            # ステージ済みリネーム (old_name.txt -> new_name.txt) で新パスのみ指定すると旧パス欠落として拒否
+            (work / "old_name.txt").write_text("rename test content line 1\nline 2\n", encoding="utf-8", newline="\n")
+            subprocess.run(["git", "-C", str(work), "add", "old_name.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "commit", "-m", "add old_name"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "mv", "old_name.txt", "new_name.txt"], check=True, capture_output=True)
+            code, _, _ = _run_cli_capture(
+                [
+                    "commit-push",
+                    "--cwd",
+                    str(work),
+                    "--files",
+                    "new_name.txt",
+                    "--message-file",
+                    str(msg_file),
+                    "--no-push",
+                ]
+            )
+            self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":

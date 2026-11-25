@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import stat
 import subprocess
@@ -58,6 +59,18 @@ REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 SAFE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+SAFE_BASE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/~^-]*$")
+DEFAULT_EXCLUDE_LOCKS = (
+    "Cargo.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "uv.lock",
+    "poetry.lock",
+)
+GITHUB_PR_URL_RE = re.compile(
+    r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)(?:[/?#].*)?$"
+)
 GITHUB_REMOTE_RE = re.compile(
     r"^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
@@ -124,6 +137,25 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
               url
             }
           }
+        }
+      }
+    }
+  }
+}
+""".strip()
+
+REVIEW_THREAD_IDS_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      headRefOid
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
         }
       }
     }
@@ -419,20 +451,20 @@ def _resolve_repo_slug(repo_arg: str | None, cwd: Path, runner: CommandRunner) -
     raise PrOpsError("repo_resolve_failed", "GitHub リポジトリ (owner/repo) を特定できませんでした。--repo を指定してください。")
 
 
-def _resolve_pr_number(
+def _resolve_repo_and_pr(
+    repo_arg: str | None,
     pr_arg: int | None,
-    repo: str,
     cwd: Path,
     runner: CommandRunner,
-    *,
-    explicit_repo: bool = False,
-) -> int:
+) -> tuple[str, int]:
+    """(owner/repo, pr_number) の組を一貫したリポジトリ基準で解決する。"""
     if pr_arg is not None:
         if pr_arg <= 0:
             raise PrOpsError("invalid_pr", "--pr は正の整数を指定してください。")
-        return pr_arg
+        return _resolve_repo_slug(repo_arg, cwd, runner), pr_arg
 
-    if explicit_repo:
+    if repo_arg:
+        repo = _resolve_repo_slug(repo_arg, cwd, runner)
         br_res = runner(["git", "branch", "--show-current"], cwd, None)
         branch = br_res.stdout.strip() if br_res.returncode == 0 else ""
         if not branch:
@@ -440,21 +472,47 @@ def _resolve_pr_number(
                 "pr_resolve_failed",
                 "--repo 指定時に --pr を省略するには作業ブランチが必要です（--pr を明示指定してください）。",
             )
-        cmd = ["gh", "pr", "view", branch, "--repo", repo, "--json", "number"]
-    else:
-        cmd = ["gh", "pr", "view", "--json", "number"]
+        res = runner(["gh", "pr", "view", branch, "--repo", repo, "--json", "number"], cwd, None)
+        if res.returncode != 0:
+            raise PrOpsError("pr_resolve_failed", f"現在ブランチに紐づく PR を取得できませんでした: {_mask(res.stderr.strip())}")
+        try:
+            num = int(json.loads(res.stdout)["number"])
+            if num <= 0:
+                raise ValueError("non-positive")
+            return repo, num
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise PrOpsError("pr_resolve_failed", f"PR 番号の解析に失敗しました: {exc}") from exc
 
-    res = runner(cmd, cwd, None)
-    if res.returncode != 0:
-        raise PrOpsError("pr_resolve_failed", f"現在ブランチに紐づく PR を取得できませんでした: {_mask(res.stderr.strip())}")
-    try:
-        data = json.loads(res.stdout)
-        num = int(data["number"])
-        if num <= 0:
-            raise ValueError("non-positive")
-        return num
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise PrOpsError("pr_resolve_failed", f"PR 番号の解析に失敗しました: {exc}") from exc
+    # --repo と --pr の両方が省略された場合は gh pr view の url から対象リポジトリと PR 番号を同時確定する
+    gh_res = runner(["gh", "pr", "view", "--json", "number,url"], cwd, None)
+    if gh_res.returncode == 0:
+        try:
+            data = json.loads(gh_res.stdout)
+            num = int(data["number"])
+            if num <= 0:
+                raise ValueError("non-positive")
+            url_val = str(data.get("url") or "").strip()
+            url_m = GITHUB_PR_URL_RE.fullmatch(url_val)
+            if url_m:
+                return f"{url_m.group(1)}/{url_m.group(2)}", num
+            return _resolve_repo_slug(None, cwd, runner), num
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            pass
+
+    # gh pr view 単体が失敗する場合は origin + 現在ブランチへフォールバック
+    repo = _resolve_repo_slug(None, cwd, runner)
+    br_res = runner(["git", "branch", "--show-current"], cwd, None)
+    branch = br_res.stdout.strip() if br_res.returncode == 0 else ""
+    if branch:
+        res = runner(["gh", "pr", "view", branch, "--repo", repo, "--json", "number"], cwd, None)
+        if res.returncode == 0:
+            try:
+                num = int(json.loads(res.stdout)["number"])
+                if num > 0:
+                    return repo, num
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                pass
+    raise PrOpsError("pr_resolve_failed", f"現在ブランチに紐づく PR を取得できませんでした: {_mask(gh_res.stderr.strip())}")
 
 
 def _run_gh_json(args: list[str], cwd: Path, runner: CommandRunner, *, input_obj: dict[str, Any] | None = None) -> Any:
@@ -553,6 +611,49 @@ def _fetch_review_threads_graphql(
     return head_oid, threads
 
 
+def _fetch_review_thread_ids_graphql(
+    owner: str,
+    repo_name: str,
+    pr_num: int,
+    cwd: Path,
+    runner: CommandRunner,
+) -> set[str]:
+    """対象 PR に属する reviewThread ID 集合のみを取得する（コメント件数制限に左右されない）。"""
+    cursor: str | None = None
+    thread_ids: set[str] = set()
+    for page_idx in range(MAX_GRAPHQL_PAGES):
+        resp = _run_gh_json(
+            ["api", "graphql", "--input", "-"],
+            cwd,
+            runner,
+            input_obj={
+                "query": REVIEW_THREAD_IDS_QUERY,
+                "variables": {
+                    "owner": owner,
+                    "repo": repo_name,
+                    "number": pr_num,
+                    "cursor": cursor,
+                },
+            },
+        )
+        if not isinstance(resp, dict) or resp.get("errors"):
+            raise PrOpsError("graphql_error", f"GraphQL reviewThreads ID 取得エラー: {_mask(str(resp.get('errors') if isinstance(resp, dict) else resp))}")
+        pr_node = ((resp.get("data") or {}).get("repository") or {}).get("pullRequest")
+        if not isinstance(pr_node, dict):
+            raise PrOpsError("graphql_error", "GraphQL 応答に pullRequest が含まれていません。")
+        rt = pr_node.get("reviewThreads") or {}
+        for node in rt.get("nodes") or []:
+            if isinstance(node, dict) and node.get("id"):
+                thread_ids.add(str(node["id"]))
+        page_info = rt.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+        if not cursor or page_idx == MAX_GRAPHQL_PAGES - 1:
+            raise PrOpsError("graphql_truncated", f"reviewThreads がページ取得上限 ({MAX_GRAPHQL_PAGES} ページ) を超えました。")
+    return thread_ids
+
+
 def _summarize_checks(rollup: Any) -> dict[str, Any]:
     items = rollup if isinstance(rollup, list) else []
     passing: list[dict[str, str]] = []
@@ -646,8 +747,7 @@ def handle_status(args: argparse.Namespace, *, runner: CommandRunner) -> int:
     out_target = _validate_non_secret_path(args.output, "--output", cwd=cwd) if args.output else None
     save_pr_target = _validate_non_secret_path(args.save_pr_json, "--save-pr-json", cwd=cwd) if args.save_pr_json else None
 
-    repo = _resolve_repo_slug(args.repo, cwd, runner)
-    pr_num = _resolve_pr_number(args.pr, repo, cwd, runner, explicit_repo=bool(args.repo))
+    repo, pr_num = _resolve_repo_and_pr(args.repo, args.pr, cwd, runner)
     owner, repo_name = repo.split("/", 1)
 
     pr_data = _fetch_pr_view(
@@ -736,13 +836,59 @@ def handle_status(args: argparse.Namespace, *, runner: CommandRunner) -> int:
     return devin_code
 
 
+def _validate_base_ref(base_ref: str) -> str:
+    cleaned = (base_ref or "").strip()
+    if not cleaned or cleaned.startswith("-") or ".." in cleaned or not SAFE_BASE_REF_RE.fullmatch(cleaned):
+        raise PrOpsError("invalid_base_ref", f"安全でない --base 参照です: {base_ref}")
+    return cleaned
+
+
+def _format_untracked_file_diff(rel_posix: str, file_path: Path) -> str | None:
+    """未追跡の新規テキストファイルを unified diff セクションへ整形する。"""
+    base_name = rel_posix.rsplit("/", 1)[-1]
+    if base_name in DEFAULT_EXCLUDE_LOCKS:
+        return None
+    if _is_reparse_or_symlink(file_path) or not file_path.is_file():
+        return None
+    try:
+        if file_path.stat().st_size > MAX_FILE_SECRET_SCAN_BYTES:
+            return None
+        raw = file_path.read_bytes()
+    except OSError:
+        return None
+    if b"\x00" in raw:
+        return None
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if not lines:
+        return (
+            f"diff --git a/{rel_posix} b/{rel_posix}\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            f"+++ b/{rel_posix}\n"
+        )
+    header = (
+        f"diff --git a/{rel_posix} b/{rel_posix}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{rel_posix}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n"
+    )
+    return header + "\n".join(f"+{line}" for line in lines) + "\n"
+
+
 def _build_combined_worktree_diff(base_ref: str, cwd: Path, runner: CommandRunner) -> str | None:
-    """作業ツリーに未コミット変更がある場合、merge-base(base, HEAD) からの統合 diff を返す。"""
-    status_res = runner(["git", "-c", "core.quotePath=false", "status", "--porcelain"], cwd, None)
+    """作業ツリーに未コミット変更がある場合、リポジトリルート基準で merge-base(base, HEAD) からの統合 diff（未追跡含む）を返す。"""
+    safe_base = _validate_base_ref(base_ref)
+    top_res = runner(["git", "rev-parse", "--show-toplevel"], cwd, None)
+    git_cwd = Path(top_res.stdout.strip()) if top_res.returncode == 0 and top_res.stdout.strip() else cwd
+    status_res = runner(["git", "-c", "core.quotePath=false", "status", "--porcelain"], git_cwd, None)
     if status_res.returncode != 0 or not status_res.stdout.strip():
         return None
-    mb_res = runner(["git", "merge-base", base_ref, "HEAD"], cwd, None)
-    diff_base = mb_res.stdout.strip() if mb_res.returncode == 0 and mb_res.stdout.strip() else base_ref
+    mb_res = runner(["git", "merge-base", safe_base, "HEAD"], git_cwd, None)
+    diff_base = mb_res.stdout.strip() if mb_res.returncode == 0 and mb_res.stdout.strip() else safe_base
+    if diff_base.startswith("-"):
+        raise PrOpsError("invalid_base_ref", f"安全でない merge-base 結果です: {diff_base}")
     diff_cmd = [
         "git",
         "-c",
@@ -753,29 +899,40 @@ def _build_combined_worktree_diff(base_ref: str, cwd: Path, runner: CommandRunne
         diff_base,
         "--",
         ".",
-        ":(exclude,glob)**/Cargo.lock",
-        ":(exclude,glob)**/package-lock.json",
-        ":(exclude,glob)**/pnpm-lock.yaml",
-        ":(exclude,glob)**/yarn.lock",
-        ":(exclude,glob)**/uv.lock",
-        ":(exclude,glob)**/poetry.lock",
+        *(f":(exclude,glob)**/{lock_name}" for lock_name in DEFAULT_EXCLUDE_LOCKS),
     ]
-    diff_res = runner(diff_cmd, cwd, None)
+    diff_res = runner(diff_cmd, git_cwd, None)
     if diff_res.returncode != 0:
         return None
-    return diff_res.stdout
+
+    chunks = [diff_res.stdout] if diff_res.stdout else []
+    untracked_res = runner(
+        ["git", "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "--", "."],
+        git_cwd,
+        None,
+    )
+    if untracked_res.returncode == 0 and untracked_res.stdout.strip():
+        for raw_rel in untracked_res.stdout.splitlines():
+            rel_posix = raw_rel.strip().replace("\\", "/")
+            if not rel_posix:
+                continue
+            section = _format_untracked_file_diff(rel_posix, git_cwd / rel_posix)
+            if section:
+                chunks.append(section)
+
+    return "\n".join(chunks)
 
 
 def handle_invariant_check(args: argparse.Namespace, *, runner: CommandRunner) -> int:
     cwd = _resolve_cwd(args.cwd)
+    safe_base = _validate_base_ref(args.base)
     for extra_rule in args.rules or []:
         _validate_non_secret_path(extra_rule, "--rules", cwd=cwd)
 
     if args.pr_json:
         pr_data = _read_json_file_checked(args.pr_json, "--pr-json", cwd=cwd, forbid_ufffd=False)
     else:
-        repo = _resolve_repo_slug(args.repo, cwd, runner)
-        pr_num = _resolve_pr_number(args.pr, repo, cwd, runner, explicit_repo=bool(args.repo))
+        repo, pr_num = _resolve_repo_and_pr(args.repo, args.pr, cwd, runner)
         pr_data = _fetch_pr_view(pr_num, repo, cwd, runner, fields="body,comments,reviews")
 
     sources = pr_guardrails.load_pr_sources(pr_data)
@@ -788,7 +945,7 @@ def handle_invariant_check(args: argparse.Namespace, *, runner: CommandRunner) -
 
     combined_diff: str | None = None
     if not getattr(args, "committed_only", False):
-        combined_diff = _build_combined_worktree_diff(args.base, cwd, runner)
+        combined_diff = _build_combined_worktree_diff(safe_base, cwd, runner)
 
     with tempfile.TemporaryDirectory(prefix="pr_ops_inv_") as tmpdir:
         cmd = [
@@ -797,12 +954,12 @@ def handle_invariant_check(args: argparse.Namespace, *, runner: CommandRunner) -
             "--format",
             args.format,
         ]
-        if combined_diff is not None and combined_diff.strip():
+        if combined_diff is not None:
             diff_path = Path(tmpdir) / "combined.diff"
             _write_utf8_file(diff_path, combined_diff)
             cmd.extend(["--diff-file", str(diff_path)])
         else:
-            cmd.extend(["--base", args.base])
+            cmd.extend(["--base", safe_base])
 
         all_rules: list[str] = [
             str(_resolve_path_from_cwd(extra_rule, cwd)) for extra_rule in (args.rules or [])
@@ -947,8 +1104,7 @@ def handle_apply_triage(args: argparse.Namespace, *, runner: CommandRunner) -> i
     if not replies and not resolve_only and summary_text is None and guardrail_items is None:
         raise PrOpsError("empty_plan", "適用対象の返信・Resolve・サマリ・再発防止策が 1 件も指定されていません。")
 
-    repo = _resolve_repo_slug(args.repo, cwd, runner)
-    pr_num = _resolve_pr_number(args.pr, repo, cwd, runner, explicit_repo=bool(args.repo))
+    repo, pr_num = _resolve_repo_and_pr(args.repo, args.pr, cwd, runner)
     owner, repo_name = repo.split("/", 1)
 
     existing_pr = _fetch_pr_view(pr_num, repo, cwd, runner, fields="headRefOid,body,comments,reviews")
@@ -1012,8 +1168,7 @@ def handle_apply_triage(args: argparse.Namespace, *, runner: CommandRunner) -> i
 
     target_thread_ids = {item["thread_id"] for item in replies} | set(resolve_only)
     if target_thread_ids:
-        _, existing_threads = _fetch_review_threads_graphql(owner, repo_name, pr_num, cwd, runner)
-        valid_thread_ids = {str(t.get("id") or "") for t in existing_threads}
+        valid_thread_ids = _fetch_review_thread_ids_graphql(owner, repo_name, pr_num, cwd, runner)
         foreign_ids = sorted(tid for tid in target_thread_ids if tid not in valid_thread_ids)
         if foreign_ids:
             raise PrOpsError(
@@ -1198,8 +1353,19 @@ def handle_commit_push(args: argparse.Namespace, *, runner: CommandRunner) -> in
                 f"--branch ({requested}) が現在のブランチ ({current_branch}) と一致しません。",
             )
 
-    requested_norm = {Path(p.replace("\\", "/")).as_posix() for p in staged_files}
-    cached_res = runner(["git", "-c", "core.quotePath=false", "diff", "--cached", "--name-only"], cwd, None)
+    prefix_res = runner(["git", "rev-parse", "--show-prefix"], cwd, None)
+    prefix = prefix_res.stdout.strip().replace("\\", "/") if prefix_res.returncode == 0 else ""
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    requested_norm = {
+        posixpath.normpath((prefix + p.replace("\\", "/")).lstrip("/"))
+        for p in staged_files
+    }
+    cached_res = runner(
+        ["git", "-c", "core.quotePath=false", "diff", "--cached", "--no-renames", "--name-only"],
+        cwd,
+        None,
+    )
     if cached_res.returncode == 0:
         already_staged = {
             line.strip().replace("\\", "/")
