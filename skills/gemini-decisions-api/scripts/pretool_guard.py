@@ -457,7 +457,7 @@ POSIX_GROUP_PREFIX_KEYWORDS = frozenset(
 
 
 def _strip_posix_line_continuations(text: str) -> str:
-    """単一引用外（非引用・二重引用内）の POSIX 行継続（\\+LF / \\+CRLF）を除去する。"""
+    """単一引用外（非引用・二重引用内）の POSIX 行継続（\\+LF）を除去する。"""
     out: list[str] = []
     in_single = False
     in_double = False
@@ -472,9 +472,6 @@ def _strip_posix_line_continuations(text: str) -> str:
             i += 1
             continue
         if ch == "\\":
-            if i + 2 < n and text[i + 1 : i + 3] == "\r\n":
-                i += 3
-                continue
             if i + 1 < n and text[i + 1] == "\n":
                 i += 2
                 continue
@@ -522,8 +519,6 @@ def _is_posix_command_start_pos(
     last_sep = -1
     group_stack: list[tuple[str, int, bool]] = []
     in_double_bracket = False
-    db_prev_sep = -1
-    db_is_compound = False
     in_single = False
     in_double = False
     pos = 0
@@ -552,12 +547,9 @@ def _is_posix_command_start_pos(
                 and before[pos : pos + 2] == "[["
                 and (pos == 0 or before[pos - 1].isspace() or before[pos - 1] in ";|&(")
                 and (pos + 2 >= n or before[pos + 2].isspace())
+                and _is_posix_prefix_at_command_start(before[last_sep + 1 : pos])
             ):
                 in_double_bracket = True
-                db_prev_sep = last_sep
-                db_is_compound = _is_posix_prefix_at_command_start(
-                    before[last_sep + 1 : pos]
-                )
                 last_sep = pos + 1
                 pos += 2
                 continue
@@ -565,10 +557,10 @@ def _is_posix_command_start_pos(
                 in_double_bracket
                 and before[pos : pos + 2] == "]]"
                 and (pos == 0 or before[pos - 1].isspace())
-                and (pos + 2 >= n or before[pos + 2].isspace() or before[pos + 2] in ";|&)")
+                and (pos + 2 >= n or before[pos + 2].isspace() or before[pos + 2] in ";|&)}")
             ):
                 in_double_bracket = False
-                last_sep = pos + 1 if db_is_compound else db_prev_sep
+                last_sep = pos + 1
                 pos += 2
                 continue
             elif not in_double_bracket and ch == "(":
@@ -626,9 +618,6 @@ def _is_group_brace_open(text: str, idx: int, *, posix_shell: bool) -> bool:
     if posix_shell:
         k = idx + 1
         while k < len(text) and text[k] == "\\":
-            if k + 2 < len(text) and text[k + 1 : k + 3] == "\r\n":
-                k += 3
-                continue
             if k + 1 < len(text) and text[k + 1] == "\n":
                 k += 2
                 continue
@@ -670,16 +659,11 @@ def _split_unquoted_top_level(command: str, *, posix_shell: bool = False) -> lis
             i += 1
             continue
 
-        if posix_shell and ch == "\\":
-            if i + 2 < n and command[i + 1 : i + 3] == "\r\n":
-                buf.append(command[i : i + 3])
-                i += 3
-                continue
-            if i + 1 < n:
-                buf.append(ch)
-                buf.append(command[i + 1])
-                i += 2
-                continue
+        if posix_shell and ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(command[i + 1])
+            i += 2
+            continue
 
         if ch in ("'", '"'):
             quote = ch
@@ -1006,13 +990,9 @@ def _find_matching_paren_subst(text: str, start: int, *, posix_shell: bool = Fal
                 quote = None
             i += 1
             continue
-        if posix_shell and ch == "\\":
-            if i + 2 < n and text[i + 1 : i + 3] == "\r\n":
-                i += 3
-                continue
-            if i + 1 < n:
-                i += 2
-                continue
+        if posix_shell and ch == "\\" and i + 1 < n:
+            i += 2
+            continue
         if ch in ("'", '"'):
             quote = ch
             i += 1
@@ -1296,13 +1276,9 @@ def _scan_group_and_flat_chunks(
                 quote = None
             i += 1
             continue
-        if posix_shell and ch == "\\":
-            if i + 2 < n and s[i + 1 : i + 3] == "\r\n":
-                i += 3
-                continue
-            if i + 1 < n:
-                i += 2
-                continue
+        if posix_shell and ch == "\\" and i + 1 < n:
+            i += 2
+            continue
         if ch in ("'", '"'):
             quote = ch
             i += 1
@@ -1313,6 +1289,7 @@ def _scan_group_and_flat_chunks(
                 and s[i : i + 2] == "[["
                 and (i == 0 or s[i - 1].isspace() or s[i - 1] in ";|&(")
                 and (i + 2 >= n or s[i + 2].isspace())
+                and (not posix_shell or _is_posix_command_start_pos(s, i))
             ):
                 in_double_bracket = True
                 i += 2
