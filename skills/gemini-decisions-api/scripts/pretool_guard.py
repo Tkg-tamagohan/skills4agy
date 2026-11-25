@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 from typing import Any, Callable
 
@@ -27,7 +28,7 @@ DECISION1_TIMEOUT_SECONDS = 8.0
 FALLBACK_REASON = "Decision 1 guard unavailable; fallback to standard confirmation."
 
 SHELL_META_RE = re.compile(r"[;&|><`\r\n\x00]|\$\(|\$\{")
-DISALLOWED_WHITELIST_META_RE = re.compile(r"[|><`\r\n\x00]|\$\(|\$\{")
+DISALLOWED_WHITELIST_ANYWHERE_RE = re.compile(r"[`\r\n\x00]|\$\(|\$\{")
 
 SAFE_ENV_VAR_VALIDATORS: dict[str, re.Pattern[str]] = {
     "PYTHONUTF8": re.compile(r"^[01]$"),
@@ -105,6 +106,7 @@ EXTERNAL_TRANSFER_COMMANDS = frozenset(
         "xh",
     }
 )
+INFO_ONLY_TRANSFER_FLAGS = frozenset({"--version", "-V", "--help"})
 
 DESTRUCTIVE_DISK_COMMANDS = frozenset(
     {
@@ -126,6 +128,139 @@ DESTRUCTIVE_DISK_COMMANDS = frozenset(
 
 COMMAND_WRAPPERS = frozenset({"sudo", "env", "nohup", "command", "time"})
 SHELL_WRAPPERS = frozenset({"sh", "bash", "zsh", "dash", "cmd", "powershell", "pwsh"})
+CODE_EXEC_SINKS = frozenset(
+    SHELL_WRAPPERS
+    | {
+        "iex",
+        "invoke-expression",
+        "invoke-command",
+        "icm",
+        "start-process",
+        "saps",
+        "start",
+        "eval",
+        "exec",
+        "source",
+        "python",
+        "python3",
+        "py",
+        "node",
+        "deno",
+        "bun",
+        "ruby",
+        "perl",
+        "php",
+        "awk",
+        "gawk",
+        "sed",
+        "xargs",
+        "wscript",
+        "cscript",
+        "mshta",
+        "rundll32",
+        "ssh",
+        "slogin",
+        "rsh",
+        "docker",
+        "podman",
+        "kubectl",
+        "wsl",
+        "su",
+        "doas",
+        "nsenter",
+        "chroot",
+        "winrm",
+        "psexec",
+        "enter-pssession",
+        "new-pssession",
+    }
+)
+SAFE_POSIX_HEREDOC_RECEIVERS = frozenset({"cat", "tee"})
+SAFE_POSIX_HEREDOC_OUTER_COMMANDS = frozenset(
+    {
+        "cat",
+        "tee",
+        "cd",
+        "set-location",
+        "sl",
+        "chdir",
+        "push-location",
+        "pushd",
+        "mkdir",
+        "ls",
+        "dir",
+        "wc",
+        "test",
+        "echo",
+        "printf",
+        "touch",
+    }
+)
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+TEAMWORK_SENDER_RE = re.compile(
+    r"\[Message\]\s+timestamp=\S+\s+sender="
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b"
+)
+MAX_TEAMWORK_PARENT_DEPTH = 8
+RG_VALUE_LONG_OPTS = frozenset(
+    {
+        "--regexp",
+        "--file",
+        "--glob",
+        "--iglob",
+        "--type",
+        "--type-not",
+        "--type-add",
+        "--type-clear",
+        "--max-count",
+        "--max-columns",
+        "--max-depth",
+        "--max-filesize",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--threads",
+        "--encoding",
+        "--color",
+        "--colors",
+        "--hostname-bin",
+        "--path-separator",
+        "--sort",
+        "--sortr",
+        "--engine",
+        "--context-separator",
+        "--field-context-separator",
+        "--field-match-separator",
+        "--replace",
+        "--dfa-size-limit",
+        "--regex-size-limit",
+    }
+)
+RG_VALUE_SHORT_CHARS = frozenset(
+    {"e", "f", "g", "t", "T", "m", "M", "d", "A", "B", "C", "j", "E", "r"}
+)
+SAFE_RELATIVE_TEMP_ROOTS = frozenset(
+    {
+        "tmp",
+        "temp",
+        ".tmp",
+        ".temp",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".cache",
+        "dist",
+        "build",
+        "coverage",
+    }
+)
+SAFE_CACHE_DIR_NAMES = frozenset(
+    {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tmp", ".temp"}
+)
+SAFE_TEMP_PARENT_NAMES = frozenset({"tmp", "temp", ".tmp", ".temp"})
 
 GIT_VALUE_GLOBAL_OPTS = frozenset(
     {"-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
@@ -289,19 +424,1038 @@ def _tokenize_lossy(segment: str) -> list[str]:
         return segment.split()
 
 
-def _split_top_level_segments(command: str) -> list[str]:
-    """連結記号・パイプ・改行および $() / バッククォート内をセグメント分割する。"""
-    raw_parts = re.split(r"&&|\|\||[;|&`]|[\r\n]+", command)
+def _split_top_level_segments_raw(
+    text: str, *, posix_shell: bool = False, allow_cmd_subst: bool = True
+) -> list[str]:
+    """連結記号・パイプ・改行および $() / バッククォート内をセグメント分割する（従来分割）。"""
+    raw_parts = re.split(r"&&|\|\||[;|&`]|[\r\n]+", text)
     segments: list[str] = []
     for part in raw_parts:
         stripped = part.strip()
         if not stripped:
             continue
         segments.append(stripped)
-        for sub in re.findall(r"\$\(([^)]+)\)", stripped):
-            sub_stripped = sub.strip()
-            if sub_stripped:
-                segments.append(sub_stripped)
+        if allow_cmd_subst:
+            for m in re.finditer(r"\$\(([^)]+)\)", stripped):
+                if posix_shell:
+                    backslashes = 0
+                    k = m.start() - 1
+                    while k >= 0 and stripped[k] == "\\":
+                        backslashes += 1
+                        k -= 1
+                    if backslashes % 2 == 1:
+                        continue
+                sub_stripped = m.group(1).strip()
+                if sub_stripped:
+                    segments.append(sub_stripped)
+    return segments
+
+
+POSIX_GROUP_PREFIX_KEYWORDS = frozenset(
+    {"if", "then", "else", "elif", "do", "while", "until", "time", "!"}
+)
+
+
+def _strip_posix_line_continuations(text: str) -> str:
+    """単一引用外（非引用・二重引用内）の POSIX 行継続（\\+LF）を除去する。"""
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_single:
+            out.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 1 < n and text[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 1 < n:
+                out.append(ch)
+                out.append(text[i + 1])
+                i += 2
+                continue
+        if not in_double and ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = not in_double
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _is_posix_prefix_at_command_start(prefix: str) -> bool:
+    """現在コマンドの接頭辞（制御語・前置代入）だけがグループ直前にあるか判定する。"""
+    stripped = prefix.strip()
+    if not stripped:
+        return True
+    cur = _strip_leading_assignments_text(stripped, posix_shell=True)
+    words = cur.split()
+    if not words:
+        return False
+    while words and words[0].lower() in POSIX_GROUP_PREFIX_KEYWORDS:
+        words.pop(0)
+    return not words
+
+
+def _is_posix_command_start_pos(
+    text: str, idx: int, *, extra_trailing: tuple[str, ...] = ()
+) -> bool:
+    """POSIX シェルで text[idx] がコマンド開始位置（行頭・区切り記号・制御語・関数定義直後）か判定する。"""
+    raw_before = _strip_posix_line_continuations(text[:idx])
+    if idx < len(text) and text[idx] == "(" and raw_before.endswith("="):
+        return False
+    before = raw_before.rstrip(" \t")
+    if not before:
+        return True
+    trailing = (";", "|", "&", "(", "{", "\n", "\r") + extra_trailing
+    if before.endswith(trailing):
+        return True
+    last_sep = -1
+    group_stack: list[tuple[str, int, bool]] = []
+    in_double_bracket = False
+    in_single = False
+    in_double = False
+    pos = 0
+    n = len(before)
+    while pos < n:
+        ch = before[pos]
+        if in_single:
+            if ch == "'":
+                in_single = False
+        elif in_double:
+            if ch == "\\" and pos + 1 < n:
+                pos += 2
+                continue
+            if ch == '"':
+                in_double = False
+        else:
+            if ch == "\\" and pos + 1 < n:
+                pos += 2
+                continue
+            if ch == "'":
+                in_single = True
+            elif ch == '"':
+                in_double = True
+            elif (
+                not in_double_bracket
+                and before[pos : pos + 2] == "[["
+                and (pos == 0 or before[pos - 1].isspace() or before[pos - 1] in ";|&(")
+                and (pos + 2 >= n or before[pos + 2].isspace())
+                and _is_posix_prefix_at_command_start(before[last_sep + 1 : pos])
+            ):
+                in_double_bracket = True
+                last_sep = pos + 1
+                pos += 2
+                continue
+            elif (
+                in_double_bracket
+                and before[pos : pos + 2] == "]]"
+                and (pos == 0 or before[pos - 1].isspace())
+                and (pos + 2 >= n or before[pos + 2].isspace() or before[pos + 2] in ";|&)}")
+            ):
+                in_double_bracket = False
+                last_sep = pos + 1
+                pos += 2
+                continue
+            elif not in_double_bracket and ch == "(":
+                prev_ch = before[pos - 1] if pos > 0 else ""
+                is_compound = (
+                    False
+                    if prev_ch in ("$", "@", "=")
+                    else _is_posix_prefix_at_command_start(before[last_sep + 1 : pos])
+                )
+                group_stack.append((")", last_sep, is_compound))
+                last_sep = pos
+            elif (
+                not in_double_bracket
+                and ch == "{"
+                and (pos == 0 or before[pos - 1] not in ("$", "@"))
+                and (pos + 1 >= n or before[pos + 1].isspace() or before[pos + 1] in "\r\n")
+            ):
+                is_compound = _is_posix_prefix_at_command_start(
+                    before[last_sep + 1 : pos]
+                )
+                group_stack.append(("}", last_sep, is_compound))
+                last_sep = pos
+            elif not in_double_bracket and group_stack and ch == group_stack[-1][0]:
+                _, prev_sep, is_compound = group_stack.pop()
+                last_sep = pos if is_compound else prev_sep
+            elif not in_double_bracket and ch in (";", "|", "&", "\n", "\r"):
+                last_sep = pos
+        pos += 1
+    cur = _strip_leading_assignments_text(
+        before[last_sep + 1 :].strip(), posix_shell=True
+    )
+    words = cur.split()
+    if not words:
+        return False
+    while words and words[0].lower() in POSIX_GROUP_PREFIX_KEYWORDS:
+        words.pop(0)
+    if not words:
+        return True
+    if len(words) == 1 and (words[0].endswith("()") or words[0].lower() == "coproc"):
+        return True
+    if len(words) == 2 and (
+        words[0].lower() in {"function", "coproc"} or words[1] == "()"
+    ):
+        return True
+    if len(words) == 3 and words[0].lower() == "function" and words[2] == "()":
+        return True
+    return False
+
+
+def _is_group_brace_open(text: str, idx: int, *, posix_shell: bool) -> bool:
+    """text[idx] == '{' が単語内ブレース展開・表示引数ではなくコマンドグループ/ブロック開始か判定する。"""
+    prev_ch = text[idx - 1] if idx > 0 else ""
+    if prev_ch in ("$", "@"):
+        return False
+    if posix_shell:
+        k = idx + 1
+        while k < len(text) and text[k] == "\\":
+            if k + 1 < len(text) and text[k + 1] == "\n":
+                k += 2
+                continue
+            break
+        next_ok = k >= len(text) or text[k].isspace() or text[k] in "\r\n"
+        return next_ok and _is_posix_command_start_pos(text, idx)
+    return idx == 0 or prev_ch.isspace() or prev_ch in ";|&(){"
+
+
+def _is_group_paren_open(text: str, idx: int, *, posix_shell: bool) -> bool:
+    """text[idx] == '(' が配列代入 var=(...) や変数リテラルではなく実行グループ/置換か判定する。"""
+    prev_ch = text[idx - 1] if idx > 0 else ""
+    if prev_ch in ("$", "@"):
+        return False
+    if posix_shell:
+        return _is_posix_command_start_pos(text, idx, extra_trailing=("<", ">"))
+    return True
+
+
+def _split_unquoted_top_level(command: str, *, posix_shell: bool = False) -> list[str] | None:
+    """クォート・グループ括弧外の連結記号・パイプ・改行で分割する。未閉鎖時は None を返す。"""
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    group_stack: list[str] = []
+    i = 0
+    n = len(command)
+
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            elif posix_shell and quote == '"' and ch == "\\" and i + 1 < n and command[i + 1] in ('"', "\\"):
+                buf.append(command[i + 1])
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if posix_shell and ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(command[i + 1])
+            i += 2
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == "(":
+            if group_stack or not (i > 0 and command[i - 1] in ("$", "@")):
+                group_stack.append(")")
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == "{":
+            if group_stack or _is_group_brace_open(command, i, posix_shell=posix_shell):
+                group_stack.append("}")
+            buf.append(ch)
+            i += 1
+            continue
+
+        if group_stack and ch == group_stack[-1]:
+            group_stack.pop()
+            buf.append(ch)
+            i += 1
+            continue
+
+        if not group_stack and command[i : i + 2] in ("&&", "||"):
+            seg = "".join(buf).strip()
+            if seg:
+                parts.append(seg)
+            buf = []
+            i += 2
+            continue
+
+        if not group_stack and ch in ";|&\r\n":
+            seg = "".join(buf).strip()
+            if seg:
+                parts.append(seg)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    if quote is not None or group_stack:
+        return None
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _extract_rg_pre_info(args: list[str]) -> tuple[bool, list[str]]:
+    """rg 引数列をオプション境界（-- および値消費フラグ）に従って走査し (--pre/--pre-glob 有無, --pre コマンド列) を返す。"""
+    has_pre = False
+    pre_cmds: list[str] = []
+    i = 0
+    n = len(args)
+    while i < n:
+        arg = args[i]
+        low = arg.lower()
+        if arg == "--":
+            break
+        if low == "--pre":
+            has_pre = True
+            if i + 1 < n:
+                pre_cmds.append(args[i + 1])
+                i += 2
+                continue
+            i += 1
+            continue
+        if low.startswith("--pre="):
+            has_pre = True
+            pre_cmds.append(arg.split("=", 1)[1])
+            i += 1
+            continue
+        if low == "--pre-glob":
+            has_pre = True
+            i += 2 if i + 1 < n else 1
+            continue
+        if low.startswith("--pre-glob="):
+            has_pre = True
+            i += 1
+            continue
+        if low in RG_VALUE_LONG_OPTS:
+            i += 2 if i + 1 < n else 1
+            continue
+        if (
+            arg.startswith("-")
+            and not arg.startswith("--")
+            and len(arg) > 1
+            and arg[-1] in RG_VALUE_SHORT_CHARS
+            and not any(ch in RG_VALUE_SHORT_CHARS for ch in arg[1:-1])
+        ):
+            i += 2 if i + 1 < n else 1
+            continue
+        i += 1
+    return has_pre, pre_cmds
+
+
+LEADING_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+
+
+def _strip_leading_assignments_text(
+    segment: str, *, posix_shell: bool = False
+) -> str:
+    """クォート除去前の生文字列から先頭の環境変数・配列代入（VAR=val / VAR=(...)）を読み飛ばす。"""
+    n = len(segment)
+    pos = 0
+    while pos < n:
+        while pos < n and segment[pos].isspace():
+            pos += 1
+        if pos >= n:
+            return ""
+        m = LEADING_ASSIGN_RE.match(segment[pos:])
+        if not m:
+            break
+        j = pos + m.end()
+        if j < n and segment[j] == "(":
+            depth = 1
+            quote: str | None = None
+            k = j + 1
+            while k < n and depth > 0:
+                ch = segment[k]
+                if quote == "'":
+                    if ch == "'":
+                        quote = None
+                    k += 1
+                    continue
+                if quote == '"':
+                    if posix_shell and ch == "\\" and k + 1 < n and segment[k + 1] in ('"', "\\"):
+                        k += 2
+                        continue
+                    if ch == '"':
+                        quote = None
+                    k += 1
+                    continue
+                if posix_shell and ch == "\\" and k + 1 < n:
+                    k += 2
+                    continue
+                if ch in ("'", '"'):
+                    quote = ch
+                    k += 1
+                    continue
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            if depth > 0 or k >= n:
+                break
+            if k + 1 < n and not segment[k + 1].isspace():
+                break
+            pos = k + 1
+            continue
+
+        quote = None
+        k = j
+        while k < n:
+            ch = segment[k]
+            if quote == "'":
+                if ch == "'":
+                    quote = None
+                k += 1
+                continue
+            if quote == '"':
+                if posix_shell and ch == "\\" and k + 1 < n and segment[k + 1] in ('"', "\\"):
+                    k += 2
+                    continue
+                if ch == '"':
+                    quote = None
+                k += 1
+                continue
+            if posix_shell and ch == "\\" and k + 1 < n:
+                k += 2
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                k += 1
+                continue
+            if ch.isspace():
+                break
+            k += 1
+        if quote is not None:
+            break
+        pos = k
+
+    return segment[pos:].strip()
+
+
+def _is_safe_rg_segment(segment: str, *, posix_shell: bool = False) -> bool:
+    """--pre / --pre-glob を含まない単一の rg コマンドセグメントか判定する。"""
+    cleaned = _strip_leading_assignments_text(segment, posix_shell=posix_shell)
+    if not cleaned:
+        return False
+    try:
+        tokens = _tokenize_command(cleaned)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if "=" in tok and not tok.startswith("-"):
+            idx += 1
+            continue
+        break
+    if idx >= len(tokens) or _command_basename(tokens[idx]) != "rg":
+        return False
+    has_pre, _ = _extract_rg_pre_info(tokens[idx + 1 :])
+    return not has_pre
+
+
+def _is_shell_wrapper_segment(segment: str, *, posix_shell: bool = False) -> bool:
+    """インライン実行フラグ（-c / -Command 等）付きのシェル起動セグメントか判定する。"""
+    cleaned = _strip_leading_assignments_text(segment, posix_shell=posix_shell)
+    if not cleaned:
+        return False
+    try:
+        tokens = _tokenize_command(cleaned)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    idx = 0
+    while idx < len(tokens):
+        base = _command_basename(tokens[idx])
+        if base in COMMAND_WRAPPERS:
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                idx += 1
+            continue
+        if "=" in tokens[idx] and not tokens[idx].startswith("-") and idx + 1 < len(tokens):
+            idx += 1
+            continue
+        break
+    if idx >= len(tokens):
+        return False
+    head = _command_basename(tokens[idx])
+    if head not in SHELL_WRAPPERS:
+        return False
+    is_unix_shell = head in {"sh", "bash", "zsh", "dash"}
+    for i, tok in enumerate(tokens[idx + 1 :], start=idx + 1):
+        low = tok.lower()
+        is_cmd_flag = low in {"-c", "/c", "/k", "-command", "-encodedcommand"} or (
+            is_unix_shell and low.startswith("-") and not low.startswith("--") and "c" in low[1:]
+        )
+        if is_cmd_flag and i + 1 < len(tokens):
+            return True
+    return False
+
+
+def _find_matching_backtick(text: str, start: int, *, in_double_quote: bool) -> int | None:
+    """` の直後から対応する閉じ ` の位置をエスケープを考慮して返す。未閉鎖時は None。"""
+    escapable = {"$", "`", "\\"}
+    if in_double_quote:
+        escapable.add('"')
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] in escapable:
+            i += 2
+            continue
+        if ch == "`":
+            return i
+        i += 1
+    return None
+
+
+def _unescape_backtick_body(body: str, *, in_double_quote: bool) -> str:
+    """バッククォートコマンド置換内のシェルエスケープを1パスで解除する。"""
+    escapable = {"$", "`", "\\"}
+    if in_double_quote:
+        escapable.add('"')
+    out: list[str] = []
+    i = 0
+    n = len(body)
+    while i < n:
+        if body[i] == "\\" and i + 1 < n and body[i + 1] in escapable:
+            out.append(body[i + 1])
+            i += 2
+            continue
+        out.append(body[i])
+        i += 1
+    return "".join(out)
+
+
+def _find_matching_paren_subst(text: str, start: int, *, posix_shell: bool = False) -> int | None:
+    """$( の直後から対応する ) の位置をクォート・ネストを考慮して返す。未閉鎖時は None。"""
+    depth = 1
+    quote: str | None = None
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if posix_shell and ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if text[i : i + 2] == "$(":
+                end = _find_matching_paren_subst(text, i + 2, posix_shell=posix_shell)
+                if end is None:
+                    return None
+                i = end + 1
+                continue
+            if ch == "`":
+                end = _find_matching_backtick(text, i + 1, in_double_quote=True)
+                if end is None:
+                    return None
+                i = end + 1
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if posix_shell and ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if text[i : i + 2] == "$(":
+            end = _find_matching_paren_subst(text, i + 2, posix_shell=posix_shell)
+            if end is None:
+                return None
+            i = end + 1
+            continue
+        if ch == "`":
+            end = _find_matching_backtick(text, i + 1, in_double_quote=False)
+            if end is None:
+                return None
+            i = end + 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _extract_command_substitutions(text: str, *, posix_shell: bool = False) -> list[str]:
+    """単一引用外（未引用＋ダブルクォート内）からエスケープを除外し対応が閉じた $(...) / `...` 本体を再帰抽出する。"""
+    bodies: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if posix_shell and ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if text[i : i + 2] == "$(":
+                end = _find_matching_paren_subst(text, i + 2, posix_shell=posix_shell)
+                if end is not None:
+                    body = text[i + 2 : end]
+                    if body.strip():
+                        bodies.append(body)
+                        bodies.extend(_extract_command_substitutions(body, posix_shell=posix_shell))
+                    i = end + 1
+                    continue
+                i += 2
+                continue
+            if ch == "`":
+                end = _find_matching_backtick(text, i + 1, in_double_quote=True)
+                if end is not None:
+                    body = _unescape_backtick_body(text[i + 1 : end], in_double_quote=True)
+                    if body.strip():
+                        bodies.append(body)
+                        bodies.extend(_extract_command_substitutions(body, posix_shell=posix_shell))
+                    i = end + 1
+                    continue
+                i += 1
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if posix_shell and ch == "\\" and i + 1 < n and text[i + 1] in ("$", "`", "\\", "'", '"'):
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if text[i : i + 2] == "$(":
+            end = _find_matching_paren_subst(text, i + 2, posix_shell=posix_shell)
+            if end is not None:
+                body = text[i + 2 : end]
+                if body.strip():
+                    bodies.append(body)
+                    bodies.extend(_extract_command_substitutions(body, posix_shell=posix_shell))
+                i = end + 1
+                continue
+            i += 2
+            continue
+        if ch == "`":
+            end = _find_matching_backtick(text, i + 1, in_double_quote=False)
+            if end is not None:
+                body = _unescape_backtick_body(text[i + 1 : end], in_double_quote=False)
+                if body.strip():
+                    bodies.append(body)
+                    bodies.extend(_extract_command_substitutions(body, posix_shell=posix_shell))
+                i = end + 1
+                continue
+            i += 1
+            continue
+        i += 1
+    return bodies
+
+
+def _extract_rg_substitutions(
+    segment: str, *, posix_shell: bool = False, allow_cmd_subst: bool = True
+) -> list[str]:
+    """単一引用外（未引用＋ダブルクォート内）から $(...) と `...` の中身を抽出しグループ含め引用境界で分割する。"""
+    if not allow_cmd_subst:
+        return []
+    subs: list[str] = []
+    for body in _extract_command_substitutions(segment, posix_shell=posix_shell):
+        subs.extend(
+            _split_quote_aware_command_strings(
+                body, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+            )
+        )
+    return subs
+
+
+CONTROL_SEGMENT_HEAD_RE = re.compile(
+    r"^(?:[@({]|(?:if|then|else|elif|for|do|while|until)(?=$|[\s({]))",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_control_or_group_segment(segment: str) -> bool:
+    """制御構文キーワード（if/then/else/for/do 等）やグループ括弧・@ で始まるセグメントか判定する。"""
+    return bool(CONTROL_SEGMENT_HEAD_RE.match(segment.lstrip()))
+
+
+def _scan_flat_control_tokens(
+    chunk: str, *, posix_shell: bool = False
+) -> list[tuple[str, int, int, bool]]:
+    """平坦な制御構文チャンクをクォート境界付きでトークン化し (token, start, end, was_quoted) を返す。"""
+    tokens: list[tuple[str, int, int, bool]] = []
+    n = len(chunk)
+    i = 0
+    while i < n:
+        while i < n and chunk[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        start = i
+        quote: str | None = None
+        was_quoted = False
+        while i < n:
+            ch = chunk[i]
+            if quote == "'":
+                if ch == "'":
+                    quote = None
+                i += 1
+                continue
+            if quote == '"':
+                if posix_shell and ch == "\\" and i + 1 < n and chunk[i + 1] in ('"', "\\"):
+                    i += 2
+                    continue
+                if ch == '"':
+                    quote = None
+                i += 1
+                continue
+            if ch.isspace():
+                break
+            if ch in ("'", '"'):
+                quote = ch
+                was_quoted = True
+                i += 1
+                continue
+            if posix_shell and ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            i += 1
+        tokens.append((chunk[start:i], start, i, was_quoted))
+    return tokens
+
+
+def _split_flat_control_chunk(chunk: str, *, posix_shell: bool = False) -> list[str]:
+    """括弧グループ除去後の平坦な制御構文チャンクから構文位置に従って実コマンド句を抽出する。"""
+    toks = _scan_flat_control_tokens(chunk, posix_shell=posix_shell)
+    if not toks:
+        return []
+
+    first_tok, _, _, first_quoted = toks[0]
+    first_low = first_tok.lower()
+    if not first_quoted:
+        if first_low in {"fi", "done", "esac"} and len(toks) == 1:
+            return []
+        if first_low in {"then", "else", "do", "while", "until"}:
+            if len(toks) <= 1:
+                return []
+            if len(toks) == 2 and not toks[1][3] and toks[1][0].lower() in {"fi", "done", "esac"}:
+                return []
+            clause = chunk[toks[1][1] : toks[-1][2]].strip()
+            return [clause] if clause else []
+        if first_low == "for":
+            for j, (tok, _, _, quoted) in enumerate(toks[1:], start=1):
+                if not quoted and tok.lower() == "do":
+                    if j + 1 < len(toks):
+                        clause = chunk[toks[j + 1][1] : toks[-1][2]].strip()
+                        return [clause] if clause else []
+                    return []
+            return []
+        if first_low in {"if", "elif"}:
+            k = 1
+            if k < len(toks) and not toks[k][3] and toks[k][0].lower() == "not":
+                k += 1
+            if k < len(toks) and not toks[k][3] and toks[k][0].lower() == "/i":
+                k += 1
+            is_cmd_cond = False
+            cmd_idx = 1
+            if (
+                k < len(toks)
+                and not toks[k][3]
+                and toks[k][0].lower() in {"exist", "errorlevel", "defined"}
+            ):
+                is_cmd_cond = True
+                cmd_idx = k + 2
+            elif k < len(toks) and not toks[k][3] and "==" in toks[k][0]:
+                is_cmd_cond = True
+                cmd_idx = k + 1
+            elif (
+                k + 2 < len(toks)
+                and not toks[k + 1][3]
+                and toks[k + 1][0].lower() in {"==", "equ", "neq", "lss", "leq", "gtr", "geq"}
+            ):
+                is_cmd_cond = True
+                cmd_idx = k + 3
+
+            if cmd_idx >= len(toks):
+                return []
+            if is_cmd_cond:
+                cmd_clauses: list[str] = []
+                seg_start_idx = cmd_idx
+                for idx_tok in range(cmd_idx, len(toks)):
+                    tok, _, _, quoted = toks[idx_tok]
+                    if not quoted and tok.lower() == "else":
+                        if seg_start_idx < idx_tok:
+                            part = chunk[toks[seg_start_idx][1] : toks[idx_tok - 1][2]].strip()
+                            if part:
+                                cmd_clauses.append(part)
+                        seg_start_idx = idx_tok + 1
+                if seg_start_idx < len(toks):
+                    part = chunk[toks[seg_start_idx][1] : toks[-1][2]].strip()
+                    if part:
+                        cmd_clauses.append(part)
+                return cmd_clauses
+
+            clause = chunk[toks[1][1] : toks[-1][2]].strip()
+            return [clause] if clause else []
+
+    stripped = chunk.strip()
+    return [stripped] if stripped else []
+
+
+def _scan_group_and_flat_chunks(
+    segment: str, *, posix_shell: bool = False
+) -> tuple[list[str], list[str]]:
+    """(...) / {...} グループ本体列と、グループ外の平坦なテキスト断片列を抽出する。"""
+    s = segment.strip()
+    if not s:
+        return [], []
+
+    group_bodies: list[str] = []
+    flat_chunks: list[str] = []
+    quote: str | None = None
+    stack: list[tuple[str, int]] = []
+    in_double_bracket = False
+    flat_start = 0
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if posix_shell and ch == "\\" and i + 1 < n and s[i + 1] in ('"', "\\"):
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if posix_shell and ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if not stack:
+            if (
+                not in_double_bracket
+                and s[i : i + 2] == "[["
+                and (i == 0 or s[i - 1].isspace() or s[i - 1] in ";|&(")
+                and (i + 2 >= n or s[i + 2].isspace())
+                and (not posix_shell or _is_posix_command_start_pos(s, i))
+            ):
+                in_double_bracket = True
+                i += 2
+                continue
+            if (
+                in_double_bracket
+                and s[i : i + 2] == "]]"
+                and (i == 0 or s[i - 1].isspace())
+                and (i + 2 >= n or s[i + 2].isspace() or s[i + 2] in ";|&)")
+            ):
+                in_double_bracket = False
+                i += 2
+                continue
+        if not in_double_bracket and ch in ("(", "{"):
+            closing = ")" if ch == "(" else "}"
+            if not stack:
+                is_group_open = (
+                    _is_group_paren_open(s, i, posix_shell=posix_shell)
+                    if ch == "("
+                    else _is_group_brace_open(s, i, posix_shell=posix_shell)
+                )
+                if is_group_open:
+                    flat_chunks.append(s[flat_start:i])
+                    stack.append((closing, i + 1))
+            else:
+                stack.append((closing, i + 1))
+            i += 1
+            continue
+        if stack and ch == stack[-1][0]:
+            _, opened_at = stack.pop()
+            if not stack:
+                inner = s[opened_at:i].strip()
+                if inner:
+                    group_bodies.append(inner)
+                flat_start = i + 1
+            i += 1
+            continue
+        i += 1
+
+    if stack:
+        _, outermost_open = stack[0]
+        unclosed_inner = s[outermost_open:].strip()
+        if unclosed_inner:
+            group_bodies.append(unclosed_inner)
+    else:
+        flat_chunks.append(s[flat_start:])
+
+    return group_bodies, flat_chunks
+
+
+def _extract_embedded_group_bodies(
+    segment: str, *, posix_shell: bool = False
+) -> list[str]:
+    """非制御コマンドセグメント内に埋め込まれた (...) / {...} ブロック本体を抽出する。"""
+    group_bodies, _ = _scan_group_and_flat_chunks(segment, posix_shell=posix_shell)
+    return group_bodies
+
+
+def _extract_control_clauses_from_text(
+    segment: str, *, posix_shell: bool = False
+) -> list[str]:
+    """制御構文や (...) / {...} グループから実際にコマンド位置へ現れる内側句のみを抽出する。"""
+    s = segment.strip()
+    if not s:
+        return []
+    if s.startswith("@") and not s.startswith(("@'", '@"')):
+        rest = s[1:].strip()
+        return [rest] if rest else []
+
+    clauses, flat_chunks = _scan_group_and_flat_chunks(s, posix_shell=posix_shell)
+    for fc in flat_chunks:
+        if fc.strip():
+            clauses.extend(_split_flat_control_chunk(fc, posix_shell=posix_shell))
+    return clauses
+
+
+def _split_quote_aware_command_strings(
+    text: str, *, posix_shell: bool = False, allow_cmd_subst: bool = True
+) -> list[str]:
+    """引用境界を保ったまま制御構文・グループ・スクリプトブロックを含むコマンド句列へ分割する。"""
+    parts = _split_unquoted_top_level(text, posix_shell=posix_shell)
+    if parts is None:
+        return _split_top_level_segments_raw(
+            text, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+        )
+
+    out: list[str] = []
+    for part in parts:
+        if _looks_like_control_or_group_segment(part):
+            clauses = _extract_control_clauses_from_text(part, posix_shell=posix_shell)
+            if clauses and not (len(clauses) == 1 and clauses[0].strip() == part.strip()):
+                for clause in clauses:
+                    out.extend(
+                        _split_quote_aware_command_strings(
+                            clause,
+                            posix_shell=posix_shell,
+                            allow_cmd_subst=allow_cmd_subst,
+                        )
+                    )
+                continue
+        out.append(part)
+        for body in _extract_embedded_group_bodies(part, posix_shell=posix_shell):
+            if body.strip() != part.strip():
+                out.extend(
+                    _split_quote_aware_command_strings(
+                        body,
+                        posix_shell=posix_shell,
+                        allow_cmd_subst=allow_cmd_subst,
+                    )
+                )
+    return out
+
+
+def _split_top_level_segments(
+    command: str, *, posix_shell: bool = False, allow_cmd_subst: bool = True
+) -> list[str]:
+    """連結記号・パイプ・改行および $() / バッククォート内をセグメント分割する。"""
+    unquoted_parts = _split_unquoted_top_level(command, posix_shell=posix_shell)
+    if unquoted_parts is None:
+        return _split_top_level_segments_raw(
+            command, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+        )
+
+    segments: list[str] = []
+    extract_outer_subs = False
+    for part in unquoted_parts:
+        if _is_safe_rg_segment(part, posix_shell=posix_shell) or _is_shell_wrapper_segment(
+            part, posix_shell=posix_shell
+        ):
+            segments.append(part)
+            extract_outer_subs = True
+        elif _looks_like_control_or_group_segment(part):
+            clauses = _extract_control_clauses_from_text(part, posix_shell=posix_shell)
+            if clauses and not (len(clauses) == 1 and clauses[0].strip() == part.strip()):
+                for clause in clauses:
+                    segments.extend(
+                        _split_top_level_segments(
+                            clause,
+                            posix_shell=posix_shell,
+                            allow_cmd_subst=allow_cmd_subst,
+                        )
+                    )
+                if allow_cmd_subst:
+                    segments.extend(
+                        _extract_rg_substitutions(
+                            part, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+                        )
+                    )
+            else:
+                segments.extend(
+                    _split_top_level_segments_raw(
+                        part, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+                    )
+                )
+        else:
+            segments.extend(
+                _split_top_level_segments_raw(
+                    part, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+                )
+            )
+    if extract_outer_subs and allow_cmd_subst:
+        segments.extend(
+            _extract_rg_substitutions(
+                command, posix_shell=posix_shell, allow_cmd_subst=allow_cmd_subst
+            )
+        )
     return segments
 
 
@@ -314,8 +1468,10 @@ def _command_basename(token: str) -> str:
     return name
 
 
-def _unwrap_segment_tokens(tokens: list[str]) -> list[list[str]]:
-    """sudo 等のラッパーや bash -c / cmd /c 内のコマンド列を展開して返す。"""
+def _unwrap_segment_tokens(
+    tokens: list[str], *, posix_shell: bool = False
+) -> list[list[str]]:
+    """sudo 等のラッパーや bash -c / cmd /c / rg --pre 内のコマンド列を展開して返す。"""
     if not tokens:
         return []
 
@@ -348,17 +1504,39 @@ def _unwrap_segment_tokens(tokens: list[str]) -> list[list[str]]:
             )
             if is_cmd_flag and i + 1 < len(sub_tokens):
                 nested = " ".join(sub_tokens[i + 1 :])
-                for seg in _split_top_level_segments(nested):
-                    results.extend(_unwrap_segment_tokens(_tokenize_lossy(seg)))
+                child_allow_cmd_subst = head != "cmd"
+                for seg in _split_top_level_segments(
+                    nested,
+                    posix_shell=is_unix_shell,
+                    allow_cmd_subst=child_allow_cmd_subst,
+                ):
+                    results.extend(_tokenize_and_unwrap(seg, posix_shell=is_unix_shell))
                 break
+    elif head == "rg":
+        _, pre_cmds = _extract_rg_pre_info(sub_tokens[1:])
+        for nested in pre_cmds:
+            if nested:
+                for seg in _split_top_level_segments(nested, posix_shell=posix_shell):
+                    results.extend(_tokenize_and_unwrap(seg, posix_shell=posix_shell))
     return results
 
 
-def _collect_all_command_segments(command: str) -> list[list[str]]:
+def _tokenize_and_unwrap(
+    segment: str, *, posix_shell: bool = False
+) -> list[list[str]]:
+    """先頭代入を除外した上でセグメント文字列をトークン化・展開して返す。"""
+    cleaned = _strip_leading_assignments_text(segment, posix_shell=posix_shell)
+    if not cleaned:
+        return []
+    return _unwrap_segment_tokens(_tokenize_lossy(cleaned), posix_shell=posix_shell)
+
+
+def _collect_all_command_segments(
+    command: str, *, posix_shell: bool = False
+) -> list[list[str]]:
     all_segments: list[list[str]] = []
-    for seg in _split_top_level_segments(command):
-        tokens = _tokenize_lossy(seg)
-        all_segments.extend(_unwrap_segment_tokens(tokens))
+    for seg in _split_top_level_segments(command, posix_shell=posix_shell):
+        all_segments.extend(_tokenize_and_unwrap(seg, posix_shell=posix_shell))
     return all_segments
 
 
@@ -416,6 +1594,9 @@ def _has_external_transfer(segments: list[list[str]]) -> bool:
         if not tokens:
             continue
         if _command_basename(tokens[0]) in EXTERNAL_TRANSFER_COMMANDS:
+            args = tokens[1:]
+            if args and all(a in INFO_ONLY_TRANSFER_FLAGS for a in args):
+                continue
             return True
     return False
 
@@ -545,7 +1726,225 @@ def _has_recursive_flag(args: list[str], *, short_chars: str) -> bool:
     return False
 
 
-def _check_destructive_command(tokens: list[str]) -> str | None:
+def _is_reparse_or_symlink(path: Path) -> bool:
+    """パスがシンボリックリンクまたは Windows リパースポイント（ジャンクション等）か判定する。"""
+    try:
+        if os.path.islink(path):
+            return True
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if reparse_flag:
+            st = os.lstat(path)
+            if getattr(st, "st_file_attributes", 0) & reparse_flag:
+                return True
+        return False
+    except OSError:
+        return True
+
+
+def _has_unsafe_temp_reparse_or_escape(anchor_path: Path, check_parts: list[str]) -> bool:
+    """アンカー以降の既存コンポーネントにリンクや外部逸脱がないか検証する。"""
+    cur = anchor_path
+    existing_deepest = anchor_path if os.path.lexists(anchor_path) else None
+    for seg in check_parts:
+        cur = cur / seg
+        if os.path.lexists(cur):
+            if _is_reparse_or_symlink(cur):
+                return True
+            existing_deepest = cur
+    if existing_deepest is not None and os.path.lexists(anchor_path):
+        try:
+            real_anchor = Path(os.path.realpath(anchor_path))
+            real_deepest = Path(os.path.realpath(existing_deepest))
+            if not real_deepest.is_relative_to(real_anchor):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _is_safe_teamwork_temp_delete_target(target: str, *, cwd: str = "") -> bool:
+    """/teamwork 中の削除対象が安全な一時・キャッシュ・scratch 配下（リンクなし）か検証する。"""
+    raw = target.strip()
+    if not raw or any(ord(ch) < 32 for ch in raw):
+        return False
+    if raw.startswith(("\\\\", "//")):
+        return False
+    if any(ch in raw for ch in "*?[],`") or "$(" in raw:
+        return False
+
+    norm = raw.replace("\\", "/").rstrip("/")
+    if not norm:
+        return False
+    parts = [p for p in norm.split("/") if p]
+    if not parts:
+        return False
+    if ".." in parts:
+        return False
+    low_parts = [p.lower() for p in parts]
+    if any(part in (SENSITIVE_CD_DIR_NAMES | {".git"}) for part in low_parts):
+        return False
+
+    env_temp_m = re.match(r"^\$env:(TEMP|TMP)/(.+)$", norm, re.IGNORECASE)
+    if env_temp_m:
+        env_name = env_temp_m.group(1).upper()
+        tail = env_temp_m.group(2)
+        if "$" in tail or ":" in tail:
+            return False
+        tail_parts = [p for p in tail.split("/") if p]
+        if not tail_parts:
+            return False
+        env_root_val = os.environ.get(env_name, "").strip()
+        if env_root_val and _has_unsafe_temp_reparse_or_escape(Path(env_root_val), tail_parts):
+            return False
+        return True
+
+    if "$" in norm:
+        return False
+    if ":" in norm:
+        if norm.count(":") != 1 or not re.match(r"^[A-Za-z]:/", norm):
+            return False
+
+    is_unix_abs = norm.startswith("/")
+    is_win_abs = bool(re.match(r"^[A-Za-z]:/", norm))
+    is_abs = is_unix_abs or is_win_abs
+
+    anchor_index: int | None = None
+    rel_parts: list[str] = []
+
+    if is_unix_abs and len(parts) >= 2 and low_parts[0] == "tmp":
+        anchor_index = 1
+    elif is_unix_abs and len(parts) >= 3 and low_parts[:2] == ["var", "tmp"]:
+        anchor_index = 2
+    elif is_win_abs and len(parts) >= 3 and low_parts[1] in {"temp", "tmp"}:
+        anchor_index = 1
+    elif (
+        is_win_abs
+        and len(parts) >= 6
+        and low_parts[1] == "users"
+        and low_parts[3:6] == ["appdata", "local", "temp"]
+    ):
+        anchor_index = 6
+    else:
+        # Antigravity .gemini/antigravity/brain/<uuid>/scratch/<child...>
+        for idx in range(len(low_parts) - 5):
+            if (
+                low_parts[idx : idx + 3] == [".gemini", "antigravity", "brain"]
+                and UUID_RE.fullmatch(parts[idx + 3])
+                and low_parts[idx + 4] == "scratch"
+            ):
+                anchor_index = idx
+                break
+
+    if anchor_index is None:
+        if not is_abs:
+            rel_parts = list(parts)
+            while rel_parts and rel_parts[0] == ".":
+                rel_parts.pop(0)
+            if not rel_parts or rel_parts[0].lower() not in SAFE_RELATIVE_TEMP_ROOTS:
+                return False
+            anchor_index = 0
+        else:
+            if low_parts[-1] in SAFE_CACHE_DIR_NAMES and len(parts) >= 2:
+                anchor_index = len(parts) - 1
+            else:
+                for idx in range(1, len(parts) - 1):
+                    if low_parts[idx] in SAFE_TEMP_PARENT_NAMES:
+                        anchor_index = idx
+                        break
+
+    if anchor_index is None:
+        return False
+
+    if not is_abs:
+        anchor_path = Path(cwd) if cwd else Path.cwd()
+        check_parts = rel_parts
+    elif is_unix_abs:
+        anchor_path = Path("/" + "/".join(parts[:anchor_index]))
+        check_parts = parts[anchor_index:]
+    else:
+        anchor_path = Path(parts[0] + "/" + "/".join(parts[1:anchor_index]))
+        check_parts = parts[anchor_index:]
+
+    if not check_parts:
+        return False
+    if _has_unsafe_temp_reparse_or_escape(anchor_path, check_parts):
+        return False
+    return True
+
+
+def _extract_safe_temp_delete_targets(head: str, args: list[str]) -> list[str] | None:
+    """rm / Remove-Item / del 系から許容フラグ以外を除いた削除対象パス一覧を返す。"""
+    targets: list[str] = []
+    if head == "rm":
+        seen_dd = False
+        for arg in args:
+            if not seen_dd and arg == "--":
+                seen_dd = True
+                continue
+            if not seen_dd and arg.startswith("-"):
+                low = arg.lower()
+                if low in {"--recursive", "--force", "--verbose", "--dir"}:
+                    continue
+                if not low.startswith("--") and len(arg) > 1 and all(ch in "rRfvd" for ch in arg[1:]):
+                    continue
+                return None
+            targets.append(arg)
+        return targets or None
+
+    if head in {"remove-item", "ri"}:
+        i = 0
+        n = len(args)
+        while i < n:
+            arg = args[i]
+            low = arg.lower()
+            if arg.startswith("-"):
+                flag, has_colon, inline_val = low.partition(":")
+                if (
+                    ("-recurse".startswith(flag) and len(flag) >= 4)
+                    or ("-force".startswith(flag) and len(flag) >= 3)
+                    or ("-verbose".startswith(flag) and len(flag) >= 2)
+                ) and not has_colon:
+                    i += 1
+                    continue
+                if flag == "-confirm" and inline_val in {"$false", "false"}:
+                    i += 1
+                    continue
+                if flag in {"-erroraction", "-ea"}:
+                    i += 1 if has_colon else (2 if i + 1 < n else 1)
+                    continue
+                if flag in {"-path", "-literalpath"}:
+                    if has_colon:
+                        if not inline_val:
+                            return None
+                        targets.append(arg.split(":", 1)[1])
+                        i += 1
+                    elif i + 1 < n:
+                        targets.append(args[i + 1])
+                        i += 2
+                    else:
+                        return None
+                    continue
+                return None
+            targets.append(arg)
+            i += 1
+        return targets or None
+
+    if head in {"del", "erase", "rmdir", "rd"}:
+        for arg in args:
+            low = arg.lower()
+            if arg.startswith("/"):
+                if low in {"/s", "/q", "/f"}:
+                    continue
+                return None
+            targets.append(arg)
+        return targets or None
+
+    return None
+
+
+def _check_destructive_command(
+    tokens: list[str], *, is_teamwork: bool = False, cwd: str = ""
+) -> str | None:
     if not tokens:
         return None
     head = _command_basename(tokens[0])
@@ -566,6 +1965,12 @@ def _check_destructive_command(tokens: list[str]) -> str | None:
             elif arg.startswith("-") and not arg.startswith("--"):
                 short_flags.update(arg[1:])
         if _has_recursive_flag(args, short_chars="rR") and (has_force or "f" in short_flags):
+            if is_teamwork:
+                targets = _extract_safe_temp_delete_targets(head, args)
+                if targets and all(
+                    _is_safe_teamwork_temp_delete_target(t, cwd=cwd) for t in targets
+                ):
+                    return None
             return "rm recursive force"
         return None
 
@@ -577,11 +1982,23 @@ def _check_destructive_command(tokens: list[str]) -> str | None:
             "-force".startswith(a) and len(a) >= 3 for a in low_args
         )
         if has_recurse and has_force:
+            if is_teamwork:
+                targets = _extract_safe_temp_delete_targets(head, args)
+                if targets and all(
+                    _is_safe_teamwork_temp_delete_target(t, cwd=cwd) for t in targets
+                ):
+                    return None
             return "Remove-Item -Recurse -Force"
         return None
 
     if head in {"del", "erase", "rmdir", "rd"}:
         if "/s" in low_args and "/q" in low_args:
+            if is_teamwork:
+                targets = _extract_safe_temp_delete_targets(head, args)
+                if targets and all(
+                    _is_safe_teamwork_temp_delete_target(t, cwd=cwd) for t in targets
+                ):
+                    return None
             return f"{head} /s /q"
         return None
 
@@ -743,9 +2160,11 @@ def _is_safe_env_assignment(name: str, value: str, *, case_insensitive: bool) ->
     return validator is not None and validator.fullmatch(value) is not None
 
 
-def _split_whitelist_segments(command: str) -> list[str] | None:
-    """クォート外の ; と && のみで単純連結を分割し、危険なメタ文字を拒否する。"""
-    if DISALLOWED_WHITELIST_META_RE.search(command):
+def _split_whitelist_segments(
+    command: str, *, posix_shell: bool = False
+) -> list[str] | None:
+    """クォート外の ; と && のみで単純連結を分割し、危険なメタ文字（クォート外の |>< も含む）を拒否する。"""
+    if DISALLOWED_WHITELIST_ANYWHERE_RE.search(command):
         return None
 
     segments: list[str] = []
@@ -760,9 +2179,18 @@ def _split_whitelist_segments(command: str) -> list[str] | None:
             if ch == quote:
                 quote = None
                 buf.append(ch)
-            elif quote == '"' and ch == "\\" and i + 1 < n and command[i + 1] == '"':
-                buf.append('\\"')
-                i += 2
+            elif quote == '"' and ch == "\\":
+                j = i
+                while j < n and command[j] == "\\":
+                    j += 1
+                if j < n and command[j] == '"' and (j - i) % 2 == 1:
+                    if not posix_shell:
+                        return None
+                    buf.append(command[i : j + 1])
+                    i = j + 1
+                    continue
+                buf.append(command[i:j])
+                i = j
                 continue
             else:
                 buf.append(ch)
@@ -774,6 +2202,9 @@ def _split_whitelist_segments(command: str) -> list[str] | None:
             buf.append(ch)
             i += 1
             continue
+
+        if ch in ("|", ">", "<"):
+            return None
 
         if ch == ";":
             seg = "".join(buf).strip()
@@ -918,11 +2349,8 @@ def _classify_whitelisted_single_command(segment: str) -> tuple[bool, bool]:
         return True, False
 
     if head == "rg":
-        for arg in args:
-            low = arg.lower()
-            if low in {"--pre", "--pre-glob"} or low.startswith(("--pre=", "--pre-glob=")):
-                return False, False
-        return True, False
+        has_pre, _ = _extract_rg_pre_info(args)
+        return (not has_pre), False
 
     if head == "pytest":
         return True, False
@@ -953,12 +2381,14 @@ def _is_whitelisted_single_command(segment: str) -> bool:
     return _classify_whitelisted_single_command(segment)[0]
 
 
-def _classify_whitelisted_command(command: str) -> tuple[bool, bool]:
+def _classify_whitelisted_command(
+    command: str, *, posix_shell: bool = False
+) -> tuple[bool, bool]:
     """安全な環境変数・ローカル cd・定型 fail-fast ガード・単純連結を含む厳格ホワイトリスト判定。"""
     stripped = command.strip()
     if not stripped:
         return False, False
-    segments = _split_whitelist_segments(stripped)
+    segments = _split_whitelist_segments(stripped, posix_shell=posix_shell)
     if segments is None or len(segments) > MAX_WHITELIST_SEGMENTS:
         return False, False
 
@@ -1011,13 +2441,631 @@ def _is_whitelisted_readonly(command: str) -> bool:
     return _classify_whitelisted_command(command)[0]
 
 
-def evaluate_stage1(command: str) -> tuple[str, str] | None:
+def _advance_shell_quote_state(text: str, in_quote: str | None) -> str | None:
+    """単一行文字列を走査し、更新後のクォート状態を返す。"""
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_quote == "'":
+            if ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_quote = None
+            i += 1
+            continue
+        if in_quote == '"':
+            if ch == "`" and i + 1 < n:
+                i += 2
+                continue
+            if ch == "\\" and i + 1 < n and text[i + 1] in ('"', "\\"):
+                i += 2
+                continue
+            if ch == '"':
+                in_quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_quote = ch
+        i += 1
+    return in_quote
+
+
+def _find_single_quoted_heredoc_opener(line_no_eol: str) -> tuple[bool, bool, str]:
+    """未クォートの POSIX 単一引用 heredoc（<<'DELIM' / <<-'DELIM'）を検出する。
+
+    戻り値は (検出したか, タブ除去モードか / fail_closed フラグ, 区切り文字列)。
+    未クォート << が複数ある場合や無効な形式は安全側で fail_closed=(False, True, "") を返す。
+    """
+    quote: str | None = None
+    offsets: list[int] = []
+    i = 0
+    n = len(line_no_eol)
+    while i < n:
+        ch = line_no_eol[i]
+        if quote == "'":
+            if ch == "'":
+                if i + 1 < n and line_no_eol[i + 1] == "'":
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "`" and i + 1 < n:
+                i += 2
+                continue
+            if ch == "\\" and i + 1 < n and line_no_eol[i + 1] in ('"', "\\"):
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "<" and i + 1 < n and line_no_eol[i + 1] == "<":
+            offsets.append(i)
+            i += 2
+            continue
+        i += 1
+
+    if len(offsets) > 1:
+        return False, True, ""
+    if not offsets:
+        return False, False, ""
+
+    match = re.match(
+        r"<<(-?)\s*'([A-Za-z_][A-Za-z0-9_]*)'(?=$|[ \t;|&<>#)])",
+        line_no_eol[offsets[0] :],
+    )
+    if not match:
+        return False, False, ""
+    return True, bool(match.group(1)), match.group(2)
+
+
+def _strip_verbatim_herestrings_with_meta(command: str) -> tuple[str, list[str], list[str]]:
+    """PowerShell @'...'@ と POSIX <<'DELIM' の逐語本体を退避し (置換後コマンド, 本体一覧, POSIX heredoc 開始行一覧) を返す。
+
+    未閉鎖や曖昧な構文を検出した場合は安全側で (command, [], []) へフォールバックする。
+    """
+    lines = command.splitlines(keepends=True)
+    if not lines:
+        return command, [], []
+
+    mode: str | None = None
+    in_quote: str | None = None
+    heredoc_delim = ""
+    heredoc_strip_tabs = False
+    pending_heredoc_line = ""
+    heredoc_opener_lines: list[str] = []
+    bodies: list[str] = []
+    current_body: list[str] = []
+    out_parts: list[str] = []
+
+    for line in lines:
+        line_no_eol = line.rstrip("\r\n")
+        eol = line[len(line_no_eol) :]
+
+        if mode == "ps_herestring":
+            if line_no_eol.startswith("'@") and (
+                len(line_no_eol) == 2 or line_no_eol[2] in " \t;)],|}+"
+            ):
+                trailing = line_no_eol[2:]
+                if trailing.rstrip(" \t").endswith("@'"):
+                    return command, [], []
+                idx = len(bodies)
+                bodies.append("".join(current_body))
+                current_body = []
+                out_parts.append(f"'<HERESTRING_{idx}>'{trailing}{eol}")
+                mode = None
+                in_quote = _advance_shell_quote_state(trailing, None)
+            else:
+                current_body.append(line)
+            continue
+
+        if mode == "posix_heredoc":
+            candidate = line_no_eol.lstrip("\t") if heredoc_strip_tabs else line_no_eol
+            if candidate == heredoc_delim:
+                bodies.append("".join(current_body))
+                current_body = []
+                mode = None
+                heredoc_opener_lines.append(pending_heredoc_line)
+                pending_heredoc_line = ""
+            else:
+                current_body.append(line)
+            continue
+
+        i = 0
+        n = len(line_no_eol)
+        entered_ps_here = False
+        while i < n:
+            ch = line_no_eol[i]
+            if in_quote == "'":
+                if ch == "'":
+                    if i + 1 < n and line_no_eol[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_quote = None
+                i += 1
+                continue
+            if in_quote == '"':
+                if ch == "`" and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == "\\" and i + 1 < n and line_no_eol[i + 1] in ('"', "\\"):
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_quote = None
+                i += 1
+                continue
+
+            if (
+                eol
+                and ch == "@"
+                and i + 1 < n
+                and line_no_eol[i + 1] == "'"
+                and line_no_eol[i + 2 :].strip(" \t") == ""
+                and (i == 0 or line_no_eol[i - 1] in " \t=(,;+")
+            ):
+                out_parts.append(line_no_eol[:i])
+                mode = "ps_herestring"
+                current_body = []
+                entered_ps_here = True
+                break
+
+            if ch in ("'", '"'):
+                in_quote = ch
+            i += 1
+
+        if entered_ps_here:
+            continue
+
+        if in_quote is None and eol:
+            found_hd, flag_or_fail, delim = _find_single_quoted_heredoc_opener(line_no_eol)
+            if not found_hd and flag_or_fail:
+                return command, [], []
+            if found_hd:
+                heredoc_strip_tabs = flag_or_fail
+                heredoc_delim = delim
+                pending_heredoc_line = line_no_eol
+                mode = "posix_heredoc"
+                current_body = []
+
+        out_parts.append(line)
+
+    if mode is not None or in_quote is not None:
+        return command, [], []
+    return "".join(out_parts), bodies, heredoc_opener_lines
+
+
+def _strip_verbatim_herestrings(command: str) -> tuple[str, list[str]]:
+    """PowerShell @'...'@ と POSIX <<'DELIM' の逐語本体を退避し (置換後コマンド, 本体一覧) を返す。"""
+    stripped, bodies, _ = _strip_verbatim_herestrings_with_meta(command)
+    return stripped, bodies
+
+
+def _extract_executable_text_chunks(
+    stripped_command: str, *, posix_shell: bool = False
+) -> str:
+    """単一/二重引用リテラルを除外し、クォート外およびコマンド置換 $(...) / `...` 本体のみを返す。"""
+    chunks: list[str] = []
+    buf: list[str] = []
+    in_quote: str | None = None
+    i = 0
+    n = len(stripped_command)
+
+    while i < n:
+        ch = stripped_command[i]
+        if in_quote == "'":
+            if ch == "'":
+                if i + 1 < n and stripped_command[i + 1] == "'":
+                    i += 2
+                    continue
+                in_quote = None
+            i += 1
+            continue
+        if in_quote == '"':
+            if ch == "`" and i + 1 < n:
+                i += 2
+                continue
+            if posix_shell and ch == "\\" and i + 1 < n and stripped_command[i + 1] in ('"', "\\"):
+                i += 2
+                continue
+            if ch == '"':
+                in_quote = None
+            i += 1
+            continue
+        if ch == "'":
+            if buf:
+                chunks.append("".join(buf))
+                buf = []
+            in_quote = "'"
+        elif ch == '"':
+            if buf:
+                chunks.append("".join(buf))
+                buf = []
+            in_quote = '"'
+        else:
+            buf.append(ch)
+        i += 1
+
+    if buf:
+        chunks.append("".join(buf))
+    for body in _extract_command_substitutions(stripped_command, posix_shell=posix_shell):
+        chunks.append(" " + body + " ")
+    return "".join(chunks)
+
+
+def _has_code_exec_sink(
+    stripped_command: str, segments: list[list[str]], *, posix_shell: bool = False
+) -> bool:
+    """コード実行シンク（シェル起動、eval/iex、呼び出し演算子 &、ドットソース等）を検出する。"""
+    for tokens in segments:
+        if tokens and _command_basename(tokens[0]) in CODE_EXEC_SINKS:
+            return True
+
+    exec_text = _extract_executable_text_chunks(stripped_command, posix_shell=posix_shell)
+    if re.search(
+        r"\b(?:scriptblock|invoke-expression|iex|invoke-command|icm)\b",
+        exec_text,
+        re.IGNORECASE,
+    ):
+        return True
+
+    in_quote: str | None = None
+    at_stmt_start = True
+    i = 0
+    n = len(stripped_command)
+    while i < n:
+        ch = stripped_command[i]
+        if in_quote == "'":
+            if ch == "'":
+                if i + 1 < n and stripped_command[i + 1] == "'":
+                    i += 2
+                    continue
+                in_quote = None
+            at_stmt_start = False
+            i += 1
+            continue
+        if in_quote == '"':
+            if ch == "`" and i + 1 < n:
+                i += 2
+                continue
+            if ch == "\\" and i + 1 < n and stripped_command[i + 1] in ('"', "\\"):
+                i += 2
+                continue
+            if ch == '"':
+                in_quote = None
+            at_stmt_start = False
+            i += 1
+            continue
+
+        if ch in ("'", '"'):
+            in_quote = ch
+            at_stmt_start = False
+            i += 1
+            continue
+
+        if ch == "&":
+            if i + 1 < n and stripped_command[i + 1] == "&" and (
+                i + 2 >= n or stripped_command[i + 2] != "&"
+            ):
+                at_stmt_start = True
+                i += 2
+                continue
+            return True
+
+        if at_stmt_start and ch == "." and i + 1 < n and stripped_command[i + 1] in " \t":
+            return True
+
+        if ch in "\r\n;|{":
+            at_stmt_start = True
+        elif ch not in " \t":
+            at_stmt_start = False
+        i += 1
+
+    return False
+
+
+def _resolve_brain_root(
+    conversation_id: str,
+    transcript_path: str = "",
+    artifact_dir: str = "",
+) -> Path | None:
+    """会話 ID とフックメタデータのパスから brain ルートディレクトリを特定する。"""
+    if not UUID_RE.fullmatch(conversation_id):
+        return None
+    low_id = conversation_id.lower()
+
+    if artifact_dir:
+        art = Path(artifact_dir)
+        if art.name.lower() == low_id:
+            return art.parent
+        for parent in art.parents:
+            if parent.name.lower() == low_id:
+                return parent.parent
+
+    if transcript_path:
+        tr = Path(transcript_path)
+        for parent in tr.parents:
+            if parent.name.lower() == low_id:
+                return parent.parent
+
+    return None
+
+
+def _is_teamwork_conversation(
+    conversation_id: str,
+    *,
+    transcript_path: str = "",
+    artifact_dir: str = "",
+    brain_root: Path | None = None,
+    max_depth: int = MAX_TEAMWORK_PARENT_DEPTH,
+) -> bool:
+    """ランタイム生成の親チェーン（sender と subagents/<id>.json）から /teamwork 配下か判定する。"""
+    if not UUID_RE.fullmatch(conversation_id):
+        return False
+    root = brain_root or _resolve_brain_root(conversation_id, transcript_path, artifact_dir)
+    if root is None:
+        return False
+
+    visited: set[str] = set()
+    cur = conversation_id
+    for _ in range(max_depth):
+        low_cur = cur.lower()
+        if low_cur in visited:
+            return False
+        visited.add(low_cur)
+
+        tpath = root / cur / ".system_generated" / "logs" / "transcript.jsonl"
+        try:
+            with tpath.open("r", encoding="utf-8", errors="replace") as fh:
+                first_line = fh.readline()
+            if not first_line:
+                return False
+            first_obj = json.loads(first_line)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+
+        if not isinstance(first_obj, dict):
+            return False
+        if first_obj.get("type") != "SYSTEM_MESSAGE" or first_obj.get("source") != "SYSTEM":
+            return False
+
+        content = str(first_obj.get("content") or "")
+        sender_m = TEAMWORK_SENDER_RE.search(content)
+        if not sender_m:
+            return False
+        parent_id = sender_m.group(1)
+        if not UUID_RE.fullmatch(parent_id):
+            return False
+
+        desc_path = root / parent_id / ".system_generated" / "subagents" / f"{cur}.json"
+        try:
+            desc_obj = json.loads(desc_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+
+        if not isinstance(desc_obj, dict):
+            return False
+        descriptor = desc_obj.get("subagentDescriptor")
+        if not isinstance(descriptor, dict):
+            return False
+        type_name = str(descriptor.get("typeName") or "")
+        if type_name == "teamwork" or type_name.startswith("teamwork_"):
+            return True
+
+        cur = parent_id
+
+    return False
+
+
+def _collect_quote_aware_segments(
+    command_text: str, *, posix_shell: bool = False
+) -> list[list[str]] | None:
+    """引用境界を保ったまま実際のコマンドセグメントと展開式のみを抽出し展開する。"""
+    unquoted_parts = _split_unquoted_top_level(command_text, posix_shell=posix_shell)
+    if unquoted_parts is None:
+        return None
+
+    extracted: list[list[str]] = []
+    for part in unquoted_parts:
+        if _looks_like_control_or_group_segment(part):
+            clauses = _extract_control_clauses_from_text(part, posix_shell=posix_shell)
+            if clauses and not (len(clauses) == 1 and clauses[0].strip() == part.strip()):
+                for clause in clauses:
+                    sub_extracted = _collect_quote_aware_segments(
+                        clause, posix_shell=posix_shell
+                    )
+                    if sub_extracted is not None:
+                        extracted.extend(sub_extracted)
+                    else:
+                        extracted.extend(_tokenize_and_unwrap(clause, posix_shell=posix_shell))
+                continue
+        extracted.extend(_tokenize_and_unwrap(part, posix_shell=posix_shell))
+        for body in _extract_embedded_group_bodies(part, posix_shell=posix_shell):
+            if body.strip() != part.strip():
+                sub_extracted = _collect_quote_aware_segments(
+                    body, posix_shell=posix_shell
+                )
+                if sub_extracted is not None:
+                    extracted.extend(sub_extracted)
+                else:
+                    for raw_seg in _split_top_level_segments_raw(
+                        body, posix_shell=posix_shell
+                    ):
+                        extracted.extend(_tokenize_and_unwrap(raw_seg, posix_shell=posix_shell))
+    for sub in _extract_rg_substitutions(command_text, posix_shell=posix_shell):
+        extracted.extend(_tokenize_and_unwrap(sub, posix_shell=posix_shell))
+    return extracted
+
+
+def _are_posix_heredoc_receivers_safe(
+    heredoc_opener_lines: list[str],
+    outer_segments: list[list[str]] | None,
+    *,
+    posix_shell: bool = False,
+) -> bool:
+    """POSIX heredoc を受け取るコマンドが cat / tee のみ、かつ外側全コマンドが許可リスト内か検証する。"""
+    if not heredoc_opener_lines:
+        return True
+    if not outer_segments:
+        return False
+    for tokens in outer_segments:
+        if not tokens or _command_basename(tokens[0]) not in SAFE_POSIX_HEREDOC_OUTER_COMMANDS:
+            return False
+    for hd_line in heredoc_opener_lines:
+        parts = _split_unquoted_top_level(hd_line, posix_shell=posix_shell)
+        if parts is None:
+            return False
+        hd_parts = [p for p in parts if _find_single_quoted_heredoc_opener(p)[0]]
+        if not hd_parts:
+            return False
+        for part in hd_parts:
+            unwrapped = _tokenize_and_unwrap(part, posix_shell=posix_shell)
+            if not unwrapped or _command_basename(unwrapped[0][0]) not in SAFE_POSIX_HEREDOC_RECEIVERS:
+                return False
+    return True
+
+
+def _extract_teamwork_push_segments(
+    command_text: str,
+    fallback_segments: list[list[str]],
+    *,
+    posix_shell: bool = False,
+) -> list[list[str]]:
+    """引用境界を保ったまま実際のコマンドセグメントと展開式のみを抽出し git push 判定に使う。"""
+    extracted = _collect_quote_aware_segments(command_text, posix_shell=posix_shell)
+    if extracted is None:
+        return fallback_segments
+    return extracted
+
+
+GOOG_HEADER_SAFE_ENV_RE = re.compile(
+    r"^(?:%[A-Za-z_][A-Za-z0-9_]*%|\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\}|[Ee][Nn][Vv]:[A-Za-z_][A-Za-z0-9_]*))$"
+)
+
+
+def _quote_state_at(text: str, pos: int) -> str | None:
+    """text[:pos] を走査し、pos 時点で開いているクォート種別（' / \" / None）を返す。"""
+    quote: str | None = None
+    i = 0
+    limit = min(pos, len(text))
+    while i < limit:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < limit and text[i + 1] in ('"', "\\"):
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        i += 1
+    return quote
+
+
+def _is_safe_goog_header_value(val: str, *, in_single_quote: bool) -> bool:
+    """x-goog-api-key ヘッダ値がプレースホルダ（REDACTED）または展開される厳格な環境変数参照のみか判定する。"""
+    if val.upper() in ("REDACTED", "[REDACTED]"):
+        return True
+    if in_single_quote:
+        return False
+    return bool(GOOG_HEADER_SAFE_ENV_RE.match(val))
+
+
+def _has_non_var_goog_header(
+    text: str, *, strict_shell_quotes: bool = True
+) -> bool:
+    """x-goog-api-key ヘッダに展開される環境変数参照や REDACTED 以外の生値が指定されているか検査する。"""
+    for m in GOOG_HEADER_QUOTED_RE.finditer(text):
+        raw_rhs = m.group(0)[len(m.group(1)) :].strip()
+        val = raw_rhs[1:-1].strip() if len(raw_rhs) >= 2 else ""
+        in_sq = (
+            (m.group(2) == "'") or (_quote_state_at(text, m.start()) == "'")
+            if strict_shell_quotes
+            else False
+        )
+        if val and not _is_safe_goog_header_value(val, in_single_quote=in_sq):
+            return True
+    for m in GOOG_HEADER_PLAIN_RE.finditer(text):
+        val = m.group(2).strip().strip("\"'")
+        in_sq = (_quote_state_at(text, m.start()) == "'") if strict_shell_quotes else False
+        if val and not _is_safe_goog_header_value(val, in_single_quote=in_sq):
+            return True
+    return False
+
+
+def _has_inline_secret_literal(
+    text: str, *, strict_shell_quotes: bool = True
+) -> bool:
+    """コマンド文字列内の API トークン・秘密鍵ヘッダ・認証ヘッダ実値パターンを検出する。"""
+    if dh.scan_text_for_secrets(text):
+        return True
+    if dh.BEARER_TOKEN_RE.search(text):
+        return True
+    if _has_non_var_goog_header(text, strict_shell_quotes=strict_shell_quotes):
+        return True
+    return False
+
+
+def evaluate_stage1(
+    command: str,
+    *,
+    is_teamwork: bool = False,
+    cwd: str = "",
+    posix_shell: bool = False,
+) -> tuple[str, str] | None:
     """第 1 段の決定論的ローカル判定を行う。決着しない場合は None を返す。"""
     if not command.strip():
         return ("ask", "Empty command line; fallback to standard confirmation.")
 
-    segments = _collect_all_command_segments(command)
-    secret_hits = _extract_secret_file_hits(command)
+    stripped_for_scan, herestring_bodies, heredoc_opener_lines = (
+        _strip_verbatim_herestrings_with_meta(command)
+    )
+    use_stripped = False
+    if herestring_bodies:
+        if heredoc_opener_lines:
+            outer_segments = _collect_quote_aware_segments(
+                stripped_for_scan, posix_shell=posix_shell
+            )
+            safe_posix_hd = _are_posix_heredoc_receivers_safe(
+                heredoc_opener_lines, outer_segments, posix_shell=posix_shell
+            )
+        else:
+            outer_segments = _collect_all_command_segments(
+                stripped_for_scan, posix_shell=posix_shell
+            )
+            safe_posix_hd = True
+        if (
+            safe_posix_hd
+            and outer_segments is not None
+            and not _has_code_exec_sink(
+                stripped_for_scan, outer_segments, posix_shell=posix_shell
+            )
+            and not _has_external_transfer(outer_segments)
+        ):
+            use_stripped = True
+            segments = outer_segments
+            secret_hits = _extract_secret_file_hits(stripped_for_scan)
+        else:
+            segments = _collect_all_command_segments(command, posix_shell=posix_shell)
+            secret_hits = _extract_secret_file_hits(command)
+    else:
+        segments = _collect_all_command_segments(command, posix_shell=posix_shell)
+        secret_hits = _extract_secret_file_hits(command)
 
     if _has_external_transfer(segments) and (secret_hits or _has_env_dump(segments)):
         return (
@@ -1027,15 +3075,56 @@ def evaluate_stage1(command: str) -> tuple[str, str] | None:
         )
 
     for seg_tokens in segments:
-        destructive_reason = _check_destructive_command(seg_tokens)
+        destructive_reason = _check_destructive_command(
+            seg_tokens, is_teamwork=is_teamwork, cwd=cwd
+        )
         if destructive_reason is not None:
             return (
                 "force_ask",
                 f"Requires explicit confirmation: destructive operation detected locally ({destructive_reason}).",
             )
 
+    if is_teamwork:
+        shell_text = stripped_for_scan if use_stripped else command
+        has_inline_secret = _has_inline_secret_literal(
+            shell_text, strict_shell_quotes=True
+        ) or (
+            use_stripped
+            and any(
+                _has_inline_secret_literal(body, strict_shell_quotes=False)
+                for body in herestring_bodies
+            )
+        )
+        if has_inline_secret:
+            if _has_external_transfer(segments):
+                return (
+                    "deny",
+                    "Blocked by local secret-exfiltration policy: inline credential "
+                    "or token passed to an external transfer command.",
+                )
+            return (
+                "force_ask",
+                "Requires explicit confirmation: inline credential or private key pattern detected in command.",
+            )
+        push_scan_text = stripped_for_scan if use_stripped else command
+        for seg_tokens in _extract_teamwork_push_segments(
+            push_scan_text, segments, posix_shell=posix_shell
+        ):
+            subcmd, _ = _extract_git_subcommand(seg_tokens, strict_safe_globals=False)
+            if subcmd == "push" and not _classify_whitelisted_git(seg_tokens)[0]:
+                return (
+                    "force_ask",
+                    "Requires explicit confirmation: git push outside explicit non-protected origin branch whitelist.",
+                )
+        return (
+            "allow",
+            "Allowed in active /teamwork subagent session (safety blacklists passed).",
+        )
+
     if not secret_hits and not _has_env_dump(segments):
-        allowed, includes_push = _classify_whitelisted_command(command)
+        allowed, includes_push = _classify_whitelisted_command(
+            command, posix_shell=posix_shell
+        )
         if allowed:
             if includes_push:
                 return (
@@ -1163,8 +3252,10 @@ def evaluate_stage2(
         return ("ask", FALLBACK_REASON)
 
 
-def _extract_hook_context(stdin_payload_text: str) -> tuple[str, str, str]:
-    """PreToolUse 標準入力 JSON から (tool_name, cwd, command_line) を抽出する。"""
+def _extract_hook_metadata(
+    stdin_payload_text: str,
+) -> tuple[str, str, str, str, str, str]:
+    """PreToolUse 標準入力 JSON から (tool_name, cwd, command_line, conversation_id, transcript_path, artifact_dir) を抽出する。"""
     data = json.loads(stdin_payload_text)
     if not isinstance(data, dict):
         raise ValueError("PreToolUse stdin payload must be a JSON object.")
@@ -1185,6 +3276,15 @@ def _extract_hook_context(stdin_payload_text: str) -> tuple[str, str, str]:
     cwd = str(data.get("cwd") or "")
     if not cwd and isinstance(data.get("workspacePaths"), list) and data["workspacePaths"]:
         cwd = str(data["workspacePaths"][0] or "")
+    conversation_id = str(data.get("conversationId") or "")
+    transcript_path = str(data.get("transcriptPath") or "")
+    artifact_dir = str(data.get("artifactDirectoryPath") or "")
+    return tool_name, cwd, command_line, conversation_id, transcript_path, artifact_dir
+
+
+def _extract_hook_context(stdin_payload_text: str) -> tuple[str, str, str]:
+    """PreToolUse 標準入力 JSON から (tool_name, cwd, command_line) を抽出する。"""
+    tool_name, cwd, command_line, _, _, _ = _extract_hook_metadata(stdin_payload_text)
     return tool_name, cwd, command_line
 
 
@@ -1208,6 +3308,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="--command 指定時に使用する作業ディレクトリ文字列",
     )
     parser.add_argument(
+        "--teamwork",
+        action="store_true",
+        help="--command 指定時に /teamwork 配下サブエージェントとして評価する",
+    )
+    parser.add_argument(
         "--endpoint",
         default=rd.DEFAULT_ENDPOINT,
         help="Decision 1 API エンドポイント URL",
@@ -1225,6 +3330,11 @@ def _configure_utf8_stdio() -> None:
     dh.configure_utf8_stdio()
 
 
+def _is_posix_host_os() -> bool:
+    """実行ホスト OS が POSIX 系かを返す（単体テストでの差し替え用ヘルパー）。"""
+    return os.name != "nt"
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -1240,10 +3350,18 @@ def main(
         tool_name = "run_command"
         cwd = args.cwd
         command_line = args.command
+        is_teamwork = bool(args.teamwork)
     else:
         raw_stdin = stdin_text if stdin_text is not None else sys.stdin.read()
         try:
-            tool_name, cwd, command_line = _extract_hook_context(raw_stdin)
+            (
+                tool_name,
+                cwd,
+                command_line,
+                conversation_id,
+                transcript_path,
+                artifact_dir,
+            ) = _extract_hook_metadata(raw_stdin)
         except (ValueError, json.JSONDecodeError) as exc:
             print(
                 f"pretool_guard: invalid PreToolUse stdin JSON ({redact_secrets(str(exc))})",
@@ -1264,7 +3382,16 @@ def main(
             )
             return 0
 
-    stage1 = evaluate_stage1(command_line)
+        is_teamwork = _is_teamwork_conversation(
+            conversation_id,
+            transcript_path=transcript_path,
+            artifact_dir=artifact_dir,
+        )
+
+    is_posix_shell = _is_posix_host_os() and (not cwd or cwd.startswith("/"))
+    stage1 = evaluate_stage1(
+        command_line, is_teamwork=is_teamwork, cwd=cwd, posix_shell=is_posix_shell
+    )
     if stage1 is not None:
         decision, reason = stage1
         out: dict[str, Any] = {"decision": decision, "reason": reason}
