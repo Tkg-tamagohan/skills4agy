@@ -1196,7 +1196,7 @@ class TestPretoolGuard(unittest.TestCase):
                 ("echo 'if \\\n!' { git push origin main }", True),
                 ("echo [[ -n x ]] then { git push origin main }", True),
                 ("if (true) then echo time { git push origin main }; fi", True),
-                ("echo [[ && if [[ -n x ]] then echo time { git push origin main }; fi", True),
+                ("echo [[ && if [[ -n x ]]; then echo time { git push origin main }; fi", True),
             ]
             for cmd, ps_flag in group_and_branch_allow_cmds:
                 with self.subTest(group_allow=cmd, posix_shell=ps_flag):
@@ -1408,7 +1408,7 @@ class TestPretoolGuard(unittest.TestCase):
             ("echo hi\\\r\nrm -rf ~/proj", True),
             ("echo hi\\\r\n{ git push origin main; }", True),
             ("echo [[ && { git push origin main; }", True),
-            ("echo [[ && if [[ -n x ]] then { git push origin main; }; fi", True),
+            ("echo [[ && if [[ -n x ]]; then { git push origin main; }; fi", True),
             ("echo [[ <(git push origin main)", True),
         ]
         for cmd, ps_flag in unsafe_child_shell_cmds:
