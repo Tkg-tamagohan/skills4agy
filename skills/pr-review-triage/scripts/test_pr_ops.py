@@ -613,6 +613,7 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
             (repo / "no_nl.txt").write_bytes(b"first_line_no_nl")
             (repo / "crlf_test.txt").write_bytes(b"line1\nline2\n")
             (repo / "tool.sh").write_bytes(b"#!/bin/sh\necho ok\n")
+            os.chmod(repo / "tool.sh", 0o755)
             subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(repo), "update-index", "--chmod=+x", "tool.sh"], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True, env=env)
@@ -638,6 +639,7 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "config", "core.autocrlf", "true"], check=True, capture_output=True)
             (repo / "crlf_test.txt").write_bytes(b"line1\r\nline2\r\n")
             (repo / "tool.sh").write_bytes(b"#!/bin/sh\necho ok\n")
+            os.chmod(repo / "tool.sh", 0o644)
 
             # 実インデックスに別ファイルをステージして汚染しないことも確認
             (repo / "staged_only.txt").write_text("staged\n", encoding="utf-8")
