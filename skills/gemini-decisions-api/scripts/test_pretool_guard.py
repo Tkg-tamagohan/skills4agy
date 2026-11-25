@@ -1729,6 +1729,23 @@ class TestPretoolGuard(unittest.TestCase):
                     cwd=str(repo_root),
                 )
             )
+            # --cwd 指定時は --cwd 先基準で --output を検査し、別ディレクトリの scratch/ リンクを許さない
+            with tempfile.TemporaryDirectory() as other_tmp:
+                other_dir = Path(other_tmp)
+                (other_dir / "scratch").mkdir()
+                self.assertIsNotNone(
+                    pg.evaluate_stage1(
+                        f'python skills/pr-review-triage/scripts/pr_ops.py status --cwd "{other_dir}" --output scratch/ok.json',
+                        cwd=str(repo_root),
+                    )
+                )
+                with mock.patch.object(pg, "_is_reparse_or_symlink", side_effect=lambda p: Path(p).name == "scratch"):
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            f'python skills/pr-review-triage/scripts/pr_ops.py status --cwd "{other_dir}" --output scratch/bad.json',
+                            cwd=str(repo_root),
+                        )
+                    )
 
         # 未信頼リポジトリ（別 origin）およびリパースポイントは拒否
         with tempfile.TemporaryDirectory() as tmp:

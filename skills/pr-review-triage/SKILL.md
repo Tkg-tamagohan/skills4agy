@@ -58,7 +58,7 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scrip
    - 日本語を含む編集を行うワーカーへ `verify-file-writes`、テスト担当へ `test-conventions` を渡す。
 5. 他セッションからの完了連絡後に統合検証を行う際は、前回検証時刻と変更対象ファイルの最終更新時刻（`LastWriteTime`）または `git diff` 内容を比較し、更新があれば前回検証以降のデルタを精査したうえで全標準検証コマンドを再実行する。
 6. 実装完了後かつ PR 更新前に、有効な PR 内再発防止策が 1 件以上あるときは、`pr_ops.py invariant-check` を実行して新差分が過去の再発防止策を破っていないか一次検査する。
-   - 同コマンドは PR コメント内の有効項目を内部の一時ルール Markdown へ自動書き出しし、`invariant-gate` を連続実行する。
+   - 同コマンドは PR コメント内の有効項目を内部の一時ルール Markdown へ自動書き出しし、未コミット作業ツリー差分がある場合は `merge-base` からの統合差分も含めて `invariant-gate` を実行する（コミット済み差分のみ検査する場合は `--committed-only` を付ける）。
 
 ```powershell
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"

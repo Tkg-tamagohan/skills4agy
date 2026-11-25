@@ -2789,6 +2789,44 @@ def _is_trusted_plugin_script(
     if _has_inline_secret_literal(raw_segment, strict_shell_quotes=True):
         return False
 
+    # 設計判断 3A: 稼働プラグイン自身および同一 origin を共有する作業クローン上の固定ホワイトリストのみ信頼する。
+    # スクリプト引数で --cwd が指定された場合、相対 --output / 入力パスはその解決先基準で検証する。
+    effective_script_cwd = cwd
+    seen_script_cwd = False
+    cwd_scan_idx = 0
+    while cwd_scan_idx < len(script_args):
+        arg = script_args[cwd_scan_idx]
+        cwd_val: str | None = None
+        if arg.startswith("--cwd="):
+            cwd_val = arg.split("=", 1)[1]
+            cwd_scan_idx += 1
+        elif arg == "--cwd":
+            if cwd_scan_idx + 1 >= len(script_args):
+                return False
+            cwd_val = script_args[cwd_scan_idx + 1]
+            cwd_scan_idx += 2
+        else:
+            cwd_scan_idx += 1
+            continue
+
+        if seen_script_cwd or not cwd_val:
+            return False
+        seen_script_cwd = True
+        expanded_cwd = _expand_safe_path_vars(cwd_val)
+        if expanded_cwd is None or not _is_safe_filesystem_cd_target(expanded_cwd):
+            return False
+        resolved_cwd = (
+            Path(expanded_cwd)
+            if Path(expanded_cwd).is_absolute()
+            else (base_cwd / expanded_cwd)
+        )
+        if os.path.lexists(resolved_cwd):
+            if _is_reparse_or_symlink(resolved_cwd) or not resolved_cwd.is_dir():
+                return False
+            if not Path(expanded_cwd).is_absolute() and _has_reparse_in_tree(base_cwd, resolved_cwd):
+                return False
+        effective_script_cwd = str(resolved_cwd)
+
     # 出力先および入力ファイル系オプションの境界検査
     output_opts = {"--output"}
     if rel_posix == "skills/pr-review-triage/scripts/pr_ops.py":
@@ -2813,6 +2851,14 @@ def _is_trusted_plugin_script(
         opt_val: str | None = None
         if "=" in arg and arg.startswith("--"):
             opt_name, opt_val = arg.split("=", 1)
+        elif arg == "--files" and rel_posix == "skills/pr-review-triage/scripts/pr_ops.py":
+            j = i + 1
+            while j < n and not script_args[j].startswith("-"):
+                if not _is_safe_non_secret_existing_file(script_args[j], cwd=effective_script_cwd):
+                    return False
+                j += 1
+            i = j
+            continue
         elif arg in output_opts or arg in input_opts:
             opt_name = arg
             if i + 1 >= n:
@@ -2820,10 +2866,10 @@ def _is_trusted_plugin_script(
             opt_val = script_args[i + 1]
             i += 1
         if opt_name in output_opts:
-            if not _is_safe_temp_output_path(opt_val or "", cwd=cwd):
+            if not _is_safe_temp_output_path(opt_val or "", cwd=effective_script_cwd):
                 return False
         elif opt_name in input_opts:
-            if opt_val and opt_val != "-" and not _is_safe_non_secret_existing_file(opt_val, cwd=cwd):
+            if opt_val and opt_val != "-" and not _is_safe_non_secret_existing_file(opt_val, cwd=effective_script_cwd):
                 return False
         i += 1
 

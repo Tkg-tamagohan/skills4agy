@@ -181,14 +181,130 @@ class TestPrOpsStatus(unittest.TestCase):
             self.assertTrue(pr_file.exists())
             self.assertFalse(out_file.read_bytes().startswith(b"\xef\xbb\xbf"))
 
+    def test_status_resolves_omitted_pr_masks_secrets_propagates_devin_exit_and_detects_truncation(self) -> None:
+        observed_pr_cmds: list[list[str]] = []
+        fake_gh_token = "ghp_" + "Z" * 36
+
+        def make_runner(*, devin_code: int = 0, comments_has_next: bool = False):
+            def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+                if cmd[:4] == ["git", "remote", "get-url", "origin"]:
+                    return pr_ops.CmdResult(0, "https://github.com/octo/repo.git\n", "")
+                if cmd[:3] == ["git", "branch", "--show-current"]:
+                    return pr_ops.CmdResult(0, "feat/current\n", "")
+                if cmd[:3] == ["gh", "pr", "view"]:
+                    observed_pr_cmds.append(cmd)
+                    if "--json" in cmd and cmd[cmd.index("--json") + 1] == "number":
+                        return pr_ops.CmdResult(0, json.dumps({"number": 77}), "")
+                    return pr_ops.CmdResult(
+                        0,
+                        json.dumps(
+                            {
+                                "number": 77,
+                                "url": "https://github.com/octo/repo/pull/77",
+                                "title": f"title {fake_gh_token}",
+                                "state": "OPEN",
+                                "headRefName": "feat/current",
+                                "headRefOid": "1234567890abcdef",
+                                "baseRefName": "main",
+                                "body": f"body {fake_gh_token}",
+                                "comments": [],
+                                "reviews": [],
+                                "statusCheckRollup": [],
+                            }
+                        ),
+                        "",
+                    )
+                if cmd[:3] == ["gh", "api", "graphql"]:
+                    return pr_ops.CmdResult(
+                        0,
+                        json.dumps(
+                            {
+                                "data": {
+                                    "repository": {
+                                        "pullRequest": {
+                                            "headRefOid": "1234567890abcdef",
+                                            "reviewThreads": {
+                                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                "nodes": [
+                                                    {
+                                                        "id": "PRRT_thread1234",
+                                                        "isResolved": False,
+                                                        "isOutdated": False,
+                                                        "path": "a.py",
+                                                        "line": 1,
+                                                        "originalLine": 1,
+                                                        "comments": {
+                                                            "pageInfo": {"hasNextPage": comments_has_next},
+                                                            "nodes": [
+                                                                {
+                                                                    "id": "C1",
+                                                                    "author": {"login": "bot"},
+                                                                    "body": f"token leak {fake_gh_token}",
+                                                                    "createdAt": "2026-11-25T00:00:00Z",
+                                                                    "url": "https://example/1",
+                                                                }
+                                                            ],
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        ),
+                        "",
+                    )
+                if len(cmd) >= 2 and cmd[1].endswith("check_devin_review.py"):
+                    return pr_ops.CmdResult(devin_code, json.dumps({"decision": "auth_error"}), "")
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            return fake_runner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pr_file = Path(tmp) / "saved_pr.json"
+            # --pr と --repo を両方省略時は `gh pr view --json number` を呼び、秘密マスク＋終了コード伝播を検証
+            code, stdout, _ = _run_cli_capture(
+                ["status", "--cwd", tmp, "--check-devin", "--save-pr-json", str(pr_file)],
+                runner=make_runner(devin_code=3),
+            )
+            self.assertEqual(code, 3)
+            self.assertEqual(observed_pr_cmds[0], ["gh", "pr", "view", "--json", "number"])
+            self.assertNotIn(fake_gh_token, stdout)
+            self.assertIn("[REDACTED]", stdout)
+            self.assertNotIn(fake_gh_token, pr_file.read_text(encoding="utf-8"))
+
+            # --repo 明示・--pr 省略時は現在ブランチ名を selector に渡す
+            observed_pr_cmds.clear()
+            code, _, _ = _run_cli_capture(
+                ["status", "--repo", "octo/repo", "--cwd", tmp],
+                runner=make_runner(devin_code=0),
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                observed_pr_cmds[0],
+                ["gh", "pr", "view", "feat/current", "--repo", "octo/repo", "--json", "number"],
+            )
+
+            # comments.pageInfo.hasNextPage == True はサイレント打ち切りせずエラー終了 (code=2)
+            code, _, _ = _run_cli_capture(
+                ["status", "--pr", "77", "--cwd", tmp],
+                runner=make_runner(comments_has_next=True),
+            )
+            self.assertEqual(code, 2)
+
 
 class TestPrOpsInvariantCheck(unittest.TestCase):
     def test_invariant_check_writes_rules_md_and_propagates_exit_code(self) -> None:
         observed_rules_text = ""
+        observed_cmd: list[str] = []
 
         def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
-            nonlocal observed_rules_text
+            nonlocal observed_rules_text, observed_cmd
+            if cmd[:4] == ["git", "-c", "core.quotePath=false", "status"]:
+                return pr_ops.CmdResult(0, "", "")
             if len(cmd) >= 2 and cmd[1].endswith("check_invariants_decision1.py"):
+                observed_cmd = list(cmd)
                 rules_idx = cmd.index("--rules")
                 rules_path = Path(cmd[rules_idx + 1])
                 observed_rules_text = rules_path.read_text(encoding="utf-8")
@@ -225,6 +341,75 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
             self.assertEqual(code, 0, stderr)
             self.assertIn("UTF-8 BOM を禁止する", observed_rules_text)
             self.assertIn('"violations"', stdout)
+            self.assertEqual(observed_cmd.count("--rules"), 1)
+
+    def test_invariant_check_includes_worktree_diff_and_combines_multiple_rules(self) -> None:
+        observed_cmd: list[str] = []
+        observed_diff = ""
+
+        def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+            nonlocal observed_cmd, observed_diff
+            if cmd[:4] == ["git", "-c", "core.quotePath=false", "status"]:
+                return pr_ops.CmdResult(0, " M app.py\n", "")
+            if cmd[:2] == ["git", "merge-base"]:
+                return pr_ops.CmdResult(0, "base123\n", "")
+            if cmd[:4] == ["git", "-c", "core.quotePath=false", "diff"]:
+                return pr_ops.CmdResult(0, "diff --git a/app.py b/app.py\n+print('uncommitted')\n", "")
+            if len(cmd) >= 2 and cmd[1].endswith("check_invariants_decision1.py"):
+                observed_cmd = list(cmd)
+                df_idx = cmd.index("--diff-file")
+                observed_diff = Path(cmd[df_idx + 1]).read_text(encoding="utf-8")
+                return pr_ops.CmdResult(0, json.dumps({"violations": []}), "")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            pr_json = tmp_dir / "pr.json"
+            pr_json.write_text(
+                json.dumps(
+                    {
+                        "body": "",
+                        "comments": [
+                            {
+                                "author": {"login": "bot"},
+                                "createdAt": "2026-11-25T00:00:00Z",
+                                "body": (
+                                    "<!-- pr-review-triage:guardrails:v1 -->\n"
+                                    "- [PRG-001] (active) 対象: `**` | ルール: 例外を握りつぶさない\n"
+                                    "<!-- /pr-review-triage:guardrails:v1 -->"
+                                ),
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            rule1 = tmp_dir / "r1.md"
+            rule2 = tmp_dir / "r2.md"
+            rule1.write_text("# R1\n", encoding="utf-8")
+            rule2.write_text("# R2\n", encoding="utf-8")
+            code, _, stderr = _run_cli_capture(
+                [
+                    "invariant-check",
+                    "--pr-json",
+                    str(pr_json),
+                    "--cwd",
+                    tmp,
+                    "--rules",
+                    "r1.md",
+                    "--rules",
+                    "r2.md",
+                    "--dry-run",
+                ],
+                runner=fake_runner,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("--diff-file", observed_cmd)
+            self.assertIn("uncommitted", observed_diff)
+            self.assertEqual(observed_cmd.count("--rules"), 1)
+            r_idx = observed_cmd.index("--rules")
+            self.assertEqual(len(observed_cmd[r_idx + 1 : r_idx + 4]), 3)
 
 
 class TestPrOpsApplyTriage(unittest.TestCase):
@@ -296,6 +481,7 @@ class TestPrOpsApplyTriage(unittest.TestCase):
                     0,
                     json.dumps(
                         {
+                            "headRefOid": "1234567890abcdef",
                             "body": "",
                             "comments": [{"author": {"login": "me"}, "createdAt": "2026-11-25T02:00:00Z", "body": posted_summary}]
                             if posted_summary
@@ -451,14 +637,22 @@ class TestPrOpsApplyTriage(unittest.TestCase):
             self.assertEqual(code, 2)
 
     def test_apply_triage_verify_failure_returns_exit_1(self) -> None:
+        gql_calls = 0
+
         def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+            nonlocal gql_calls
             if cmd[:4] == ["git", "remote", "get-url", "origin"]:
                 return pr_ops.CmdResult(0, "https://github.com/octo/repo.git\n", "")
             if cmd[:3] == ["gh", "pr", "view"]:
-                return pr_ops.CmdResult(0, json.dumps({"body": "", "comments": [], "reviews": []}), "")
+                return pr_ops.CmdResult(
+                    0,
+                    json.dumps({"headRefOid": "1234567890abcdef", "body": "", "comments": [], "reviews": []}),
+                    "",
+                )
             if cmd[:3] == ["gh", "pr", "comment"]:
                 return pr_ops.CmdResult(0, "https://github.com/octo/repo/pull/6#issuecomment-1\n", "")
             if cmd[:3] == ["gh", "api", "graphql"]:
+                gql_calls += 1
                 return pr_ops.CmdResult(
                     0,
                     json.dumps(
@@ -504,6 +698,93 @@ class TestPrOpsApplyTriage(unittest.TestCase):
             out = json.loads(stdout)
             self.assertFalse(out["ok"])
             self.assertFalse(out["verification"]["commit_sha_match"])
+
+    def test_apply_triage_blocks_pre_write_sha_mismatch_and_foreign_thread(self) -> None:
+        mutations_called = 0
+
+        def make_runner(remote_head: str, thread_ids: list[str]):
+            def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+                nonlocal mutations_called
+                if cmd[:4] == ["git", "remote", "get-url", "origin"]:
+                    return pr_ops.CmdResult(0, "https://github.com/octo/repo.git\n", "")
+                if cmd[:3] == ["gh", "pr", "view"]:
+                    return pr_ops.CmdResult(
+                        0,
+                        json.dumps({"headRefOid": remote_head, "body": "", "comments": [], "reviews": []}),
+                        "",
+                    )
+                if cmd[:3] == ["gh", "api", "graphql"]:
+                    payload = json.loads(input_text or "{}")
+                    q = payload.get("query") or ""
+                    if "reviewThreads" in q:
+                        return pr_ops.CmdResult(
+                            0,
+                            json.dumps(
+                                {
+                                    "data": {
+                                        "repository": {
+                                            "pullRequest": {
+                                                "headRefOid": remote_head,
+                                                "reviewThreads": {
+                                                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                    "nodes": [
+                                                        {"id": tid, "isResolved": False, "isOutdated": False, "comments": {"nodes": []}}
+                                                        for tid in thread_ids
+                                                    ],
+                                                },
+                                            }
+                                        }
+                                    }
+                                }
+                            ),
+                            "",
+                        )
+                    mutations_called += 1
+                    raise AssertionError(f"Mutation must not run before pre-checks: {q}")
+                if cmd[:3] == ["gh", "pr", "comment"]:
+                    mutations_called += 1
+                    raise AssertionError("Comment must not run before pre-checks")
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            return fake_runner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "replies": [{"thread_id": "PRRT_foreign_1234", "body": "fix {{COMMIT_SHORT}}", "resolve": True}],
+                        "summary_comment": "done {{COMMIT_SHA}}",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            # 1. リモート HEAD 不一致なら書き込みゼロで終了コード 2
+            code, _, _ = _run_cli_capture(
+                ["apply-triage", "--pr", "6", "--cwd", tmp, "--plan", str(plan_path), "--commit-sha", "1234567"],
+                runner=make_runner("9999999999abcdef1234567890abcdef12345678", ["PRRT_foreign_1234"]),
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(mutations_called, 0)
+
+            # 2. リモート HEAD 一致でも別 PR のスレッド ID が含まれるなら書き込みゼロで終了コード 2
+            code, _, _ = _run_cli_capture(
+                ["apply-triage", "--pr", "6", "--cwd", tmp, "--plan", str(plan_path), "--commit-sha", "1234567"],
+                runner=make_runner("1234567890abcdef1234567890abcdef12345678", ["PRRT_belongs_to_pr6"]),
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(mutations_called, 0)
+
+            # 3. 短縮 SHA 指定で一致かつ所属一致時はフル SHA へ正規化されて展開される
+            code, stdout, stderr = _run_cli_capture(
+                ["apply-triage", "--pr", "6", "--cwd", tmp, "--plan", str(plan_path), "--commit-sha", "1234567", "--dry-run"],
+                runner=make_runner("1234567890abcdef1234567890abcdef12345678", ["PRRT_foreign_1234"]),
+            )
+            self.assertEqual(code, 0, stderr)
+            out = json.loads(stdout)
+            self.assertEqual(out["commit_sha"], "1234567890abcdef1234567890abcdef12345678")
+            self.assertIn("1234567890abcdef1234567890abcdef12345678", out["summary_preview"])
 
 
 class TestPrOpsCommitPush(unittest.TestCase):
@@ -619,6 +900,76 @@ class TestPrOpsCommitPush(unittest.TestCase):
                 ]
             )
             self.assertEqual(code, 2)
+
+            # 指定外のファイルが事前ステージされている場合は停止し、既存インデックスを変更しない
+            unrelated = work / "unrelated.txt"
+            unrelated.write_text("unrelated\n", encoding="utf-8")
+            (work / "fix.txt").write_text("fix\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(work), "add", "unrelated.txt"], check=True, capture_output=True)
+            code, _, _ = _run_cli_capture(
+                [
+                    "commit-push",
+                    "--cwd",
+                    str(work),
+                    "--files",
+                    "fix.txt",
+                    "--message-file",
+                    str(msg_file),
+                ]
+            )
+            self.assertEqual(code, 2)
+            staged_after = subprocess.run(
+                ["git", "-C", str(work), "diff", "--cached", "--name-only"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            self.assertEqual(staged_after, ["unrelated.txt"])
+            subprocess.run(["git", "-C", str(work), "reset", "HEAD", "unrelated.txt"], check=True, capture_output=True)
+
+            # origin/HEAD が独自名の既定ブランチを指す場合は直接 push を拒否
+            subprocess.run(["git", "-C", str(work), "checkout", "-b", "trunk-custom"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(work), "push", "-u", "origin", "trunk-custom"], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(work), "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk-custom"],
+                check=True,
+                capture_output=True,
+            )
+            code, _, _ = _run_cli_capture(
+                [
+                    "commit-push",
+                    "--cwd",
+                    str(work),
+                    "--files",
+                    "fix.txt",
+                    "--message-file",
+                    str(msg_file),
+                ]
+            )
+            self.assertEqual(code, 2)
+
+            # 相対 --cwd 指定時でも --message-file が二重パス連結されず成功する
+            subprocess.run(["git", "-C", str(work), "checkout", "feat/pr-ops-test"], check=True, capture_output=True)
+            (work / "rel_msg.txt").write_text("feat: relative cwd test\n", encoding="utf-8", newline="\n")
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(tmp_dir)
+                code, stdout, stderr = _run_cli_capture(
+                    [
+                        "commit-push",
+                        "--cwd",
+                        "work",
+                        "--files",
+                        "fix.txt",
+                        "--message-file",
+                        "rel_msg.txt",
+                        "--no-push",
+                    ]
+                )
+            finally:
+                os.chdir(prev_cwd)
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue(json.loads(stdout)["ok"])
 
 
 if __name__ == "__main__":
