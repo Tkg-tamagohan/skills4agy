@@ -366,7 +366,16 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
                 return pr_ops.CmdResult(0, " M app.py\n", "")
             if cmd[:2] == ["git", "merge-base"]:
                 return pr_ops.CmdResult(0, "base123\n", "")
-            if cmd[:4] == ["git", "-c", "core.quotePath=false", "diff"]:
+            if cmd[:8] == [
+                "git",
+                "-c",
+                "core.quotePath=false",
+                "-c",
+                "diff.noprefix=false",
+                "-c",
+                "diff.mnemonicPrefix=false",
+                "diff",
+            ]:
                 return pr_ops.CmdResult(0, "diff --git a/app.py b/app.py\n+print('uncommitted')\n", "")
             if cmd[:4] == ["git", "-c", "core.quotePath=false", "ls-files"]:
                 return pr_ops.CmdResult(0, "", "")
@@ -670,6 +679,90 @@ class TestPrOpsInvariantCheck(unittest.TestCase):
             self.assertIn("-first_line_no_nl\n", diff_text)
             self.assertIn(f"+token={dummy_tok}\n", diff_text)
             self.assertNotIn(f"first_line_no_nl+token=", diff_text)
+
+    def test_invariant_check_round5_isolation_glob_noprefix_and_errors(self) -> None:
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "config", "core.autocrlf", "false"], check=True, capture_output=True)
+            (repo / "base.txt").write_bytes(b"line1\nline2\n")
+            subprocess.run(["git", "-C", str(repo), "add", "base.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True, env=env)
+            base_sha = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            # 1. SEC_0001: 一時オブジェクト分離により実 .git/objects へ loose blob を書き込まない
+            objects_before = {
+                p.relative_to(repo / ".git" / "objects") for p in (repo / ".git" / "objects").rglob("*")
+            }
+            dummy_secret = "ghp_" + ("X" * 36)
+            (repo / "secret_untracked.py").write_text(f"TOKEN = '{dummy_secret}'\n", encoding="utf-8", newline="\n")
+
+            # 2. SEC_0002: diff.noprefix=true / diff.mnemonicPrefix=true を上書きし a/ b/ を維持する
+            subprocess.run(["git", "-C", str(repo), "config", "diff.noprefix", "true"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "config", "diff.mnemonicPrefix", "true"], check=True, capture_output=True)
+            (repo / ".env").write_text("DB_PASSWORD=custom-val\n", encoding="utf-8", newline="\n")
+
+            # 3. BUG_0002: 角括弧付き未追跡ファイル名でも除外済みファイルを取り込まない
+            (repo / "report[12].txt").write_text("small bracket file\n", encoding="utf-8", newline="\n")
+            (repo / "report1.txt").write_bytes(b"A" * (2 * 1024 * 1024 + 128))
+
+            diff_text, skipped = pr_ops._build_combined_worktree_diff(base_sha, repo, pr_ops._default_runner)
+            objects_after = {
+                p.relative_to(repo / ".git" / "objects") for p in (repo / ".git" / "objects").rglob("*")
+            }
+            self.assertEqual(objects_before, objects_after)
+            self.assertEqual(skipped, ["report1.txt (exceeds_2MiB_limit)"])
+            self.assertIsNotNone(diff_text)
+            assert diff_text is not None
+            self.assertIn("secret_untracked.py", diff_text)
+            self.assertIn("diff --git a/.env b/.env", diff_text)
+            self.assertIn("+++ b/.env", diff_text)
+            self.assertIn("report[12].txt", diff_text)
+            self.assertNotIn("report1.txt", diff_text)
+
+            # 4. BUG_0001: core.safecrlf=true で git add -u が失敗したときに暗黙成功へ倒さない
+            subprocess.run(["git", "-C", str(repo), "config", "core.autocrlf", "true"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "config", "core.safecrlf", "true"], check=True, capture_output=True)
+            (repo / "base.txt").write_bytes(b"line1\r\nline2\r\n")
+            with self.assertRaises(pr_ops.PrOpsError) as cm:
+                pr_ops._build_combined_worktree_diff(base_sha, repo, pr_ops._default_runner)
+            self.assertEqual(cm.exception.code, "worktree_diff_failed")
+
+            # 5. ANALYSIS_0001: 外部 GIT_DIR + GIT_WORK_TREE（ルートに .git なし）で未追跡ファイルを検出する
+            ext_git = root / "ext_git"
+            ext_work = root / "ext_work"
+            ext_git.mkdir()
+            ext_work.mkdir()
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(ext_git), "GIT_WORK_TREE": str(ext_work)}):
+                ext_env = {**env, "GIT_DIR": str(ext_git), "GIT_WORK_TREE": str(ext_work)}
+                subprocess.run(["git", "init", "-b", "main"], cwd=str(ext_work), check=True, capture_output=True)
+                (ext_work / "app.py").write_text("a = 1\n", encoding="utf-8", newline="\n")
+                subprocess.run(["git", "add", "app.py"], cwd=str(ext_work), check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "ext init"], cwd=str(ext_work), check=True, capture_output=True, env=ext_env)
+                ext_base = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=str(ext_work), check=True, capture_output=True, text=True
+                ).stdout.strip()
+                (ext_work / "ext_new.py").write_text("val = 1\n", encoding="utf-8", newline="\n")
+                self.assertFalse((ext_work / ".git").exists())
+                ext_diff, ext_skipped = pr_ops._build_combined_worktree_diff(
+                    ext_base, ext_work, pr_ops._default_runner
+                )
+                self.assertEqual(ext_skipped, [])
+                self.assertIsNotNone(ext_diff)
+                assert ext_diff is not None
+                self.assertIn("ext_new.py", ext_diff)
+                self.assertIn("+val = 1", ext_diff)
 
 
 class TestPrOpsApplyTriage(unittest.TestCase):

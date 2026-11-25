@@ -919,11 +919,22 @@ def _build_combined_worktree_diff(
         raise PrOpsError("invalid_base_ref", f"安全でない merge-base 結果です: {diff_base}")
     exclude_pathspecs = [f":(exclude,glob)**/{lock_name}" for lock_name in DEFAULT_EXCLUDE_LOCKS]
 
-    if not (git_cwd / ".git").exists():
+    real_git_dir: Path | None = None
+    if (git_cwd / ".git").exists() or os.environ.get("GIT_DIR", "").strip():
+        git_dir_res = runner(["git", "rev-parse", "--absolute-git-dir"], git_cwd, None)
+        if git_dir_res.returncode == 0 and git_dir_res.stdout.strip():
+            candidate_git_dir = Path(git_dir_res.stdout.strip())
+            if candidate_git_dir.is_dir():
+                real_git_dir = candidate_git_dir
+    if real_git_dir is None:
         diff_cmd = [
             "git",
             "-c",
             "core.quotePath=false",
+            "-c",
+            "diff.noprefix=false",
+            "-c",
+            "diff.mnemonicPrefix=false",
             "diff",
             "--no-ext-diff",
             "--unified=15",
@@ -959,6 +970,9 @@ def _build_combined_worktree_diff(
 
     with tempfile.TemporaryDirectory(prefix="pr_ops_idx_") as tmp_dir:
         tmp_index = Path(tmp_dir) / "index"
+        tmp_objects = Path(tmp_dir) / "objects"
+        tmp_objects.mkdir()
+
         idx_res = runner(["git", "rev-parse", "--git-path", "index"], git_cwd, None)
         if idx_res.returncode == 0 and idx_res.stdout.strip():
             raw_idx = Path(idx_res.stdout.strip())
@@ -966,34 +980,64 @@ def _build_combined_worktree_diff(
             if real_index.is_file():
                 shutil.copy2(real_index, tmp_index)
 
+        obj_res = runner(["git", "rev-parse", "--git-path", "objects"], git_cwd, None)
+        if obj_res.returncode == 0 and obj_res.stdout.strip():
+            raw_obj = Path(obj_res.stdout.strip())
+            real_objects = (raw_obj if raw_obj.is_absolute() else (git_cwd / raw_obj)).resolve()
+        else:
+            real_objects = (real_git_dir / "objects").resolve()
+
         tmp_env = os.environ.copy()
         tmp_env["GIT_INDEX_FILE"] = str(tmp_index)
+        tmp_env["GIT_OBJECT_DIRECTORY"] = str(tmp_objects)
+        real_obj_str = str(real_objects)
+        if os.pathsep in real_obj_str or '"' in real_obj_str:
+            quoted_real_obj = '"' + real_obj_str.replace("\\", "/") + '"'
+        else:
+            quoted_real_obj = real_obj_str
+        existing_alt = tmp_env.get("GIT_ALTERNATE_OBJECT_DIRECTORIES", "").strip()
+        tmp_env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = (
+            f"{quoted_real_obj}{os.pathsep}{existing_alt}" if existing_alt else quoted_real_obj
+        )
 
         if not tmp_index.exists():
             head_res = runner(["git", "rev-parse", "--verify", "--quiet", "HEAD"], git_cwd, None)
             if head_res.returncode == 0:
                 rt_res = _run_git_env(["git", "read-tree", "HEAD"], git_cwd, tmp_env)
                 if rt_res.returncode != 0:
-                    return None, skipped_untracked
+                    raise PrOpsError(
+                        "worktree_diff_failed",
+                        f"作業ツリー統合 diff の生成に失敗しました（read-tree）: {_mask(rt_res.stderr.strip())}",
+                    )
 
         add_u_res = _run_git_env(["git", "add", "-u"], git_cwd, tmp_env)
         if add_u_res.returncode != 0:
-            return None, skipped_untracked
+            raise PrOpsError(
+                "worktree_diff_failed",
+                f"作業ツリー統合 diff の生成に失敗しました（git add -u）: {_mask(add_u_res.stderr.strip())}",
+            )
 
         if safe_untracked:
             add_untracked_res = _run_git_env(
-                ["git", "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                ["git", "--literal-pathspecs", "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
                 git_cwd,
                 tmp_env,
                 input_text="\x00".join(safe_untracked) + "\x00",
             )
             if add_untracked_res.returncode != 0:
-                return None, skipped_untracked
+                raise PrOpsError(
+                    "worktree_diff_failed",
+                    f"作業ツリー統合 diff の生成に失敗しました（git add untracked）: {_mask(add_untracked_res.stderr.strip())}",
+                )
 
         cached_diff_cmd = [
             "git",
             "-c",
             "core.quotePath=false",
+            "-c",
+            "diff.noprefix=false",
+            "-c",
+            "diff.mnemonicPrefix=false",
             "diff",
             "--cached",
             "--no-ext-diff",
@@ -1005,7 +1049,10 @@ def _build_combined_worktree_diff(
         ]
         diff_res = _run_git_env(cached_diff_cmd, git_cwd, tmp_env)
         if diff_res.returncode != 0:
-            return None, skipped_untracked
+            raise PrOpsError(
+                "worktree_diff_failed",
+                f"作業ツリー統合 diff の生成に失敗しました（git diff --cached）: {_mask(diff_res.stderr.strip())}",
+            )
         return diff_res.stdout or "", skipped_untracked
 
 
