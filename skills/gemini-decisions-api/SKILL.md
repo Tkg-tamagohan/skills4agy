@@ -101,11 +101,13 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/gemini-decisions-api/s
 プラグインルートの `hooks.json`（キー名 `decision1-pretool-guard`、`"enabled": true`）は、`run_command` 実行前に `scripts/pretool_guard.py` を呼び出す。
 第 1 段の決定論的ローカル判定が純粋な読み取り、単体テスト、および厳格条件を満たす `origin` 非保護ブランチへの明示的な通常 push（`git push origin <branch>` 等）を即時 `allow`、破壊的操作（force push、既定ブランチ push、`--delete` / `:branch` / `--mirror` 等）を `force_ask`、機密ファイルや `env:` ドライブの外部送信を `deny` で処理し、境界上の曖昧なコマンドだけを機密マスク後に第 2 段の Decision 1 判定へ渡す。
 引数を省略した `git push` 単体や `git push origin HEAD` はコマンド文字列から対象ブランチを確定できないため意図的に第 1 段ホワイトリスト外とし、第 2 段判定（要確認）へ送る。
-第 1 段のホワイトリスト判定では、`PYTHONUTF8` や `PYTHONIOENCODING` などの安全な定数リテラル環境変数プレフィックス、ローカル FS パス限定の `Set-Location` / `cd` 類（PSDrive、UNC パス、ワイルドカード、`.ssh` や `.aws` 等の機密ディレクトリを除外）、PowerShell 5.1 の定型 fail-fast ガード（`if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` 等）、`;` と `&&` による許可コマンドの単純連結、および `python -B -m unittest` などの無害な短縮フラグを許容する。
+第 1 段のホワイトリスト判定では、`PYTHONUTF8` や `PYTHONIOENCODING` などの安全な定数リテラル環境変数プレフィックス、ローカル FS パス限定の `Set-Location` / `cd` 類（PSDrive、UNC パス、ワイルドカード、`.ssh` や `.aws` 等の機密ディレクトリを除外）、PowerShell 5.1 の定型 fail-fast ガード（`if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` 等）、`;` と `&&` とクォート外改行による許可コマンドの単純連結（最大 20 セグメント、クォート内改行と行継続 `\` は拒否）、および `python -B -m unittest` などの無害な短縮フラグを許容する。
+さらに、`python` によるプラグイン内検証と PR 運用のスクリプト（`check_plugin.py`、`check_hygiene.py`、`run_all_tests.py`、`check_invariants_decision1.py`、`check_devin_review.py`、`pr_guardrails.py`、`triage_decision1.py`、`pr_ops.py`、`slop_lint.py`、`slop_diff.py`、および `skills/*/scripts/test_*.py`）は、実パス解決とシンボリックリンクやリパースポイントの拒否を前提に稼働プラグイン自身または同一 `origin` 作業クローン配下に限り即時 `allow` とする（`--output` は安全一時領域または `scratch/` 配下に限定し、`python -c` や `python -` は引き続き拒否）。
+また、読み取り専用の `gh`（`gh pr view/checks/list/diff/status`、`gh run list/view`、`gh auth status`、ただし `--web`/`-w`/`--show-token` 等を除く）、`--body-file`/`-F` 限定かつ秘密情報非混入の PR 書き込み（`gh pr create/edit/comment`）、および安全な PR 用 `git` 操作（`fetch`、`checkout` や `switch` によるブランチ切替と新規作成、`pull --ff-only origin <branch>`、明示ファイルのみの `add`、`commit -m`/`-F`）を第 1 段で即時 `allow` とし、`gh pr merge` と `gh api` 単体は第 2 段確認を維持する。
 さらに、実行元の会話がランタイム管理情報から `/teamwork` 配下のサブエージェントと判定された場合は、機密の外部送信（`deny`）、平文認証情報や保護外 `git push` を含む破壊的操作（`force_ask`、ただし安全な一時ディレクトリやキャッシュ削除を除く）を通過したコマンドを第 1 段で即時 `allow` とし、第 2 段確認による停止を防ぐ。
 また、`rg` の引用符内正規表現に含まれる `|`、`<`、`>` はシェル演算子として誤分割せず、第 1 段ホワイトリストでそのまま `allow` とする。
 外側コマンドにコード実行シンクや外部送信コマンドが含まれない場合は、PowerShell `@'...'@` および POSIX `<<'DELIM'` の逐語本文を第 1 段ブラックリスト走査から除外し、Markdown 本文内のコマンド例による誤検知を防ぐ。
-一方で、`git commit` など他の状態変更コマンドや一般の制御構文を 1 回の `run_command` へ混在させると第 1 段の即時許可や IDE 側のコマンド単位許可が適用されにくくなるため、変更系と確認系は別呼び出しへ分離する。
+一方で、`git commit --amend` や一般の制御構文など範囲外コマンドを混在させると第 1 段の即時許可が適用されないため、承認が必要な操作は分離して実行する。
 API キー未設定や通信障害時は `ask` へ安全にフォールバックする。
 
 ```powershell

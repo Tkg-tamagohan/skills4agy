@@ -589,10 +589,12 @@ class TestPretoolGuard(unittest.TestCase):
         )
 
         stage2_cmds = [
-            "git commit -m fix; git rev-parse HEAD",
+            "git commit --amend -m fix; git rev-parse HEAD",
+            "git commit --no-verify -m fix",
             "git status; if ($LASTEXITCODE -ne 0) { ls }",
             'git status && python -c "print(1)"',
-            "git status; gh pr view 5",
+            "git status; gh pr delete 5",
+            "git status; gh pr merge 5",
             'rg "unclosed; git status',
             'git status; rg "unclosed',
             "git status;; dir",
@@ -605,7 +607,7 @@ class TestPretoolGuard(unittest.TestCase):
             "(ls)",
             'rg "$env:GEMINI_API_KEY" .',
             "rg $SECRET .",
-            "; ".join(["git status"] * 11),
+            "; ".join(["git status"] * 21),
         ]
         for cmd in stage2_cmds:
             with self.subTest(cmd=cmd):
@@ -1099,10 +1101,22 @@ class TestPretoolGuard(unittest.TestCase):
                         self.assertEqual(out["decision"], "allow")
                         self.assertIn("/teamwork", out["reason"])
 
-            # 通常会話では同じコマンド群は Stage 1 allow にならない（Stage 2 送り）
+            # 通常会話では /teamwork 専用コマンド群は Stage 1 allow にならず（Stage 2 送り）、
+            # v0.5.3 で通常ホワイトリスト化された安全 git commit / gh pr create --body-file のみ通常 allow となる
+            normal_whitelisted_in_teamwork_cmds = {
+                'git commit -m "feat: add updater"',
+                'git commit -m "docs: explain git status; git push origin main"',
+                "gh pr create --title test --body-file note.md",
+            }
             for cmd in teamwork_cmds:
                 with self.subTest(normal_cmd=cmd[:40]):
-                    self.assertIsNone(pg.evaluate_stage1(cmd, is_teamwork=False))
+                    res = pg.evaluate_stage1(cmd, is_teamwork=False)
+                    if cmd in normal_whitelisted_in_teamwork_cmds:
+                        self.assertIsNotNone(res)
+                        self.assertEqual(res[0], "allow")
+                        self.assertNotIn("/teamwork", res[1])
+                    else:
+                        self.assertIsNone(res)
 
             # 確定 POSIX シェル（posix_shell=True）または非 POSIX 環境上の明示的 bash -c では
             # バックスラッシュエスケープされた \$ / \` を実行置換扱いしない
@@ -1628,6 +1642,294 @@ class TestPretoolGuard(unittest.TestCase):
         for cmd in deferred_cmds:
             with self.subTest(deferred_cmd=cmd):
                 self.assertIsNone(pg.evaluate_stage1(cmd))
+
+    def test_p2_30_multiline_whitelist_and_segment_limits(self) -> None:
+        """P2-30: 複数行ホワイトリスト（空行無視・20 セグメント上限）とクォート内改行・末尾演算子の拒否を検証する。"""
+        allow_cmds = [
+            "git status\ngit diff --stat",
+            "git status\r\n\r\n  \r\ngit log -n 5 --oneline",
+            "$env:PYTHONUTF8=\"1\"\n$env:PYTHONIOENCODING=\"utf-8\"\ngit status\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\ngit branch --show-current",
+            "\n".join(["git status"] * 20),
+        ]
+        for cmd in allow_cmds:
+            with self.subTest(allow_cmd=cmd):
+                res = pg.evaluate_stage1(cmd)
+                self.assertIsNotNone(res, f"Expected stage1 allow for multiline cmd: {cmd!r}")
+                self.assertEqual(res[0], "allow")
+
+        self.assertEqual(pg.evaluate_stage1("git status\nrm -rf /")[0], "force_ask")
+
+        deferred_cmds = [
+            "\n".join(["git status"] * 21),
+            'git commit -m "line1\nline2"',
+            "git status;\ngit diff",
+            "git status &&\ngit diff",
+            "git status;\n",
+            "git status \\\ngit diff",
+            "git status\necho next",
+        ]
+        for cmd in deferred_cmds:
+            with self.subTest(deferred_cmd=cmd):
+                self.assertIsNone(pg.evaluate_stage1(cmd), f"Expected None for: {cmd!r}")
+
+    def test_p2_31_trusted_plugin_scripts_and_origin_boundary(self) -> None:
+        """P2-31: 信頼済みプラグインスクリプト（プラグイン自身＋同一 origin 作業クローン）と境界拒否を検証する。"""
+        repo_root = Path(__file__).resolve().parents[3]
+        trusted_scripts = [
+            "skills/plugin-authoring/scripts/check_plugin.py --version-base origin/main",
+            "skills/plugin-authoring/scripts/check_hygiene.py",
+            "skills/plugin-authoring/scripts/run_all_tests.py",
+            "skills/invariant-gate/scripts/check_invariants_decision1.py --base origin/main --dry-run",
+            "skills/pr-review-triage/scripts/check_devin_review.py --pr-url https://github.com/o/r/pull/1 --dry-run",
+            "skills/pr-review-triage/scripts/pr_guardrails.py extract --input pr.json --format summary",
+            "skills/pr-review-triage/scripts/pr_guardrails.py extract --input pr.json --format rules-md --output $env:TEMP/pr-guardrails.md",
+            "skills/pr-review-triage/scripts/pr_guardrails.py extract --input pr.json --format rules-md --output scratch/pr-guardrails.md",
+            "skills/pr-review-triage/scripts/triage_decision1.py --input reviews.json --dry-run",
+            "skills/pr-review-triage/scripts/pr_ops.py status --pr 6",
+            "skills/pr-review-triage/scripts/pr_ops.py status --pr 6 --output $env:TEMP/pr-status.json",
+            "skills/japanese-tech-writing/scripts/slop_lint.py --strict README.md",
+            "skills/japanese-tech-writing/scripts/slop_diff.py --base origin/main",
+            "skills/gemini-decisions-api/scripts/test_pretool_guard.py",
+        ]
+        with mock.patch.dict(os.environ, {"TEMP": str(Path(tempfile.gettempdir()))}):
+            for script_call in trusted_scripts:
+                with self.subTest(script_call=script_call):
+                    res = pg.evaluate_stage1(f"python {script_call}", cwd=str(repo_root))
+                    self.assertIsNotNone(res, f"Expected allow for trusted script: {script_call}")
+                    self.assertEqual(res[0], "allow")
+
+            # Set-Location 後の相対パス実行および $HOME パス展開
+            chained_res = pg.evaluate_stage1(
+                f'Set-Location "{repo_root}"; python skills/plugin-authoring/scripts/check_hygiene.py',
+                cwd=str(Path(tempfile.gettempdir())),
+            )
+            self.assertIsNotNone(chained_res)
+            self.assertEqual(chained_res[0], "allow")
+
+            fake_home_plugin = pg.PLUGIN_ROOT
+            with mock.patch.object(Path, "home", return_value=fake_home_plugin):
+                # $HOME/skills/... の形でも PLUGIN_ROOT 配下に解決されれば allow になることを確認
+                home_res = pg.evaluate_stage1(
+                    'python "$HOME/skills/plugin-authoring/scripts/check_hygiene.py"',
+                    cwd=str(Path(tempfile.gettempdir())),
+                )
+                self.assertIsNotNone(home_res)
+                self.assertEqual(home_res[0], "allow")
+
+            # 信頼スクリプトでも --output に安全一時/scratch 外や .env を指定した場合は拒否
+            self.assertIsNone(
+                pg.evaluate_stage1(
+                    "python skills/pr-review-triage/scripts/pr_guardrails.py extract --input pr.json --output ./evil.md",
+                    cwd=str(repo_root),
+                )
+            )
+            self.assertIsNone(
+                pg.evaluate_stage1(
+                    "python skills/pr-review-triage/scripts/pr_ops.py status --output ./outside.json",
+                    cwd=str(repo_root),
+                )
+            )
+
+        # 未信頼リポジトリ（別 origin）およびリパースポイントは拒否
+        with tempfile.TemporaryDirectory() as tmp:
+            untrusted = Path(tmp) / "untrusted"
+            (untrusted / "skills" / "plugin-authoring" / "scripts").mkdir(parents=True)
+            (untrusted / ".git").mkdir()
+            (untrusted / ".git" / "config").write_text(
+                '[remote "origin"]\n\turl = https://github.com/evil/other-repo.git\n',
+                encoding="utf-8",
+            )
+            target_py = untrusted / "skills" / "plugin-authoring" / "scripts" / "check_hygiene.py"
+            target_py.write_text("print('pwn')\n", encoding="utf-8")
+
+            with mock.patch.object(pg, "_read_git_origin_url", side_effect=lambda p: (
+                "https://github.com/Tkg-tamagohan/skills4agy.git"
+                if Path(p) == pg.PLUGIN_ROOT
+                else "https://github.com/evil/other-repo.git"
+            )):
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        "python skills/plugin-authoring/scripts/check_hygiene.py",
+                        cwd=str(untrusted),
+                    )
+                )
+
+            # 同一 origin なら allow、ただし _is_reparse_or_symlink が True なら拒否
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                ok_res = pg.evaluate_stage1(
+                    "python skills/plugin-authoring/scripts/check_hygiene.py",
+                    cwd=str(untrusted),
+                )
+                self.assertIsNotNone(ok_res)
+                self.assertEqual(ok_res[0], "allow")
+
+                with mock.patch.object(pg, "_is_reparse_or_symlink", return_value=True):
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            "python skills/plugin-authoring/scripts/check_hygiene.py",
+                            cwd=str(untrusted),
+                        )
+                    )
+
+        # 非対象スクリプトおよび python -c / python - は引き続き拒否
+        for bad_cmd in (
+            "python skills/plugin-authoring/scripts/new_entry.py",
+            'python -c "print(1)"',
+            "python -",
+            "python $HOME_EVIL/check_hygiene.py",
+        ):
+            with self.subTest(bad_cmd=bad_cmd):
+                self.assertIsNone(pg.evaluate_stage1(bad_cmd, cwd=str(repo_root)))
+
+    def test_p2_32_gh_whitelist_and_merge_api_boundaries(self) -> None:
+        """P2-32: 安全な gh 読み取り・--body-file 限定書き込みを allow し、gh pr merge / gh api / --body / 秘密混入を拒否する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            safe_body = tmp_dir / "body.md"
+            safe_body.write_text("PR の変更概要です。\n", encoding="utf-8")
+            secret_body = tmp_dir / "secret_body.md"
+            secret_body.write_text("key=" + ("ghp_" + "A" * 36) + "\n", encoding="utf-8")
+
+            allow_cmds = [
+                "gh pr view 6",
+                "gh pr view 6 --json number,headRefOid,body,comments,reviews",
+                "gh pr checks 6",
+                "gh pr list --state open",
+                "gh pr diff 6",
+                "gh pr status",
+                "gh run list --limit 5",
+                "gh run view 12345",
+                "gh auth status",
+                'gh pr create --base main --head feat/x --title "feat: test" --body-file body.md',
+                'gh pr edit 6 --title "updated" --body-file body.md',
+                "gh pr comment 6 -F body.md",
+            ]
+            for cmd in allow_cmds:
+                with self.subTest(allow_cmd=cmd):
+                    res = pg.evaluate_stage1(cmd, cwd=tmp)
+                    self.assertIsNotNone(res, f"Expected allow for gh cmd: {cmd}")
+                    self.assertEqual(res[0], "allow")
+
+            self.assertEqual(
+                pg.evaluate_stage1("gh pr create --title t --body-file .env", cwd=tmp)[0],
+                "deny",
+            )
+            self.assertEqual(
+                pg.evaluate_stage1("gh pr comment 6 -F id_rsa", cwd=tmp)[0],
+                "deny",
+            )
+
+            deferred_cmds = [
+                "gh pr merge 6 --merge",
+                "gh pr close 6",
+                "gh pr delete 6",
+                "gh api graphql -f query='{ viewer { login } }'",
+                "gh auth token",
+                "gh auth status --show-token",
+                "gh auth status -t",
+                "gh pr view 6 --web",
+                "gh pr view 6 -w",
+                'gh pr create --title "t" --body "inline body"',
+                'gh pr comment 6 -b "inline"',
+                "gh pr comment 6 --body-file -",
+                "gh pr comment 6 --body-file secret_body.md",
+                'gh pr create --title "tok=' + ("ghp_" + "A" * 36) + '" --body-file body.md',
+            ]
+            for cmd in deferred_cmds:
+                with self.subTest(deferred_cmd=cmd):
+                    self.assertIsNone(pg.evaluate_stage1(cmd, cwd=tmp), f"Expected None for: {cmd}")
+
+            with mock.patch.object(pg, "_is_reparse_or_symlink", return_value=True):
+                self.assertIsNone(
+                    pg.evaluate_stage1("gh pr comment 6 -F body.md", cwd=tmp)
+                )
+
+    def test_p2_33_git_pr_ops_whitelist_and_dangerous_flags(self) -> None:
+        """P2-33: git fetch/checkout/switch/pull --ff-only/add/commit の安全ケースを allow し、危険フラグ・範囲外引数を拒否する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            (tmp_dir / "README.md").write_text("hello\n", encoding="utf-8")
+            (tmp_dir / "safe_dir").mkdir()
+            msg_ok = tmp_dir / "msg.txt"
+            msg_ok.write_text("feat: safe commit\n", encoding="utf-8")
+            msg_secret = tmp_dir / "msg_secret.txt"
+            msg_secret.write_text("leak " + ("sk-" + "B" * 24) + "\n", encoding="utf-8")
+
+            allow_cmds = [
+                "git fetch origin",
+                "git fetch origin main",
+                "git checkout main",
+                "git checkout -b feat/new-branch",
+                "git checkout -b feat/new-branch origin/main",
+                "git switch main",
+                "git switch -c feat/switch-branch",
+                "git pull --ff-only origin main",
+                "git add README.md",
+                "git add -- README.md",
+                'git commit -m "feat: add feature"',
+                "git commit -F msg.txt",
+            ]
+            for cmd in allow_cmds:
+                with self.subTest(allow_cmd=cmd):
+                    res = pg.evaluate_stage1(cmd, cwd=tmp)
+                    self.assertIsNotNone(res, f"Expected allow for git cmd: {cmd}")
+                    self.assertEqual(res[0], "allow")
+
+            # git push --force origin feat は破壊操作として force_ask
+            self.assertEqual(
+                pg.evaluate_stage1("git push --force origin feat/x", cwd=tmp)[0],
+                "force_ask",
+            )
+
+            deferred_cmds = [
+                "git fetch --all",
+                "git fetch --prune origin",
+                "git fetch upstream",
+                "git checkout -- README.md",
+                "git checkout README.md",
+                "git checkout -f main",
+                "git checkout -B main",
+                "git checkout --orphan gh-pages",
+                "git checkout --detach HEAD",
+                "git checkout HEAD",
+                "git switch --discard-changes main",
+                "git switch -C main",
+                "git switch -f main",
+                "git switch --detach HEAD",
+                "git pull origin main",
+                "git pull --rebase origin main",
+                "git pull --ff-only upstream main",
+                "git pull --ff-only origin +main:main",
+                "git add -A",
+                "git add --all",
+                "git add .",
+                "git add -u",
+                "git add -f README.md",
+                "git add *.py",
+                "git add safe_dir",
+                "git add .env",
+                "git add id_rsa",
+                'git commit --amend -m "x"',
+                'git commit --no-verify -m "x"',
+                'git commit -n -m "x"',
+                'git commit -a -m "x"',
+                'git commit -m "x" README.md',
+                "git commit -F -",
+                "git commit -F .env",
+                "git commit -F msg_secret.txt",
+                'git commit -m "leak ' + ("ghp_" + "C" * 36) + '"',
+            ]
+            for cmd in deferred_cmds:
+                with self.subTest(deferred_cmd=cmd):
+                    self.assertIsNone(pg.evaluate_stage1(cmd, cwd=tmp), f"Expected None for git cmd: {cmd}")
+
+            with mock.patch.object(pg, "_is_reparse_or_symlink", return_value=True):
+                self.assertIsNone(pg.evaluate_stage1("git add README.md", cwd=tmp))
+                self.assertIsNone(pg.evaluate_stage1("git commit -F msg.txt", cwd=tmp))
 
 
 if __name__ == "__main__":

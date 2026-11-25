@@ -19,10 +19,9 @@ description: PR レビュー指摘と GraphQL スレッドを実コードで照�
 
 ## Stage 1：実物照合トリアージ
 
-1. `git log`、現行 HEAD の実装とテストコード、および GitHub PR の状態を Python スクリプト経由で取得して突き合わせる。
-   - GraphQL `reviewThreads` から全スレッドの `id`、`isResolved`、`isOutdated`、対象パスと行、コメント本文を取得する。
-   - あわせて `gh pr view <num> --json body,comments,reviews` も取得し、インラインスレッド外のレビュー総評本文に記載された diff 外指摘と、過去ラウンドの再発防止策を見落とさない。
-   - 取得した PR JSON に対して `scripts/pr_guardrails.py extract --input pr.json --format summary` を実行し、PR 内に記録済みの有効な再発防止策と失効履歴を回収する。
+1. `git log`、現行 HEAD の実装とテストコード、および GitHub PR の状態を統合 CLI `scripts/pr_ops.py` 経由で取得して突き合わせる。
+   - `pr_ops.py status --save-pr-json <tmp>/pr.json` で PR 本文、コメント、レビュー総評、CI チェック集計、GraphQL `reviewThreads`（全ページ）、および既存再発防止策を一括取得する。
+   - 取得した PR JSON に対して `scripts/pr_guardrails.py extract --input pr.json --format summary` を実行し、PR 内に記録済みの有効な再発防止策と失効履歴を確認する。
 2. 指摘件数が多い場合（目安 5 件以上）は、任意で同梱の `scripts/triage_decision1.py` を使い、取得済み指摘 JSON を一次プリラベルして確定候補の根拠照合と要精査項目の再現確認へ集中する。
    - 各指摘を `triage_bucket`、`needs_human_confirmation`、`severity`、`dispatch_mode` の 4 問で並列分類し、API トークンや秘密鍵ヘッダの混入時は送信前に終了コード `2` で遮断される。
    - 信頼度 `0.80` 以上、区分 `other` 以外、要確認度 `0.50` 未満をすべて満たす項目は確定候補（`needs_deep_review: false`）に振り分け、残りを重点精査対象（`needs_deep_review: true`）へ上げる。
@@ -31,9 +30,9 @@ description: PR レビュー指摘と GraphQL スレッドを実コードで照�
 
 ```powershell
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/pr_guardrails.py" extract --input pr.json --format summary
+python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/pr_ops.py" status --save-pr-json "$env:TEMP/pr.json" --output "$env:TEMP/pr-status.json"
+python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/pr_guardrails.py" extract --input "$env:TEMP/pr.json" --format summary
 python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/triage_decision1.py" --input reviews.json --dry-run
-python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/triage_decision1.py" --input reviews.json --format table
 ```
 
 3. 各指摘を次の 3 区分に分類し、根拠コミット、実在する行番号と回帰テスト ID、関連する再発防止策 ID（該当がある場合）、担当区分を一覧表にする。
@@ -58,35 +57,38 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scrip
    - Windows 上で `git`、`gh`、PowerShell を使う全ワーカーへ `windows-cli-pitfalls` を渡す。
    - 日本語を含む編集を行うワーカーへ `verify-file-writes`、テスト担当へ `test-conventions` を渡す。
 5. 他セッションからの完了連絡後に統合検証を行う際は、前回検証時刻と変更対象ファイルの最終更新時刻（`LastWriteTime`）または `git diff` 内容を比較し、更新があれば前回検証以降のデルタを精査したうえで全標準検証コマンドを再実行する。
-6. 実装完了後かつ PR 更新前に、有効な PR 内再発防止策が 1 件以上あるときは、リポジトリ外（`$env:TEMP` や `scratch/`）へルール Markdown を書き出し、`invariant-gate`（`--rules` 指定）で新差分が過去の再発防止策を破っていないか一次検査する。
+6. 実装完了後かつ PR 更新前に、有効な PR 内再発防止策が 1 件以上あるときは、`pr_ops.py invariant-check` を実行して新差分が過去の再発防止策を破っていないか一次検査する。
+   - 同コマンドは PR コメント内の有効項目を内部の一時ルール Markdown へ自動書き出しし、`invariant-gate` を連続実行する。
 
 ```powershell
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-$guardrailsMd = Join-Path $env:TEMP "pr-guardrails.md"
-python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/pr_guardrails.py" extract --input pr.json --format brief
-python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/pr_guardrails.py" extract --input pr.json --format rules-md --output $guardrailsMd
-python "$HOME/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts/check_invariants_decision1.py" --base main --rules $guardrailsMd
+python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/pr_ops.py" invariant-check --base origin/main --strict-guardrails
 ```
 
 ## Stage 3：コミット、push、スレッド返信と Resolve、事後検証
 
-1. コミットと push の前に作成する返信ドラフトでは、「既コミット分のみで完結する本文」と「未コミット変更を push した後に `<次コミットハッシュ>` を差し替えて追記する本文」を厳密に区別する。
+1. コミットと push の前に作成する返信ドラフトでは、「既コミット分のみで完結する本文」と「未コミット変更を push した後に `{{COMMIT_SHORT}}` を差し替えて追記する本文」を厳密に区別する。
 2. ユーザーから反映指示を受けたら、次の順序で実行する（`git push --force` と既定ブランチへの直接 push は行わない）。
-   1. `git branch --show-current` と `git status -sb` で対象ブランチと変更ファイル集合が想定どおりであることを確認し、対象ファイルのみ明示的に `git add` する。
-   2. リポジトリ外（`$env:TEMP` や `scratch/`）へ UTF-8（BOM なし）の一時ファイルを作成して `git commit -F` でコミットし、`git push origin <branch>` でリモートと対象ブランチを明示して push し、新コミットハッシュ（短縮とフル）を確定させる。
-   3. 確定ハッシュを差し替えた日本語返信を Python の `subprocess.run(..., encoding="utf-8")` から GraphQL `addPullRequestReviewThreadReply` で投稿し、対応スレッドを `resolveReviewThread` で Resolve する。
-   4. 今回解決または合意した指摘から再発防止策（新規、`active` 改訂、不要化した `retired`）を抽出し、`pr_guardrails.py render --items guardrails.json --existing pr.json` で検証済みマーカーブロックを生成して、新コミットハッシュ、対応指摘（diff 外総評指摘を含む）、追加または改訂したテスト ID 一覧、標準検証コマンドの実測結果、未検証範囲をまとめた日本語サマリコメント末尾へ含め、`gh pr comment --body-file` で投稿する。
-   5. PR マージ後もリポジトリ全体で守るべき恒久化候補がある場合は、リポジトリ内ファイルを勝手に編集せず、Stage 3 の完了報告で反映先案（`AGENTS.md`、`.agents/rules/`、`.agents/invariants.json` 等）を提案のみ提示する。
-3. 反映完了後、次の機械的事後検証を実行して結果を表で報告する。
-   - GraphQL で PR の `headRefOid` と全 `reviewThreads` を再取得し、未 Resolve スレッドが 0 件であること、`headRefOid` が push 済みコミットと一致することを確認する。
-   - 投稿後の PR JSON（`gh pr view <num> --json body,comments`）に対して `pr_guardrails.py extract --input pr-after.json --strict --format json` を実行し、終了コード `0` で意図した ID とステータスが復元できることを確認する。
-   - 投稿した全スレッド返信と PR サマリコメントに `U+FFFD` や文字化けがないことを確認する。
+   1. 入力テキスト（コミットメッセージ、返信計画 JSON、サマリコメント等）は `write_file` で `$env:TEMP` または `scratch/` 配下へ BOM なし UTF-8 で書き出す（全コマンドで秘密情報、BOM、および `U+FFFD` の検査を強制）。
+   2. `pr_ops.py commit-push --files <対象ファイル...> --message-file <msg.txt>` で明示ファイルのみ `git add`、コミット、`git push origin <branch>` を実行し、新コミット SHA を確定させる。
+   3. `pr_ops.py apply-triage --plan <plan.json> --commit-sha <head_sha>` で確定 SHA 差し替え済みの日本語スレッド返信、`resolveReviewThread`、`pr_guardrails.py` 検証済みマーカーブロック付きの日本語サマリコメント投稿（`gh pr comment --body-file`）、および GraphQL 再取得、strict 復元、および `U+FFFD` 検証までを一括実行する。
+   4. PR マージ後もリポジトリ全体で守るべき恒久化候補がある場合は、リポジトリ内ファイルを勝手に編集せず、Stage 3 の完了報告で反映先案（`AGENTS.md`、`.agents/rules/`、`.agents/invariants.json` 等）を提案のみ提示する。
+
+```powershell
+$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
+python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/pr_ops.py" commit-push --files path/to/file.py --message-file "$env:TEMP/commit-msg.txt"
+python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/pr_ops.py" apply-triage --plan "$env:TEMP/triage-plan.json" --commit-sha "<head_sha>" --dry-run
+python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scripts/pr_ops.py" apply-triage --plan "$env:TEMP/triage-plan.json" --commit-sha "<head_sha>"
+```
+
+3. 反映完了後、`apply-triage` の `verification` 出力と合わせて以下を確認し、結果を表で報告する。
+   - `unresolved_count == 0` かつ `commit_sha_match == true` かつ `guardrails_strict_ok == true` かつ `ufffd_found == false` であること。
    - `git status -sb` がクリーンであること、および一時ファイルが残存していないことを確認する。
 
 ## Stage 3 後：Devin Review 状態確認と再レビューループ
 
 PR 改善ループ（`/goal` 等）でコミットを push した直後は、GitHub GraphQL だけでは「0 件完了」と「解析中または未実行」を区別できない。
-`scripts/check_devin_review.py` を呼び出し、Devin API の完了状態と GitHub GraphQL の未 Resolve スレッド件数を突き合わせて次手を決める。
+`pr_ops.py status --check-devin`（内部で `scripts/check_devin_review.py` を実行）を呼び出し、Devin API の完了状態と GitHub GraphQL の未 Resolve スレッド件数を突き合わせて次手を決める。
 
 前提として、2026 年 11 月時点の Devin API v3（Pro プラン実機確認済み）では組織スコープの `/v3/organizations/{org_id}/pr-reviews` を使用し、エンタープライズ専用の `/v3/enterprise/pr-reviews` は使わない。
 このエンドポイントは指摘件数を返さないため、0 件完了の確定には GitHub GraphQL との併用が必須である。

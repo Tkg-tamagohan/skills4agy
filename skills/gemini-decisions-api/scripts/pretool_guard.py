@@ -28,7 +28,7 @@ DECISION1_TIMEOUT_SECONDS = 8.0
 FALLBACK_REASON = "Decision 1 guard unavailable; fallback to standard confirmation."
 
 SHELL_META_RE = re.compile(r"[;&|><`\r\n\x00]|\$\(|\$\{")
-DISALLOWED_WHITELIST_ANYWHERE_RE = re.compile(r"[`\r\n\x00]|\$\(|\$\{")
+DISALLOWED_WHITELIST_ANYWHERE_RE = re.compile(r"[`\x00]|\$\(|\$\{")
 
 SAFE_ENV_VAR_VALIDATORS: dict[str, re.Pattern[str]] = {
     "PYTHONUTF8": re.compile(r"^[01]$"),
@@ -67,7 +67,27 @@ SENSITIVE_CD_DIR_NAMES = frozenset(
 )
 WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:(?:[\\/]|$)")
 SAFE_PYTHON_SHORT_FLAGS = frozenset({"B", "u", "s", "E", "I"})
-MAX_WHITELIST_SEGMENTS = 10
+MAX_WHITELIST_SEGMENTS = 20
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[3]
+TRUSTED_PLUGIN_SCRIPTS = frozenset(
+    {
+        "skills/plugin-authoring/scripts/check_plugin.py",
+        "skills/plugin-authoring/scripts/check_hygiene.py",
+        "skills/plugin-authoring/scripts/run_all_tests.py",
+        "skills/invariant-gate/scripts/check_invariants_decision1.py",
+        "skills/pr-review-triage/scripts/check_devin_review.py",
+        "skills/pr-review-triage/scripts/pr_guardrails.py",
+        "skills/pr-review-triage/scripts/triage_decision1.py",
+        "skills/pr-review-triage/scripts/pr_ops.py",
+        "skills/japanese-tech-writing/scripts/slop_lint.py",
+        "skills/japanese-tech-writing/scripts/slop_diff.py",
+    }
+)
+TRUSTED_PLUGIN_TEST_SCRIPT_RE = re.compile(
+    r"^skills/[a-z0-9-]+/scripts/test_[a-z0-9_]+\.py$"
+)
+MAX_SAFE_INSPECT_FILE_BYTES = 2 * 1024 * 1024
 
 SAFE_ENV_FILENAMES = dh.SAFE_ENV_BASENAMES
 
@@ -274,6 +294,54 @@ GIT_SAFE_PUSH_FLAGS = frozenset(
     {"-u", "--set-upstream", "-n", "--dry-run", "-q", "--quiet", "-v", "--verbose", "--porcelain"}
 )
 GIT_SAFE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+GIT_SAFE_FETCH_FLAGS = frozenset({"-q", "--quiet", "-v", "--verbose", "--no-tags"})
+GIT_SAFE_CHECKOUT_FLAGS = frozenset({"-b", "-q", "--quiet"})
+GIT_SAFE_SWITCH_FLAGS = frozenset({"-c", "--create", "-q", "--quiet"})
+GIT_SAFE_PULL_FLAGS = frozenset({"--ff-only", "-q", "--quiet", "-v", "--verbose", "--no-stat"})
+GIT_SAFE_COMMIT_FLAGS = frozenset({"-q", "--quiet"})
+GIT_SAFE_COMMIT_VALUE_FLAGS = frozenset({"-m", "--message", "-F", "--file"})
+
+GH_READONLY_PR_SUBCOMMANDS = frozenset({"view", "checks", "list", "diff", "status"})
+GH_READONLY_RUN_SUBCOMMANDS = frozenset({"list", "view"})
+GH_WRITE_PR_SUBCOMMANDS = frozenset({"create", "edit", "comment"})
+GH_PR_COMMON_VALUE_FLAGS = frozenset({"--repo", "-R", "--title", "-t", "--body-file", "-F"})
+GH_PR_CREATE_VALUE_FLAGS = GH_PR_COMMON_VALUE_FLAGS | {
+    "--base",
+    "-B",
+    "--head",
+    "-H",
+    "--label",
+    "-l",
+    "--assignee",
+    "-a",
+    "--reviewer",
+    "-r",
+    "--milestone",
+    "-m",
+    "--project",
+    "-p",
+    "--template",
+    "-T",
+}
+GH_PR_CREATE_BOOL_FLAGS = frozenset({"--draft", "-d", "--fill", "-f", "--fill-first"})
+GH_PR_EDIT_VALUE_FLAGS = GH_PR_COMMON_VALUE_FLAGS | {
+    "--base",
+    "-B",
+    "--add-label",
+    "--remove-label",
+    "--add-assignee",
+    "--remove-assignee",
+    "--add-reviewer",
+    "--remove-reviewer",
+    "--milestone",
+    "-m",
+    "--remove-milestone",
+    "--add-project",
+    "--remove-project",
+}
+GH_PR_EDIT_BOOL_FLAGS = frozenset()
+GH_PR_COMMENT_VALUE_FLAGS = frozenset({"--repo", "-R", "--body-file", "-F"})
+GH_PR_COMMENT_BOOL_FLAGS = frozenset({"--edit-last", "--create-if-none"})
 GIT_PROTECTED_PUSH_BRANCHES = frozenset(
     {
         "main",
@@ -1540,6 +1608,42 @@ def _collect_all_command_segments(
     return all_segments
 
 
+def _match_secret_file_hit(raw_path: str) -> str | None:
+    """単一トークン・パスが機密ファイル（非除外 .env、秘密鍵、クラウド資格情報）参照ならラベルを返す。"""
+    cleaned = raw_path.strip().lstrip("@<=:").rstrip(",;")
+    if not cleaned:
+        return None
+    norm = cleaned.replace("\\", "/")
+    low_norm = norm.lower()
+    parts = [p for p in low_norm.split("/") if p]
+    base = parts[-1] if parts else ""
+    if not base:
+        return None
+
+    if dh.is_blocked_env_path(base):
+        return base
+
+    if base in PRIVATE_KEY_EXACT_NAMES:
+        return base
+
+    if not base.startswith("-") and any(
+        base.endswith(ext) and len(base) > len(ext) for ext in PRIVATE_KEY_EXTENSIONS
+    ):
+        return base
+
+    if low_norm.endswith("/.aws/credentials") or low_norm == ".aws/credentials":
+        return ".aws/credentials"
+
+    if any(part in {".ssh", ".gnupg"} for part in parts):
+        return parts[-1]
+
+    return None
+
+
+def _is_secret_file_path(raw_path: str) -> bool:
+    return _match_secret_file_hit(raw_path) is not None
+
+
 def _extract_secret_file_hits(command: str) -> list[str]:
     """コマンドライン内の機密ファイル（非除外 .env と秘密鍵ファイル）参照を検出する。"""
     hits: list[str] = []
@@ -1551,26 +1655,9 @@ def _extract_secret_file_hits(command: str) -> list[str]:
             cleaned = rhs.lstrip("@<=")
         if not cleaned:
             continue
-        norm = cleaned.replace("\\", "/")
-        low_norm = norm.lower()
-        base = norm.rsplit("/", 1)[-1].lower()
-
-        if dh.is_blocked_env_path(base):
-            hits.append(base)
-            continue
-
-        if base in PRIVATE_KEY_EXACT_NAMES:
-            hits.append(base)
-            continue
-
-        if not base.startswith("-") and any(
-            base.endswith(ext) and len(base) > len(ext) for ext in PRIVATE_KEY_EXTENSIONS
-        ):
-            hits.append(base)
-            continue
-
-        if low_norm.endswith("/.aws/credentials") or low_norm == ".aws/credentials":
-            hits.append(".aws/credentials")
+        hit = _match_secret_file_hit(cleaned)
+        if hit is not None:
+            hits.append(hit)
     return hits
 
 
@@ -2096,7 +2183,385 @@ def _is_whitelisted_git_push(args: list[str]) -> bool:
     return True
 
 
-def _classify_whitelisted_git(tokens: list[str]) -> tuple[bool, bool]:
+def _expand_safe_path_vars(path_str: str) -> str | None:
+    """安全な既知パス変数（$HOME/ と $env:TEMP/ / $env:TMP/）のみ展開する。"""
+    if not path_str:
+        return None
+    norm = path_str.replace("\\", "/")
+    if path_str == "$HOME" or (
+        path_str.startswith("$HOME")
+        and len(path_str) > 5
+        and path_str[5] in ("/", "\\")
+    ):
+        if len(path_str) == 5:
+            return None
+        tail = path_str[6:].lstrip("/\\")
+        if not tail or "$" in tail:
+            return None
+        return str(Path.home() / tail)
+
+    m = re.match(r"^\$env:(TEMP|TMP)[\\/](.+)$", path_str, re.IGNORECASE)
+    if m:
+        env_name = m.group(1).upper()
+        tail = m.group(2).lstrip("/\\")
+        if not tail or "$" in tail:
+            return None
+        env_root = os.environ.get(env_name, "").strip()
+        if not env_root:
+            return None
+        return str(Path(env_root) / tail)
+
+    if "$" in norm:
+        return None
+    return path_str
+
+
+def _has_reparse_in_tree(root: Path, target: Path) -> bool:
+    """root から target までの全既存ディレクトリ・ファイルにリンク/リパースポイントがないか検査する。"""
+    try:
+        rel = target.relative_to(root)
+    except ValueError:
+        return True
+    cur = root
+    if os.path.lexists(cur) and _is_reparse_or_symlink(cur):
+        return True
+    for part in rel.parts:
+        cur = cur / part
+        if os.path.lexists(cur) and _is_reparse_or_symlink(cur):
+            return True
+    return False
+
+
+def _is_safe_non_secret_existing_file(path_str: str, *, cwd: str = "") -> bool:
+    """--body-file / -F 等に渡されるファイルパスが安全で、実在時はリンク/秘密混入がないか検証する。"""
+    raw = (path_str or "").strip()
+    if not raw or raw == "-" or any(ord(ch) < 32 for ch in raw):
+        return False
+    if any(ch in raw for ch in "*?[]"):
+        return False
+    if _is_secret_file_path(raw):
+        return False
+    expanded = _expand_safe_path_vars(raw)
+    if expanded is None:
+        return False
+    base_cwd = Path(cwd) if cwd else Path.cwd()
+    cand = Path(expanded) if Path(expanded).is_absolute() else (base_cwd / expanded)
+    if not os.path.lexists(cand):
+        return True
+    if _is_reparse_or_symlink(cand) or not cand.is_file():
+        return False
+    if not Path(expanded).is_absolute() and _has_reparse_in_tree(base_cwd, cand):
+        return False
+    try:
+        if cand.stat().st_size > MAX_SAFE_INSPECT_FILE_BYTES:
+            return False
+        raw_bytes = cand.read_bytes()
+        if b"\x00" in raw_bytes:
+            return False
+        text = raw_bytes.decode("utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError):
+        return False
+    if _has_inline_secret_literal(text, strict_shell_quotes=False):
+        return False
+    return True
+
+
+def _is_safe_temp_output_path(target: str, *, cwd: str = "") -> bool:
+    """pr_guardrails.py / pr_ops.py の --output 先が安全一時領域または scratch/ 配下か検証する。"""
+    raw = (target or "").strip()
+    if not raw or raw == "-" or _is_secret_file_path(raw):
+        return False
+    if raw.startswith("$HOME/") or raw.startswith("$HOME\\"):
+        expanded_home = _expand_safe_path_vars(raw)
+        if expanded_home is None:
+            return False
+        raw = expanded_home
+    norm = raw.replace("\\", "/").rstrip("/")
+    parts = [p for p in norm.split("/") if p]
+    if not parts or ".." in parts:
+        return False
+    low_parts = [p.lower() for p in parts]
+    if not Path(norm).is_absolute() and not norm.lower().startswith("$env:"):
+        rel_parts = list(parts)
+        while rel_parts and rel_parts[0] == ".":
+            rel_parts.pop(0)
+        if rel_parts and rel_parts[0].lower() == "scratch" and len(rel_parts) >= 2:
+            if any(ch in raw for ch in "*?[],`") or "$(" in raw or "$" in raw:
+                return False
+            base_cwd = Path(cwd) if cwd else Path.cwd()
+            return not _has_unsafe_temp_reparse_or_escape(base_cwd, rel_parts)
+    return _is_safe_teamwork_temp_delete_target(raw, cwd=cwd)
+
+
+def _normalize_git_remote_url(url: str) -> str | None:
+    """git remote URL を比較用の正規形式へ変換する（認証情報付き URL は拒否）。"""
+    raw = (url or "").strip()
+    if not raw or any(ch.isspace() for ch in raw):
+        return None
+    if raw.startswith(("http://", "https://")):
+        # https://user:pass@host/... の認証情報埋め込みを拒否
+        scheme_rest = raw.split("://", 1)[1]
+        authority = scheme_rest.split("/", 1)[0]
+        if "@" in authority:
+            return None
+    gh_m = re.match(
+        r"^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$",
+        raw,
+        re.IGNORECASE,
+    )
+    if gh_m:
+        return f"github.com/{gh_m.group(1).lower()}/{gh_m.group(2).lower()}"
+    if raw.startswith(("http://", "https://", "ssh://", "git://")):
+        cleaned = raw.rstrip("/")
+        if cleaned.lower().endswith(".git"):
+            cleaned = cleaned[:-4]
+        return cleaned.lower()
+    # ローカルパスまたは file:// URL
+    local_path = raw[7:] if raw.lower().startswith("file://") else raw
+    try:
+        resolved = os.path.realpath(local_path).replace("\\", "/").rstrip("/")
+    except OSError:
+        return None
+    if resolved.lower().endswith(".git"):
+        resolved = resolved[:-4]
+    return resolved.lower()
+
+
+def _read_git_origin_url(repo_dir: Path) -> str | None:
+    """subprocess を使わずにリポジトリの .git/config から remote origin URL を取得する。"""
+    dot_git = repo_dir / ".git"
+    if not os.path.lexists(dot_git) or _is_reparse_or_symlink(dot_git):
+        return None
+    git_dir: Path | None = None
+    if dot_git.is_dir():
+        git_dir = dot_git
+    elif dot_git.is_file():
+        try:
+            text = dot_git.read_text(encoding="utf-8", errors="strict").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not text.lower().startswith("gitdir:"):
+            return None
+        raw_gitdir = text.split(":", 1)[1].strip()
+        cand_gitdir = Path(raw_gitdir)
+        if not cand_gitdir.is_absolute():
+            cand_gitdir = repo_dir / cand_gitdir
+        if not os.path.lexists(cand_gitdir) or _is_reparse_or_symlink(cand_gitdir):
+            return None
+        git_dir = cand_gitdir
+    if git_dir is None:
+        return None
+
+    config_path = git_dir / "config"
+    if not os.path.lexists(config_path) and (git_dir / "commondir").is_file():
+        commondir_file = git_dir / "commondir"
+        if _is_reparse_or_symlink(commondir_file):
+            return None
+        try:
+            common_raw = commondir_file.read_text(encoding="utf-8", errors="strict").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        common_dir = Path(common_raw)
+        if not common_dir.is_absolute():
+            common_dir = git_dir / common_raw
+        if not os.path.lexists(common_dir) or _is_reparse_or_symlink(common_dir):
+            return None
+        config_path = common_dir / "config"
+
+    if not os.path.lexists(config_path) or _is_reparse_or_symlink(config_path) or not config_path.is_file():
+        return None
+    try:
+        cfg_lines = config_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+
+    in_origin = False
+    for line in cfg_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_origin = stripped.lower() == '[remote "origin"]'
+            continue
+        if in_origin and "=" in stripped:
+            k, v = stripped.split("=", 1)
+            if k.strip().lower() == "url":
+                return v.strip()
+    return None
+
+
+def _find_repo_root_with_origin(file_path: Path) -> Path | None:
+    cur = file_path.parent
+    for _ in range(20):
+        dot_git = cur / ".git"
+        if os.path.lexists(dot_git):
+            if _read_git_origin_url(cur) is not None:
+                return cur
+            return None
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def _is_whitelisted_git_checkout_or_switch(
+    subcmd: str, args: list[str], *, cwd: str = ""
+) -> bool:
+    """安全な git checkout / switch（ブランチ切替または新規ブランチ作成のみ）か検証する。"""
+    if "--" in args:
+        return False
+    create_flag = "-b" if subcmd == "checkout" else "-c"
+    allowed_flags = (
+        GIT_SAFE_CHECKOUT_FLAGS if subcmd == "checkout" else GIT_SAFE_SWITCH_FLAGS
+    )
+    has_create = False
+    positional: list[str] = []
+    for arg in args:
+        if arg.startswith("-"):
+            if arg not in allowed_flags:
+                return False
+            if arg == create_flag or (subcmd == "switch" and arg == "--create"):
+                has_create = True
+            continue
+        positional.append(arg)
+
+    if has_create:
+        if len(positional) not in {1, 2}:
+            return False
+        return all(_is_safe_git_ref_name(ref) for ref in positional)
+
+    if len(positional) != 1:
+        return False
+    target = positional[0]
+    if target.lower() == "head" or not _is_safe_git_ref_name(target):
+        return False
+    if subcmd == "checkout":
+        base_cwd = Path(cwd) if cwd else Path.cwd()
+        if os.path.lexists(base_cwd / target):
+            return False
+    return True
+
+
+def _is_whitelisted_git_fetch(args: list[str]) -> bool:
+    positional: list[str] = []
+    for arg in args:
+        if arg.startswith("-"):
+            if arg not in GIT_SAFE_FETCH_FLAGS:
+                return False
+            continue
+        positional.append(arg)
+    if len(positional) == 0:
+        return True
+    if len(positional) == 1:
+        return positional[0] == "origin"
+    if len(positional) == 2:
+        remote, ref = positional
+        return remote == "origin" and ":" not in ref and "+" not in ref and _is_safe_git_ref_name(ref)
+    return False
+
+
+def _is_whitelisted_git_pull(args: list[str]) -> bool:
+    has_ff_only = False
+    positional: list[str] = []
+    for arg in args:
+        if arg.startswith("-"):
+            if arg not in GIT_SAFE_PULL_FLAGS:
+                return False
+            if arg == "--ff-only":
+                has_ff_only = True
+            continue
+        positional.append(arg)
+    if not has_ff_only or len(positional) != 2:
+        return False
+    remote, branch = positional
+    if remote != "origin":
+        return False
+    if ":" in branch or "+" in branch:
+        return False
+    return _is_safe_git_ref_name(branch)
+
+
+def _is_whitelisted_git_add(args: list[str], *, cwd: str = "") -> bool:
+    if not args:
+        return False
+    paths: list[str] = []
+    seen_dd = False
+    for arg in args:
+        if not seen_dd and arg == "--":
+            seen_dd = True
+            continue
+        if not seen_dd and arg.startswith("-"):
+            return False
+        paths.append(arg)
+    if not paths:
+        return False
+    base_cwd = Path(cwd) if cwd else Path.cwd()
+    for p in paths:
+        if not p or p.startswith("-") or any(ord(ch) < 32 for ch in p):
+            return False
+        norm = p.replace("\\", "/")
+        if norm in {".", "./"} or ".." in [seg for seg in norm.split("/") if seg]:
+            return False
+        if Path(p).is_absolute():
+            return False
+        if any(ch in p for ch in "*?[]:"):
+            return False
+        if _is_secret_file_path(p):
+            return False
+        cand = base_cwd / p
+        if os.path.lexists(cand):
+            if _is_reparse_or_symlink(cand) or cand.is_dir():
+                return False
+            if _has_reparse_in_tree(base_cwd, cand):
+                return False
+    return True
+
+
+def _is_whitelisted_git_commit(args: list[str], *, cwd: str = "") -> bool:
+    has_msg_or_file = False
+    i = 0
+    n = len(args)
+    while i < n:
+        arg = args[i]
+        if arg in GIT_SAFE_COMMIT_FLAGS:
+            i += 1
+            continue
+        if arg in {"-m", "--message"}:
+            if i + 1 >= n or not args[i + 1].strip():
+                return False
+            if _has_inline_secret_literal(args[i + 1], strict_shell_quotes=False):
+                return False
+            has_msg_or_file = True
+            i += 2
+            continue
+        if arg.startswith("--message="):
+            val = arg.split("=", 1)[1]
+            if not val.strip() or _has_inline_secret_literal(val, strict_shell_quotes=False):
+                return False
+            has_msg_or_file = True
+            i += 1
+            continue
+        if arg in {"-F", "--file"}:
+            if i + 1 >= n:
+                return False
+            if not _is_safe_non_secret_existing_file(args[i + 1], cwd=cwd):
+                return False
+            has_msg_or_file = True
+            i += 2
+            continue
+        if arg.startswith("--file="):
+            val = arg.split("=", 1)[1]
+            if not _is_safe_non_secret_existing_file(val, cwd=cwd):
+                return False
+            has_msg_or_file = True
+            i += 1
+            continue
+        return False
+    return has_msg_or_file
+
+
+def _classify_whitelisted_git(tokens: list[str], *, cwd: str = "") -> tuple[bool, bool]:
     """git コマンドを (ホワイトリスト許可可否, 安全な git push を含むか) で返す。"""
     subcmd, args = _extract_git_subcommand(tokens, strict_safe_globals=True)
     if subcmd is None:
@@ -2143,6 +2608,21 @@ def _classify_whitelisted_git(tokens: list[str]) -> tuple[bool, bool]:
             or (len(args) >= 1 and args[0] == "show")
         ), False
 
+    if subcmd == "fetch":
+        return _is_whitelisted_git_fetch(args), False
+
+    if subcmd in {"checkout", "switch"}:
+        return _is_whitelisted_git_checkout_or_switch(subcmd, args, cwd=cwd), False
+
+    if subcmd == "pull":
+        return _is_whitelisted_git_pull(args), False
+
+    if subcmd == "add":
+        return _is_whitelisted_git_add(args, cwd=cwd), False
+
+    if subcmd == "commit":
+        return _is_whitelisted_git_commit(args, cwd=cwd), False
+
     if subcmd == "push":
         return (_is_whitelisted_git_push(args), True)
 
@@ -2151,6 +2631,203 @@ def _classify_whitelisted_git(tokens: list[str]) -> tuple[bool, bool]:
 
 def _is_whitelisted_git(tokens: list[str]) -> bool:
     return _classify_whitelisted_git(tokens)[0]
+
+
+def _has_gh_forbidden_interactive_flag(args: list[str], *, forbid_t: bool = False) -> bool:
+    for arg in args:
+        low = arg.lower()
+        if low in {"--web", "--editor"} or low.startswith(("--web=", "--editor=")):
+            return True
+        if forbid_t and (low == "--show-token" or low.startswith("--show-token=")):
+            return True
+        if arg.startswith("-") and not arg.startswith("--"):
+            chars = arg[1:]
+            if "w" in chars or "e" in chars or (forbid_t and "t" in chars):
+                return True
+    return False
+
+
+def _classify_whitelisted_gh(
+    tokens: list[str], *, raw_segment: str, cwd: str = ""
+) -> tuple[bool, bool]:
+    """安全な gh 読み取り専用および --body-file 限定 PR 書き込みコマンドのみ許可する。"""
+    if len(tokens) < 3 or _command_basename(tokens[0]) != "gh":
+        return False, False
+    group = tokens[1].lower()
+    subcmd = tokens[2].lower()
+    args = tokens[3:]
+
+    if group == "pr" and subcmd in GH_READONLY_PR_SUBCOMMANDS:
+        return (not _has_gh_forbidden_interactive_flag(args, forbid_t=False)), False
+
+    if group == "run" and subcmd in GH_READONLY_RUN_SUBCOMMANDS:
+        return (not _has_gh_forbidden_interactive_flag(args, forbid_t=False)), False
+
+    if group == "auth" and subcmd == "status":
+        return (not _has_gh_forbidden_interactive_flag(args, forbid_t=True)), False
+
+    if group == "pr" and subcmd in GH_WRITE_PR_SUBCOMMANDS:
+        if _has_inline_secret_literal(raw_segment, strict_shell_quotes=True):
+            return False, False
+        if _has_gh_forbidden_interactive_flag(args, forbid_t=False):
+            return False, False
+
+        if subcmd == "create":
+            value_flags = GH_PR_CREATE_VALUE_FLAGS
+            bool_flags = GH_PR_CREATE_BOOL_FLAGS
+            max_pos = 0
+        elif subcmd == "edit":
+            value_flags = GH_PR_EDIT_VALUE_FLAGS
+            bool_flags = GH_PR_EDIT_BOOL_FLAGS
+            max_pos = 1
+        else:
+            value_flags = GH_PR_COMMENT_VALUE_FLAGS
+            bool_flags = GH_PR_COMMENT_BOOL_FLAGS
+            max_pos = 1
+
+        body_files: list[str] = []
+        positional: list[str] = []
+        i = 0
+        n = len(args)
+        while i < n:
+            arg = args[i]
+            if arg.startswith("-"):
+                if "=" in arg:
+                    flag, val = arg.split("=", 1)
+                    if flag not in value_flags or not val:
+                        return False, False
+                    if flag in {"--body-file", "-F"}:
+                        body_files.append(val)
+                    i += 1
+                    continue
+                if arg in bool_flags:
+                    i += 1
+                    continue
+                if arg in value_flags:
+                    if i + 1 >= n or not args[i + 1]:
+                        return False, False
+                    if arg in {"--body-file", "-F"}:
+                        body_files.append(args[i + 1])
+                    i += 2
+                    continue
+                return False, False
+            positional.append(arg)
+            i += 1
+
+        if len(positional) > max_pos or not body_files:
+            return False, False
+        if not all(_is_safe_non_secret_existing_file(bf, cwd=cwd) for bf in body_files):
+            return False, False
+        return True, False
+
+    return False, False
+
+
+def _is_trusted_plugin_script(
+    script_tok: str,
+    script_args: list[str],
+    *,
+    raw_segment: str,
+    cwd: str = "",
+) -> bool:
+    """稼働プラグイン自身または同一 origin 作業クローン配下の信頼済みスクリプトか検証する。"""
+    if not script_tok or script_tok.startswith("-") or any(ord(ch) < 32 for ch in script_tok):
+        return False
+    if any(ch in script_tok for ch in "*?[]"):
+        return False
+    norm_tok = script_tok.replace("\\", "/")
+    if ".." in [seg for seg in norm_tok.split("/") if seg]:
+        return False
+
+    expanded = _expand_safe_path_vars(script_tok)
+    if expanded is None:
+        return False
+
+    base_cwd = Path(cwd) if cwd else Path.cwd()
+    is_rel_tok = not Path(expanded).is_absolute()
+    cand = (base_cwd / expanded) if is_rel_tok else Path(expanded)
+
+    if not os.path.lexists(cand) or _is_reparse_or_symlink(cand) or not cand.is_file():
+        return False
+    if is_rel_tok and _has_reparse_in_tree(base_cwd, cand):
+        return False
+
+    try:
+        real_plugin_root = Path(os.path.realpath(PLUGIN_ROOT))
+        real_cand = Path(os.path.realpath(cand))
+    except OSError:
+        return False
+
+    if real_cand.is_relative_to(real_plugin_root):
+        root_dir = PLUGIN_ROOT
+    else:
+        repo_root = _find_repo_root_with_origin(cand)
+        if repo_root is None:
+            return False
+        plugin_origin = _normalize_git_remote_url(_read_git_origin_url(PLUGIN_ROOT) or "")
+        repo_origin = _normalize_git_remote_url(_read_git_origin_url(repo_root) or "")
+        if not plugin_origin or not repo_origin or plugin_origin != repo_origin:
+            return False
+        root_dir = repo_root
+
+    try:
+        real_root = Path(os.path.realpath(root_dir))
+    except OSError:
+        return False
+    if not real_cand.is_relative_to(real_root):
+        return False
+    if _has_reparse_in_tree(root_dir, cand):
+        return False
+
+    rel_posix = real_cand.relative_to(real_root).as_posix()
+    is_trusted = rel_posix in TRUSTED_PLUGIN_SCRIPTS or bool(
+        TRUSTED_PLUGIN_TEST_SCRIPT_RE.fullmatch(rel_posix)
+    )
+    if not is_trusted:
+        return False
+
+    if _has_inline_secret_literal(raw_segment, strict_shell_quotes=True):
+        return False
+
+    # 出力先および入力ファイル系オプションの境界検査
+    output_opts = {"--output"}
+    if rel_posix == "skills/pr-review-triage/scripts/pr_ops.py":
+        output_opts = {"--output", "--save-pr-json"}
+    input_opts = {
+        "--input",
+        "--items",
+        "--existing",
+        "--plan",
+        "--summary-file",
+        "--guardrails-items",
+        "--message-file",
+        "--pr-json",
+        "--rules",
+    }
+
+    i = 0
+    n = len(script_args)
+    while i < n:
+        arg = script_args[i]
+        opt_name = ""
+        opt_val: str | None = None
+        if "=" in arg and arg.startswith("--"):
+            opt_name, opt_val = arg.split("=", 1)
+        elif arg in output_opts or arg in input_opts:
+            opt_name = arg
+            if i + 1 >= n:
+                return False
+            opt_val = script_args[i + 1]
+            i += 1
+        if opt_name in output_opts:
+            if not _is_safe_temp_output_path(opt_val or "", cwd=cwd):
+                return False
+        elif opt_name in input_opts:
+            if opt_val and opt_val != "-" and not _is_safe_non_secret_existing_file(opt_val, cwd=cwd):
+                return False
+        i += 1
+
+    return True
 
 
 def _is_safe_env_assignment(name: str, value: str, *, case_insensitive: bool) -> bool:
@@ -2163,19 +2840,22 @@ def _is_safe_env_assignment(name: str, value: str, *, case_insensitive: bool) ->
 def _split_whitelist_segments(
     command: str, *, posix_shell: bool = False
 ) -> list[str] | None:
-    """クォート外の ; と && のみで単純連結を分割し、危険なメタ文字（クォート外の |>< も含む）を拒否する。"""
+    """クォート外の ; と && と改行で単純連結を分割し、危険なメタ文字（クォート外の |>< やクォート内改行等）を拒否する。"""
     if DISALLOWED_WHITELIST_ANYWHERE_RE.search(command):
         return None
 
     segments: list[str] = []
     buf: list[str] = []
     quote: str | None = None
+    pending_op = False
     i = 0
     n = len(command)
 
     while i < n:
         ch = command[i]
         if quote is not None:
+            if ch in ("\r", "\n"):
+                return None
             if ch == quote:
                 quote = None
                 buf.append(ch)
@@ -2203,8 +2883,25 @@ def _split_whitelist_segments(
             i += 1
             continue
 
+        if ch == "\\" and i + 1 < n and command[i + 1] in ("\r", "\n"):
+            return None
+
         if ch in ("|", ">", "<"):
             return None
+
+        if ch in ("\r", "\n"):
+            seg = "".join(buf).strip()
+            if seg:
+                segments.append(seg)
+                buf = []
+                pending_op = False
+            elif pending_op:
+                return None
+            if ch == "\r" and i + 1 < n and command[i + 1] == "\n":
+                i += 2
+            else:
+                i += 1
+            continue
 
         if ch == ";":
             seg = "".join(buf).strip()
@@ -2212,6 +2909,7 @@ def _split_whitelist_segments(
                 return None
             segments.append(seg)
             buf = []
+            pending_op = True
             i += 1
             continue
 
@@ -2222,6 +2920,7 @@ def _split_whitelist_segments(
                     return None
                 segments.append(seg)
                 buf = []
+                pending_op = True
                 i += 2
                 continue
             return None
@@ -2234,7 +2933,9 @@ def _split_whitelist_segments(
 
     tail = "".join(buf).strip()
     if not tail:
-        return None
+        if pending_op or not segments:
+            return None
+        return segments
     segments.append(tail)
     return segments
 
@@ -2265,8 +2966,19 @@ def _contains_unquoted_grouping_chars(segment: str) -> bool:
     return quote is not None
 
 
+def _match_safe_dollar_path_prefix(segment: str, idx: int) -> int | None:
+    """idx 位置の $ が安全な $HOME/ または $env:TEMP/ / $env:TMP/ パス参照であれば消費長を返す。"""
+    rest = segment[idx:]
+    if rest.startswith("$HOME/") or rest.startswith("$HOME\\"):
+        return 5
+    m = re.match(r"^\$env:(?:TEMP|TMP)(?=[\\/])", rest, re.IGNORECASE)
+    if m:
+        return len(m.group(0))
+    return None
+
+
 def _contains_unsafe_dollar(segment: str) -> bool:
-    """クォート外の $ およびダブルクォート内の変数展開パターンを検出する。"""
+    """クォート外の $ およびダブルクォート内の変数展開パターン（$HOME/ と $env:TEMP/ 等を除く）を検出する。"""
     quote: str | None = None
     i = 0
     n = len(segment)
@@ -2280,6 +2992,10 @@ def _contains_unsafe_dollar(segment: str) -> bool:
                 i += 2
                 continue
             elif quote == '"' and ch == "$" and i + 1 < n:
+                safe_len = _match_safe_dollar_path_prefix(segment, i)
+                if safe_len is not None:
+                    i += safe_len
+                    continue
                 nxt = segment[i + 1]
                 if nxt.isalnum() or nxt in "_@*?#^":
                     return True
@@ -2289,6 +3005,10 @@ def _contains_unsafe_dollar(segment: str) -> bool:
         if ch in ("'", '"'):
             quote = ch
         elif ch == "$":
+            safe_len = _match_safe_dollar_path_prefix(segment, i)
+            if safe_len is not None:
+                i += safe_len
+                continue
             return True
         i += 1
 
@@ -2309,28 +3029,37 @@ def _strip_safe_posix_env_prefixes(segment: str) -> str | None:
         rest = rest[match.end() :].lstrip()
 
 
-def _is_whitelisted_cd_segment(segment: str) -> bool:
-    """安全なローカルディレクトリ移動セグメント（Set-Location / cd 等）か判定する。"""
+def _extract_cd_target(segment: str) -> str | None:
+    """安全なローカルディレクトリ移動セグメント（Set-Location / cd 等）であれば移動先を返す。"""
     try:
         tokens = _tokenize_command(segment)
     except ValueError:
-        return False
+        return None
     if not tokens:
-        return False
+        return None
 
     head = _command_basename(tokens[0])
     if head not in SAFE_CD_COMMANDS:
-        return False
+        return None
 
     args = tokens[1:]
+    target: str | None = None
     if len(args) == 1:
-        return _is_safe_filesystem_cd_target(args[0])
-    if len(args) == 2 and args[0].lower() in {"-path", "-literalpath"}:
-        return _is_safe_filesystem_cd_target(args[1])
-    return False
+        target = args[0]
+    elif len(args) == 2 and args[0].lower() in {"-path", "-literalpath"}:
+        target = args[1]
+    if target is None or not _is_safe_filesystem_cd_target(target):
+        return None
+    return target
 
 
-def _classify_whitelisted_single_command(segment: str) -> tuple[bool, bool]:
+def _is_whitelisted_cd_segment(segment: str) -> bool:
+    return _extract_cd_target(segment) is not None
+
+
+def _classify_whitelisted_single_command(
+    segment: str, *, cwd: str = "", cwd_tainted: bool = False
+) -> tuple[bool, bool]:
     """単一コマンドを (ローカルホワイトリスト許可可否, 安全な git push を含むか) で判定する。"""
     try:
         tokens = _tokenize_command(segment)
@@ -2343,7 +3072,10 @@ def _classify_whitelisted_single_command(segment: str) -> tuple[bool, bool]:
     args = tokens[1:]
 
     if head == "git":
-        return _classify_whitelisted_git(tokens)
+        return _classify_whitelisted_git(tokens, cwd=cwd)
+
+    if head == "gh":
+        return _classify_whitelisted_gh(tokens, raw_segment=segment, cwd=cwd)
 
     if head in {"ls", "dir", "get-childitem", "pwd", "get-location"}:
         return True, False
@@ -2372,6 +3104,15 @@ def _classify_whitelisted_single_command(segment: str) -> tuple[bool, bool]:
             break
         if idx + 1 < len(tokens) and tokens[idx] == "-m" and tokens[idx + 1] in {"unittest", "pytest"}:
             return True, False
+        if idx < len(tokens):
+            if cwd_tainted:
+                return False, False
+            return (
+                _is_trusted_plugin_script(
+                    tokens[idx], tokens[idx + 1 :], raw_segment=segment, cwd=cwd
+                ),
+                False,
+            )
         return False, False
 
     return False, False
@@ -2382,7 +3123,7 @@ def _is_whitelisted_single_command(segment: str) -> bool:
 
 
 def _classify_whitelisted_command(
-    command: str, *, posix_shell: bool = False
+    command: str, *, posix_shell: bool = False, cwd: str = ""
 ) -> tuple[bool, bool]:
     """安全な環境変数・ローカル cd・定型 fail-fast ガード・単純連結を含む厳格ホワイトリスト判定。"""
     stripped = command.strip()
@@ -2395,6 +3136,8 @@ def _classify_whitelisted_command(
     command_count = 0
     includes_push = False
     last_kind: str | None = None
+    effective_cwd = cwd
+    cwd_tainted = False
     for seg in segments:
         if PS_FAILFAST_GUARD_RE.fullmatch(seg):
             if last_kind not in {"cmd", "cd"}:
@@ -2417,14 +3160,26 @@ def _classify_whitelisted_command(
         if _contains_unsafe_dollar(seg):
             return False, False
 
-        if _is_whitelisted_cd_segment(seg):
+        cd_target = _extract_cd_target(seg)
+        if cd_target is not None:
+            expanded_cd = _expand_safe_path_vars(cd_target)
+            if expanded_cd is None:
+                cwd_tainted = True
+            else:
+                base_dir = Path(effective_cwd) if effective_cwd else Path.cwd()
+                new_dir = Path(expanded_cd) if Path(expanded_cd).is_absolute() else (base_dir / expanded_cd)
+                if os.path.lexists(new_dir) and _is_reparse_or_symlink(new_dir):
+                    cwd_tainted = True
+                effective_cwd = str(new_dir)
             last_kind = "cd"
             continue
 
         cmd_part = _strip_safe_posix_env_prefixes(seg)
         if cmd_part is None:
             return False, False
-        allowed, seg_has_push = _classify_whitelisted_single_command(cmd_part)
+        allowed, seg_has_push = _classify_whitelisted_single_command(
+            cmd_part, cwd=effective_cwd, cwd_tainted=cwd_tainted
+        )
         if not allowed:
             return False, False
         command_count += 1
@@ -3123,7 +3878,7 @@ def evaluate_stage1(
 
     if not secret_hits and not _has_env_dump(segments):
         allowed, includes_push = _classify_whitelisted_command(
-            command, posix_shell=posix_shell
+            command, posix_shell=posix_shell, cwd=cwd
         )
         if allowed:
             if includes_push:
