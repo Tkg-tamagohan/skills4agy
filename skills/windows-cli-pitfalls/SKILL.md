@@ -1,6 +1,6 @@
 ---
 name: windows-cli-pitfalls
-description: Windows 上の PowerShell と Git Bash におけるシェル罠と回避策。セッション非永続性、UTF-8 と cp932 文字コード、PowerShell 5.1 構文と curl エイリアス、パスとワイルドカード展開、外部コマンド引用符剥離、BOM なし UTF-8 ファイル渡しを扱い、Windows でコマンドやスクリプトを組むときに使用する。
+description: Windows 上の PowerShell と Git Bash におけるシェル罠と回避策。セッション非永続性、UTF-8 と cp932 文字コード、PowerShell 5.1 構文と curl エイリアス、パスとワイルドカード展開、外部コマンド引用符剥離、BOM なし UTF-8 ファイル渡し、.NET 例外展開と PSModulePath 汚染を扱い、Windows でコマンドやスクリプトを組むときに使用する。
 ---
 
 # Windows CLI の文字コードとシェルの罠
@@ -140,19 +140,22 @@ print(json.loads(r.stdout)["body"].splitlines())
 
 ## PowerShell 5.1 の UTF-8 読み取り、Start-Process 引用、.NET 例外
 
-PowerShell 5.1 の `Get-Content` は既定エンコーディングがシステムロケール（日本語環境では cp932）のため、`-Encoding UTF8` を付けないと BOM なし UTF-8 内の非 ASCII パスが文字化けする。
-BOM なし UTF-8 を読むときは `Get-Content -Encoding UTF8` または `[System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false))` を使う。
+PowerShell 5.1 の `Get-Content` は既定エンコーディングがシステムロケール（日本語環境では cp932）のため、BOM なし UTF-8 を読むときは `Get-Content -Encoding UTF8` または `[System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false))` を使う。
 `Start-Process -ArgumentList` へ空白を含むパス（`C:\Program Files\...` 等）をそのまま渡すと引数分割されるため、要素内を内側ダブルクォートで囲む。
-PowerShell 5.1 の `-Command` 等では `.NET` メソッド（`TcpClient.Connect` 等）が例外を投げても既定では後続文が実行され終了コード 0 になる。
-冒頭で `$ErrorActionPreference = 'Stop'` を設定し、`try/finally` で後処理と失敗終了を両立させる。
+PowerShell 5.1 の `-Command` 等では `.NET` メソッド（`TcpClient.Connect` 等）が例外を投げても既定では後続文が実行され終了コード 0 になるため、冒頭で `$ErrorActionPreference = 'Stop'` を設定し `try/finally` で後処理と失敗終了を両立させる。
+また、`.NET` メソッド例外は `System.Management.Automation.MethodInvocationException` に包まれるため、リトライや原因種別の判定では `$_.Exception` 単体ではなく `.InnerException` 連鎖を展開して照合する。
+PowerShell 6/7（`pwsh`）配下や混在環境から Windows PowerShell 5.1（`powershell.exe`）を起動すると引き継いだ `PSModulePath` で `Get-Acl` や `Set-Acl` 等のセキュリティモジュール読込が壊れるため、起動直後に PS 6/7 由来パスを除去し `$PSHOME\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1` を明示インポートする。
 
 ```powershell
 # UTF-8 読み取り / Start-Process の空白パス保護
 $text = [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false))
 Start-Process -FilePath $exe -ArgumentList @("--config", "`"C:\Program Files\App\cfg.json`"")
-# .NET 例外で失敗終了させる
+# .NET 例外で失敗終了させ、原因判定時は InnerException 連鎖を辿る
 $ErrorActionPreference = 'Stop'; $c = New-Object Net.Sockets.TcpClient
 try { $c.Connect('127.0.0.1', 8080) } finally { $c.Dispose() }
+# PS 5.1 起動時の PSModulePath 汚染を除去し Security モジュールを明示読込
+$env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '\\PowerShell(\\|$)' }) -join ';'
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -Force
 ```
 
 ## Select-Object -First による上流コマンドの非ゼロ終了
@@ -193,4 +196,5 @@ Git Bash と Windows プロセスを併用する場合、Git Bash では `$TEMP`
 - Python 由来の decode と encode のエラーは `$env:PYTHONUTF8="1"` と `$env:PYTHONIOENCODING="utf-8"` で環境側を直す（共有スクリプト自体に環境依存の差分を入れない）。
 - 状態変更コマンド（`git commit` 等）と読み取り確認コマンドや一般の制御構文は 1 回の `run_command` に連結せず別呼び出しに分け、確認判定とコマンド許可の粒度を保つ（ワークツリーへのローカル `Set-Location`、`origin` の非保護ブランチを明示した通常 `git push origin <branch>`、`if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` の定型連結は `pretool_guard.py` の第 1 段ホワイトリスト対象）。
 - PowerShell 5.1 で BOM なし UTF-8 を読むときは `Get-Content -Encoding UTF8` または `[System.IO.File]::ReadAllText` を使い、`Start-Process -ArgumentList` の空白パスは内側ダブルクォートで囲む。
-- PowerShell 5.1 の `-Command` 等で `.NET` メソッドを呼ぶときは `$ErrorActionPreference = 'Stop'` と `try/finally` で例外時に失敗終了させる。
+- PowerShell 5.1 の `-Command` 等で `.NET` メソッドを呼ぶときは `$ErrorActionPreference = 'Stop'` と `try/finally` で失敗終了させ、リトライ等の例外種別判定では `MethodInvocationException.InnerException` 連鎖を展開する。
+- PS 6/7 混在環境から `powershell.exe` 5.1 を起動するときは `PSModulePath` の PS 6/7 パスを除去し、`Microsoft.PowerShell.Security.psd1` を明示読込する。

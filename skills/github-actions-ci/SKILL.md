@@ -59,7 +59,8 @@ for name, info in needs.items():
 - **`node --check` は先頭引数しか検査しない**：`node --check a.js b.js` は最初の `a.js` だけを構文検査し、`b.js` 以降は構文エラーがあっても素通りする。
   複数ファイルを検証するときは `node --check a.js && node --check b.js` のように 1 ファイルずつ呼ぶ。
 - **`tsconfig.json` 除外資産の補完**：ブラウザ拡張やビルド設定ファイルなど型検査対象外の JS へは個別 `node --check` を回し、HTML の DOM ID やマニフェスト参照の実在を単体テストで押さえる。
-- **補助スクリプトとテキスト健全性**：CI 用や開発用のスクリプト群にも `py_compile` と標準ライブラリでの単体テストを用意し、置換文字 `U+FFFD` や競合マーカーの残存、JSON と XML の構文エラー、多言語翻訳の余剰キー不在をあわせて検査する。
+- **補助スクリプトとテキスト健全性**：CI 用や開発用のスクリプト群にも `python -W error` による `py_compile` と標準ライブラリでの単体テストを用意し、置換文字 `U+FFFD` や競合マーカーの残存、JSON と XML の構文エラー、多言語翻訳の余剰キー不在をあわせて検査する。
+  Windows 向けインストーラや PowerShell スクリプトを対象とするテストは Linux ランナーだけで済ませず、`windows-latest` でも実行する。
 
 ```json
 // NG（2 番目のファイルに構文エラーがあっても終了コード 0 で通る）
@@ -81,10 +82,12 @@ for name, info in needs.items():
 
 長時間のクロスプラットフォームビルドを始める前に明らかな不備を弾き、公開直前に配布物全体を検査する。
 
-1. 先頭に `preflight` ジョブを置き、文書整合、タグ文字列と設定ファイルのバージョン一致（`--expect-tag`）、署名秘密鍵 Secrets の非空を数秒で確認する。
-2. Linux と Windows が混在するビルドマトリクスでの共通スクリプト検査には `shell: bash` を明示し、環境差による構文エラーを避ける。
-3. `gh release create` や `gh release upload` の直前で検証スクリプトを実行し、署名中間ファイル（`.sig` 等）や廃止拡張子の非残存、自動更新マニフェスト（`latest.json` 等）のバージョン一致と成果物実在、パッケージ内へのテスト混入なしを確認する。
-4. 既存リリースのアセット削除では `for x in $names` による空白分割を避け、`while IFS= read -r name` で 1 行ずつ処理する。
+1. 先頭に `preflight` ジョブを置き、対象コミット（フル `source_sha`）の確定、文書整合、タグ文字列と設定ファイルのバージョン一致（`--expect-tag`）、署名秘密鍵 Secrets の非空を数秒で確認する。
+   後続の全ジョブの `actions/checkout` は確定した `source_sha` へ固定し、本番リリース時はタグが指すコミットとの一致検証および署名タグ検証（`--verify-tag` 等）を強制する。
+2. `dry_run` 経路では本番署名鍵を使わず専用のテスト鍵識別子（例: `--key-id dry-run-test`）を明示し、成果物の非信頼境界と本番公開ジョブへの非流入条件を明記する。
+3. Linux と Windows が混在するビルドマトリクスでの共通スクリプト検査には `shell: bash` を明示し、Windows 固有のリリース／インストーラスクリプト検証は `windows-latest` でも実行する。
+4. `gh release create` や `gh release upload` の直前で検証スクリプトを実行し、署名中間ファイル（`.sig` 等）や廃止拡張子の非残存、自動更新マニフェスト（`latest.json` 等）のバージョン一致と成果物実在、パッケージ内へのテスト混入なしを確認する。
+5. 既存リリースのアセット削除では `for x in $names` による空白分割を避け、`while IFS= read -r name` で 1 行ずつ処理する。
 
 ## 脆弱性監査の定期分離と重大度管理
 
@@ -99,4 +102,4 @@ for name, info in needs.items():
 - 差分取得不能時や仕様照合対象ドキュメントの変更時は、必ず関連ジョブを実行側へ倒す。
 - `node --check` は 1 回の呼び出しにつき先頭 1 ファイルしか見ない仕様を踏まえ、ファイルごとに個別実行する。
 - 全ワークフローへ最小 `permissions`、`timeout-minutes`、`pull_request` 限定のキャンセル制御、`--locked` を組み込む。
-- リリースは `preflight` と公開直前検証の二段で守り、脆弱性監査は PR と分離して定期実行する。
+- リリースは `preflight`（`source_sha` 固定、本番タグ検証、`dry_run` 鍵分離）と公開直前検証の二段で守り、Windows 向けスクリプト検証は `windows-latest` と `python -W error` で押さえ、脆弱性監査は PR と分離して定期実行する。
