@@ -365,6 +365,7 @@ def _extract_unquoted_text(cmd_str: str) -> str:
             i += 1
             continue
         if ch == "\\" and i + 1 < n:
+            out.append("\\")
             out.append(" ")
             i += 2
             continue
@@ -394,7 +395,9 @@ def _is_powershell_command(
         unquoted,
     ):
         return True
-    if re.search(r"(?:^|\s)[A-Za-z]:\\", unquoted):
+    if re.search(r"(?:^|[\s;&|])[A-Za-z]:\\", unquoted):
+        return True
+    if re.search(r"(?<!`)(?:``)*`(?:\r?\n)", unquoted):
         return True
     if initial_cwd:
         if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", initial_cwd):

@@ -570,6 +570,42 @@ class TestAuditSkillsWeekly(unittest.TestCase):
                     ),
                     ["/opt/prod_plugin/skills/alpha-skill/scripts/run_alpha.py"],
                 )
+                self.assertEqual(
+                    asw._extract_executed_python_scripts(
+                        r"cd C:\prod; python -B skills/alpha-skill/scripts/run_alpha.py",
+                        initial_cwd="",
+                        allow_unresolved_relative=False,
+                    ),
+                    ["c:/prod/skills/alpha-skill/scripts/run_alpha.py"],
+                )
+                self.assertFalse(
+                    asw._is_powershell_command('echo "C:\\prod"', initial_cwd="")
+                )
+                self.assertEqual(
+                    asw._extract_executed_python_scripts(
+                        "python -B `\n  /opt/prod_plugin/skills/alpha-skill/scripts/run_alpha.py `\n  --days 7",
+                        initial_cwd="",
+                        allow_unresolved_relative=False,
+                    ),
+                    ["/opt/prod_plugin/skills/alpha-skill/scripts/run_alpha.py"],
+                )
+                self.assertFalse(
+                    asw._is_powershell_command(
+                        "python -B `\n  /opt/a.py",
+                        initial_cwd="",
+                        explicit_shell="bash",
+                    )
+                )
+                self.assertFalse(
+                    asw._is_powershell_command(
+                        "echo ``\npython /opt/a.py", initial_cwd=""
+                    )
+                )
+                self.assertFalse(
+                    asw._is_powershell_command(
+                        "echo \\`\npython /opt/a.py", initial_cwd=""
+                    )
+                )
 
     def test_repo_alias_matches_maintenance_when_resolve_differs(self) -> None:
         """Windows 8.3 短縮名のように入力パスと resolve() 後が異なる場合でも保守作業として計上される。"""
