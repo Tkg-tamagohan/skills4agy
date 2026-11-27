@@ -72,6 +72,7 @@ MAX_WHITELIST_SEGMENTS = 20
 PLUGIN_ROOT = Path(__file__).resolve().parents[3]
 TRUSTED_PLUGIN_SCRIPTS = frozenset(
     {
+        "skills/plugin-authoring/scripts/audit_skills_weekly.py",
         "skills/plugin-authoring/scripts/check_plugin.py",
         "skills/plugin-authoring/scripts/check_hygiene.py",
         "skills/plugin-authoring/scripts/run_all_tests.py",

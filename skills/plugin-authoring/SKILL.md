@@ -1,6 +1,6 @@
 ---
 name: plugin-authoring
-description: shared-skills プラグインへのルールやスキル追加、変更、置き場所判断、version 更新、構造と衛生の検査、全テスト実行の手順。共有カスタマイズを編集するときに使用する。コンテキスト制御ルール改訂前後の計測は session-context-audit に委ねる。
+description: shared-skills プラグインへのルールやスキル追加、変更、置き場所判断、version 更新、構造と衛生の検査、全テスト実行、および週次 SKILL 監査の手順。共有カスタマイズを編集または点検するときに使用する。コンテキスト制御ルール改訂前後の計測は session-context-audit に委ねる。
 ---
 
 # shared-skills へのルールとスキルの追加と変更
@@ -21,6 +21,7 @@ description: shared-skills プラグインへのルールやスキル追加、�
 - **全スキル横断の単体テスト**：`skills/` 配下には `__init__.py` を置かず、各スキルのスクリプトが自身のディレクトリ前提のインポートを使う構成となっている。
   - 一括実行と 0 件通過の抑止は `scripts/run_all_tests.py` が担う。
 - **コンテキスト制御の効果測定**：`rules/AGENTS.md` などコンテキスト制御ルール改訂前後の定量計測は `session-context-audit` に委ねる。
+- **週次監査時のドリフト深掘りと 2 段改修**：Decision 1 による文書陳腐化スクリーニング（`screen_drift_decision1.py docs`）および大規模な 2 段ファンアウト整理は `repo-drift-audit` に委ねる。
 
 ## 手順
 
@@ -62,3 +63,17 @@ description: shared-skills プラグインへのルールやスキル追加、�
    - [ ] 対価指標（`turns_to_first_edit`、`redundant_reread_rate`、`edit_error_rate`）に許容外の悪化がないか
    - [ ] 主要モデル別表（必要時は `--classify-decision1` のタスク種別層別）でモデル構成比やタスク重量化の交絡を除いても同傾向か
    - [ ] 対価指標の悪化が計測スクリプト側の定義バイアスではなく実挙動の変化によるものか
+
+## 週次 SKILL 監査
+
+`shared-skills` のルールとスキルの経年劣化（死蔵、常時コンテキスト肥大化、機械化候補、競合、スクリプト乖離、フック健全性、同期ずれ）は、週次で点検する。
+6 つの主眼、判定マトリクス、定期実行時の制約、およびレポート構成は同ディレクトリの `weekly-audit-guide.md` に従う。
+
+```powershell
+$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
+python "$HOME/.gemini/config/plugins/shared-skills/skills/plugin-authoring/scripts/audit_skills_weekly.py" `
+  --repo "E:\Documents\code\skills4agy" `
+  --prod-root "$HOME\.gemini\config\plugins\shared-skills" `
+  --include-context-audit `
+  --format markdown
+```

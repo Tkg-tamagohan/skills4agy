@@ -1676,6 +1676,7 @@ class TestPretoolGuard(unittest.TestCase):
         """P2-31: 信頼済みプラグインスクリプト（プラグイン自身＋同一 origin 作業クローン）と境界拒否を検証する。"""
         repo_root = Path(__file__).resolve().parents[3]
         trusted_scripts = [
+            "skills/plugin-authoring/scripts/audit_skills_weekly.py --no-git --format json",
             "skills/plugin-authoring/scripts/check_plugin.py --version-base origin/main",
             "skills/plugin-authoring/scripts/check_hygiene.py",
             "skills/plugin-authoring/scripts/run_all_tests.py",
@@ -1732,6 +1733,12 @@ class TestPretoolGuard(unittest.TestCase):
             self.assertIsNone(
                 pg.evaluate_stage1(
                     "python skills/pr-review-triage/scripts/pr_ops.py invariant-check --base=--output=evil.txt",
+                    cwd=str(repo_root),
+                )
+            )
+            self.assertIsNone(
+                pg.evaluate_stage1(
+                    "python skills/plugin-authoring/scripts/audit_skills_weekly.py --now AIzaSyDummySecretToken12345678901234567890",
                     cwd=str(repo_root),
                 )
             )
