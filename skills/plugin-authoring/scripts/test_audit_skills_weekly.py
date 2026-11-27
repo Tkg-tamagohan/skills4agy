@@ -558,6 +558,18 @@ class TestAuditSkillsWeekly(unittest.TestCase):
                     ),
                     ["c:/prod/skills/alpha-skill/scripts/run_alpha.py"],
                 )
+                posix_ps_cmd = (
+                    'Set-Location "/opt/prod_plugin\\"; '
+                    "python -B skills/alpha-skill/scripts/run_alpha.py"
+                )
+                self.assertEqual(
+                    asw._extract_executed_python_scripts(
+                        posix_ps_cmd,
+                        initial_cwd="/tmp/work",
+                        allow_unresolved_relative=False,
+                    ),
+                    ["/opt/prod_plugin/skills/alpha-skill/scripts/run_alpha.py"],
+                )
 
     def test_repo_alias_matches_maintenance_when_resolve_differs(self) -> None:
         """Windows 8.3 短縮名のように入力パスと resolve() 後が異なる場合でも保守作業として計上される。"""

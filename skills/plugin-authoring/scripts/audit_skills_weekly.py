@@ -381,17 +381,12 @@ def _extract_unquoted_text(cmd_str: str) -> str:
 def _is_powershell_command(
     cmd_str: str, initial_cwd: str = "", explicit_shell: str = ""
 ) -> bool:
-    """明示シェル・作業ディレクトリ・クォート外構文から PowerShell か POSIX シェルかを判定する。"""
+    """明示シェル・クォート外構文・作業ディレクトリから PowerShell か POSIX シェルかを判定する。"""
     if explicit_shell:
         low = explicit_shell.strip().lower()
         if any(tok in low for tok in ("powershell", "pwsh")):
             return True
         if any(tok in low for tok in ("bash", "zsh", "fish", "dash", "sh")):
-            return False
-    if initial_cwd:
-        if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", initial_cwd):
-            return True
-        if initial_cwd.startswith("/"):
             return False
     unquoted = _extract_unquoted_text(cmd_str)
     if re.search(
@@ -401,6 +396,11 @@ def _is_powershell_command(
         return True
     if re.search(r"(?:^|\s)[A-Za-z]:\\", unquoted):
         return True
+    if initial_cwd:
+        if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", initial_cwd):
+            return True
+        if initial_cwd.startswith("/"):
+            return False
     return os.name == "nt"
 
 
