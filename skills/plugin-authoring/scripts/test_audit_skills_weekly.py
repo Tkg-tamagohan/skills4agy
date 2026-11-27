@@ -418,6 +418,71 @@ class TestAuditSkillsWeekly(unittest.TestCase):
             self.assertEqual(alpha["script_runs_7d"], 2)
             self.assertEqual(alpha["maintenance_touches_28d"], 1)
 
+    def test_powershell_trailing_backslash_and_posix_quotes(self) -> None:
+        """PowerShell で末尾 \\ を含む引用パス付き Set-Location 後も計上され、POSIX の \\" も誤分割されない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "dev_repo"
+            prod = root / "prod_plugin"
+            app = root / "app_data"
+            _build_fixture_repo(repo)
+            prod.mkdir(parents=True)
+
+            # 末尾バックスラッシュ付きの Windows 形式文字列（os.name 非依存で PowerShell 判定を検証）
+            repo_bs = str(repo).rstrip("\\/") + "\\"
+            prod_bs = str(prod).rstrip("\\/") + "\\"
+            s_log = app / "brain" / "sess-ps-bs" / ".system_generated" / "logs" / "transcript.jsonl"
+            events = [
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-11-26T10:00:00Z",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": f'Set-Location "{repo_bs}"; python -B skills/alpha-skill/scripts/run_alpha.py',
+                                "Cwd": str(root),
+                            },
+                        },
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": f'Set-Location "{prod_bs}"; python -B skills/alpha-skill/scripts/run_alpha.py',
+                                "Cwd": str(root),
+                            },
+                        },
+                    ],
+                }
+            ]
+            _write_text(s_log, "\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n")
+
+            rep = asw.build_weekly_report(
+                repo_root=repo,
+                prod_root=prod,
+                app_data_dir=app,
+                now_dt=asw.parse_iso_datetime("2026-11-27T12:00:00Z"),
+                days=7,
+                window_days=28,
+                use_git=False,
+                include_context_audit=False,
+            )
+            alpha = {r["name"]: r for r in rep["skills"]}["alpha-skill"]
+            self.assertEqual(alpha["script_runs_7d"], 1)
+            self.assertEqual(alpha["maintenance_touches_28d"], 1)
+
+            # POSIX シェル（Cwd が / 始まり）では二重引用符内の \" をエスケープとして扱う
+            posix_cmd = 'cd "/opt/prod_plugin" && python -B skills/alpha-skill/scripts/run_alpha.py --msg "a \\"quoted; &&\\" b"'
+            extracted = asw._extract_executed_python_scripts(
+                posix_cmd,
+                initial_cwd="/tmp/other",
+                allow_unresolved_relative=False,
+            )
+            self.assertEqual(extracted, ["/opt/prod_plugin/skills/alpha-skill/scripts/run_alpha.py"])
+            segs = asw._split_shell_segments(posix_cmd, powershell=False)
+            self.assertEqual(len(segs), 2)
+            toks = asw._tokenize_segment(segs[1], powershell=False)
+            self.assertEqual(toks[-1], 'a "quoted; &&" b')
+
     def test_repo_alias_matches_maintenance_when_resolve_differs(self) -> None:
         """Windows 8.3 短縮名のように入力パスと resolve() 後が異なる場合でも保守作業として計上される。"""
         with tempfile.TemporaryDirectory() as tmp:

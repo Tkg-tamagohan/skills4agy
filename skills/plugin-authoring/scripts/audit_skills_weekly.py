@@ -345,9 +345,28 @@ def _classify_path_origin(
     return "other"
 
 
-def _split_shell_segments(cmd_str: str) -> list[str]:
+def _is_powershell_command(cmd_str: str, initial_cwd: str = "") -> bool:
+    """コマンド文字列と作業ディレクトリから PowerShell 構文か POSIX シェル構文かを推定する。"""
+    if initial_cwd:
+        if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", initial_cwd):
+            return True
+    if re.search(
+        r"(?i)\b(?:Set-Location|Push-Location)\b|\$env:|[A-Za-z]:\\|`\r?\n",
+        cmd_str,
+    ):
+        return True
+    if initial_cwd and initial_cwd.startswith("/"):
+        return False
+    return os.name == "nt"
+
+
+def _split_shell_segments(cmd_str: str, *, powershell: bool) -> list[str]:
     """クォート外の区切り文字で単純コマンド列へ分割し、判定不能な構文セグメントは除外する。"""
-    joined = re.sub(r"`\r?\n\s*", " ", cmd_str)
+    joined = (
+        re.sub(r"`\r?\n\s*", " ", cmd_str)
+        if powershell
+        else re.sub(r"\\\r?\n\s*", " ", cmd_str)
+    )
     segments: list[str] = []
     buf: list[str] = []
     quote: Optional[str] = None
@@ -357,14 +376,34 @@ def _split_shell_segments(cmd_str: str) -> list[str]:
     while i < n:
         ch = joined[i]
         if quote is not None:
-            if ch == quote:
-                quote = None
-            elif quote == '"' and ch == "\\" and i + 1 < n and joined[i + 1] == '"':
-                buf.append(ch)
-                i += 1
-                buf.append(joined[i])
-                i += 1
-                continue
+            if powershell:
+                if quote == '"':
+                    if ch == "`" and i + 1 < n:
+                        buf.append(ch)
+                        buf.append(joined[i + 1])
+                        i += 2
+                        continue
+                    if ch == '"' and i + 1 < n and joined[i + 1] == '"':
+                        buf.append('""')
+                        i += 2
+                        continue
+                    if ch == '"':
+                        quote = None
+                elif quote == "'":
+                    if ch == "'" and i + 1 < n and joined[i + 1] == "'":
+                        buf.append("''")
+                        i += 2
+                        continue
+                    if ch == "'":
+                        quote = None
+            else:
+                if quote == '"' and ch == "\\" and i + 1 < n and joined[i + 1] in ('"', "\\", "$", "`"):
+                    buf.append(ch)
+                    buf.append(joined[i + 1])
+                    i += 2
+                    continue
+                if ch == quote:
+                    quote = None
             buf.append(ch)
             i += 1
             continue
@@ -374,7 +413,14 @@ def _split_shell_segments(cmd_str: str) -> list[str]:
             buf.append(ch)
             i += 1
             continue
-        if ch == "`" or (ch == "$" and i + 1 < n and joined[i + 1] in ("(", "{")):
+        if powershell and ch == "`" and i + 1 < n:
+            buf.append(ch)
+            buf.append(joined[i + 1])
+            i += 2
+            continue
+        if (not powershell and ch == "`") or (
+            ch == "$" and i + 1 < n and joined[i + 1] in ("(", "{")
+        ):
             unparseable = True
         if ch in (";", "|", "\r", "\n") or (ch == "&" and i + 1 < n and joined[i + 1] == "&"):
             seg = "".join(buf).strip()
@@ -400,8 +446,8 @@ def _split_shell_segments(cmd_str: str) -> list[str]:
     return segments
 
 
-def _tokenize_segment(seg: str) -> Optional[list[str]]:
-    """単一コマンドセグメントをクォート解除しつつトークン化する（Windows パスを保持）。"""
+def _tokenize_segment(seg: str, *, powershell: bool) -> Optional[list[str]]:
+    """単一コマンドセグメントをシェル種別に応じた引用符規則でトークン化する。"""
     tokens: list[str] = []
     buf: list[str] = []
     quote: Optional[str] = None
@@ -411,14 +457,38 @@ def _tokenize_segment(seg: str) -> Optional[list[str]]:
     while i < n:
         ch = seg[i]
         if quote is not None:
-            if ch == quote:
-                quote = None
-            elif quote == '"' and ch == "\\" and i + 1 < n and seg[i + 1] == '"':
-                buf.append('"')
-                i += 2
-                continue
+            if powershell:
+                if quote == '"':
+                    if ch == "`" and i + 1 < n:
+                        buf.append(seg[i + 1])
+                        i += 2
+                        continue
+                    if ch == '"' and i + 1 < n and seg[i + 1] == '"':
+                        buf.append('"')
+                        i += 2
+                        continue
+                    if ch == '"':
+                        quote = None
+                    else:
+                        buf.append(ch)
+                elif quote == "'":
+                    if ch == "'" and i + 1 < n and seg[i + 1] == "'":
+                        buf.append("'")
+                        i += 2
+                        continue
+                    if ch == "'":
+                        quote = None
+                    else:
+                        buf.append(ch)
             else:
-                buf.append(ch)
+                if quote == '"' and ch == "\\" and i + 1 < n and seg[i + 1] in ('"', "\\", "$", "`"):
+                    buf.append(seg[i + 1])
+                    i += 2
+                    continue
+                if ch == quote:
+                    quote = None
+                else:
+                    buf.append(ch)
             i += 1
             continue
 
@@ -426,6 +496,16 @@ def _tokenize_segment(seg: str) -> Optional[list[str]]:
             quote = ch
             has_token = True
             i += 1
+            continue
+        if powershell and ch == "`" and i + 1 < n:
+            buf.append(seg[i + 1])
+            has_token = True
+            i += 2
+            continue
+        if not powershell and ch == "\\" and i + 1 < n:
+            buf.append(seg[i + 1])
+            has_token = True
+            i += 2
             continue
         if ch.isspace():
             if has_token:
@@ -474,9 +554,10 @@ def _extract_executed_python_scripts(
 ) -> list[str]:
     """run_command 文字列から python 系実行コマンドのスクリプト引数パスだけを抽出する。"""
     current_cwd = normalize_posix_lower(initial_cwd).rstrip("/") if initial_cwd else ""
+    is_ps = _is_powershell_command(cmd_str, initial_cwd)
     results: list[str] = []
-    for seg in _split_shell_segments(cmd_str):
-        tokens = _tokenize_segment(seg)
+    for seg in _split_shell_segments(cmd_str, powershell=is_ps):
+        tokens = _tokenize_segment(seg, powershell=is_ps)
         if not tokens:
             continue
 
