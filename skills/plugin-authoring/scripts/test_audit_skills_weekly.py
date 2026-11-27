@@ -654,6 +654,50 @@ class TestAuditSkillsWeekly(unittest.TestCase):
                     ),
                     ["/opt/prod_plugin/skills/alpha-skill/scripts/run_alpha.py"],
                 )
+                ps_space_escape_cmd = (
+                    "python -B /opt/shared` skills/skills/alpha-skill/scripts/run_alpha.py `\n"
+                    "  --version-base origin/main"
+                )
+                self.assertEqual(
+                    asw._extract_executed_python_scripts(
+                        ps_space_escape_cmd,
+                        initial_cwd="/opt",
+                        allow_unresolved_relative=False,
+                        explicit_shell="",
+                    ),
+                    ["/opt/shared skills/skills/alpha-skill/scripts/run_alpha.py"],
+                )
+                ps_prev_space_escape_cmd = (
+                    "cd /opt/shared` skills\n"
+                    "python -B skills/alpha-skill/scripts/run_alpha.py `\n"
+                    "  --days 7"
+                )
+                self.assertEqual(
+                    asw._extract_executed_python_scripts(
+                        ps_prev_space_escape_cmd,
+                        initial_cwd="/opt",
+                        allow_unresolved_relative=False,
+                        explicit_shell="",
+                    ),
+                    ["/opt/shared skills/skills/alpha-skill/scripts/run_alpha.py"],
+                )
+                bash_trailing_space_subst_cmd = (
+                    "echo `pwd `\n"
+                    "python -B skills/alpha-skill/scripts/run_alpha.py"
+                )
+                self.assertFalse(
+                    asw._is_powershell_command(
+                        bash_trailing_space_subst_cmd, initial_cwd="/opt/prod_plugin"
+                    )
+                )
+                self.assertEqual(
+                    asw._extract_executed_python_scripts(
+                        bash_trailing_space_subst_cmd,
+                        initial_cwd="/opt/prod_plugin",
+                        allow_unresolved_relative=False,
+                    ),
+                    ["/opt/prod_plugin/skills/alpha-skill/scripts/run_alpha.py"],
+                )
 
     def test_repo_alias_matches_maintenance_when_resolve_differs(self) -> None:
         """Windows 8.3 短縮名のように入力パスと resolve() 後が異なる場合でも保守作業として計上される。"""
