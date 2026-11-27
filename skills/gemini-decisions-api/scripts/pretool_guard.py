@@ -2882,6 +2882,32 @@ def _is_trusted_plugin_script(
                 base_val = arg.split("=", 1)[1]
             if not base_val or base_val.startswith("-"):
                 return False
+        elif rel_posix == "skills/plugin-authoring/scripts/audit_skills_weekly.py" and (
+            arg in {"--repo", "--prod-root", "--app-data-dir"}
+            or arg.startswith(("--repo=", "--prod-root=", "--app-data-dir="))
+        ):
+            if "=" in arg:
+                dir_val = arg.split("=", 1)[1]
+            else:
+                if i + 1 >= n:
+                    return False
+                dir_val = script_args[i + 1]
+                i += 1
+            expanded_dir = _expand_safe_path_vars(dir_val)
+            if expanded_dir is None or not _is_safe_filesystem_cd_target(expanded_dir):
+                return False
+            norm_dir = expanded_dir.replace("\\", "/")
+            if ".." in [seg for seg in norm_dir.split("/") if seg]:
+                return False
+            dir_cand = (
+                Path(expanded_dir)
+                if Path(expanded_dir).is_absolute()
+                else (Path(effective_script_cwd or ".") / expanded_dir)
+            )
+            if os.path.lexists(dir_cand) and (
+                _is_reparse_or_symlink(dir_cand) or not dir_cand.is_dir()
+            ):
+                return False
         i += 1
 
     return True

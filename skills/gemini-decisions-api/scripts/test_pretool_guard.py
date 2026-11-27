@@ -1738,7 +1738,21 @@ class TestPretoolGuard(unittest.TestCase):
             )
             self.assertIsNone(
                 pg.evaluate_stage1(
-                    "python skills/plugin-authoring/scripts/audit_skills_weekly.py --now AIzaSyDummySecretToken12345678901234567890",
+                    "python skills/plugin-authoring/scripts/audit_skills_weekly.py --now "
+                    + "AIza"
+                    + "SyDummySecretToken12345678901234567890",
+                    cwd=str(repo_root),
+                )
+            )
+            self.assertIsNone(
+                pg.evaluate_stage1(
+                    "python skills/plugin-authoring/scripts/audit_skills_weekly.py --repo ~/.ssh",
+                    cwd=str(repo_root),
+                )
+            )
+            self.assertIsNone(
+                pg.evaluate_stage1(
+                    "python skills/plugin-authoring/scripts/audit_skills_weekly.py --prod-root ../secret/.aws",
                     cwd=str(repo_root),
                 )
             )

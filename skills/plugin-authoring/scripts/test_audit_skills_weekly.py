@@ -6,11 +6,14 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -42,13 +45,16 @@ def _build_fixture_repo(repo: Path) -> None:
         + "\n---\n\n# 不整合規則\n\n## 手順\n\n1. `ghost-missing-skill` に委ねる。\n\n## 対象外\n\nなし。\n",
     )
 
-    # alpha-skill: スクリプトあり・テストあり・CLI フラグ乖離あり・横断 import あり
+    # alpha-skill: 2本のスクリプト（script_a/script_b相当）・CLI フラグ乖離・横断 import あり
     _write_text(
         repo / "skills" / "alpha-skill" / "SKILL.md",
         "---\nname: alpha-skill\n"
         "description: α処理を実行するときに使用する。共有補助は beta-helper に委ねる。\n"
         "---\n\n# αスキル\n\n## 責任範囲の境界\n\n- 詳細設定は `beta-helper` に委ねる。\n\n"
-        "## 手順\n\n```powershell\npython \"$HOME/.gemini/config/plugins/shared-skills/skills/alpha-skill/scripts/run_alpha.py\" --real-flag --ghost-flag\n```\n",
+        "## 手順\n\n```powershell\n"
+        "python \"$HOME/.gemini/config/plugins/shared-skills/skills/alpha-skill/scripts/run_alpha.py\" --real-flag --only-b --ghost-flag\n"
+        "python \"$HOME/.gemini/config/plugins/shared-skills/skills/alpha-skill/scripts/other_alpha.py\" --only-b\n"
+        "```\n",
     )
     _write_text(
         repo / "skills" / "alpha-skill" / "scripts" / "run_alpha.py",
@@ -56,6 +62,14 @@ def _build_fixture_repo(repo: Path) -> None:
         "def main():\n"
         "    p = argparse.ArgumentParser()\n"
         "    p.add_argument('--real-flag')\n"
+        "    return 0\n",
+    )
+    _write_text(
+        repo / "skills" / "alpha-skill" / "scripts" / "other_alpha.py",
+        "import argparse\n\n"
+        "def main():\n"
+        "    p = argparse.ArgumentParser()\n"
+        "    p.add_argument('--only-b')\n"
         "    return 0\n",
     )
     _write_text(
@@ -130,7 +144,6 @@ class TestAuditSkillsWeekly(unittest.TestCase):
             _build_fixture_repo(repo)
             prod.mkdir(parents=True)
 
-            # セッション1（3日前・本番利用 + pretool フォールバック）
             s1_log = app / "brain" / "sess-0001" / ".system_generated" / "logs" / "transcript.jsonl"
             prod_skill = str(prod / "skills" / "alpha-skill" / "SKILL.md")
             prod_script = str(prod / "skills" / "alpha-skill" / "scripts" / "run_alpha.py")
@@ -178,7 +191,6 @@ class TestAuditSkillsWeekly(unittest.TestCase):
                 + "\n",
             )
 
-            # セッション2（15日前・28日窓内だが7日窓外、35日前は窓外）
             s2_log = app / "brain" / "sess-0002" / ".system_generated" / "logs" / "transcript.jsonl"
             events_s2 = [
                 {
@@ -231,25 +243,28 @@ class TestAuditSkillsWeekly(unittest.TestCase):
             self.assertEqual(rc, 0)
             data = json.loads(buf.getvalue())
 
+            self.assertEqual(data["meta"]["usage_status"], "ok")
+            self.assertTrue(data["meta"]["usage_complete"])
             self.assertEqual(data["meta"]["malformed_lines"], 1)
             self.assertEqual(data["meta"]["active_sessions_7d"], 1)
             self.assertEqual(data["meta"]["active_sessions_28d"], 2)
 
             skills_by_name = {r["name"]: r for r in data["skills"]}
-            # alpha-skill: 本番読込1 + スクリプト実行1 = 2 (7d/28d)
             self.assertEqual(skills_by_name["alpha-skill"]["usage_7d"], 2)
             self.assertEqual(skills_by_name["alpha-skill"]["script_runs_7d"], 1)
             self.assertEqual(skills_by_name["alpha-skill"]["test_case_count"], 2)
-            self.assertEqual(skills_by_name["alpha-skill"]["doc_only_flags"], ["--ghost-flag"])
+            # スクリプト単位で照合されるため other_alpha.py 専用の --only-b も run_alpha.py 側の乖離として検知
+            self.assertEqual(
+                skills_by_name["alpha-skill"]["doc_only_flags"],
+                ["run_alpha.py:--ghost-flag", "run_alpha.py:--only-b"],
+            )
 
-            # beta-helper: dev_repo の参照は保守作業であり、35日前は28日窓外なので実利用0
             self.assertEqual(skills_by_name["beta-helper"]["usage_28d"], 0)
             self.assertEqual(skills_by_name["beta-helper"]["maintenance_touches_28d"], 1)
             self.assertIn("prune_or_merge_candidate", skills_by_name["beta-helper"]["tags"])
             self.assertIn("trim_description_candidate", skills_by_name["beta-helper"]["tags"])
             self.assertIn("split_body_candidate", skills_by_name["beta-helper"]["tags"])
 
-            # manual-heavy: 15日前の利用が28日窓に計上され、7日窓は0、mechanization_candidate が付く
             self.assertEqual(skills_by_name["manual-heavy"]["usage_7d"], 0)
             self.assertEqual(skills_by_name["manual-heavy"]["usage_28d"], 1)
             self.assertIn("mechanization_candidate", skills_by_name["manual-heavy"]["tags"])
@@ -258,7 +273,6 @@ class TestAuditSkillsWeekly(unittest.TestCase):
             self.assertEqual(rules_by_name["alpha-rule"]["usage_7d"], 1)
             self.assertEqual(rules_by_name["dangling-rule"]["usage_28d"], 0)
 
-            # 委譲リンク切れ・横断 import・フックフォールバック・衛生残骸
             dangling = data["boundaries"]["dangling_references"]
             self.assertEqual(len(dangling), 1)
             self.assertEqual(dangling[0]["target"], "ghost-missing-skill")
@@ -280,10 +294,295 @@ class TestAuditSkillsWeekly(unittest.TestCase):
                 ["skills/nonexistent/*.md"],
             )
 
-            # Markdown 出力スモーク
+            # Markdown にフック詳細、横断結合詳細、切れパス一覧、context_audit 省略理由が含まれる
             md = asw.render_markdown(data)
             self.assertIn("# 週次 SKILL 監査定量レポート", md)
-            self.assertIn("alpha-skill", md)
+            self.assertIn("`decision1-pretool-guard` enabled=True timeout=[15]", md)
+            self.assertIn("`alpha-skill/run_alpha.py` -> `beta-helper` (`shared_util`)", md)
+            self.assertIn("REVIEW.md 除外切れ: `skills/missing/gone.py`", md)
+            self.assertIn(".sloplintignore 切れ: `skills/nonexistent/*.md`", md)
+            self.assertIn("--include-context-audit 未指定", md)
+
+    def test_unavailable_logs_do_not_mark_zero_or_prune(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "dev_repo"
+            prod = root / "prod_plugin"
+            app = root / "empty_app_data"
+            _build_fixture_repo(repo)
+            prod.mkdir(parents=True)
+
+            # 1. brain ディレクトリ未存在
+            rep_no_brain = asw.build_weekly_report(
+                repo_root=repo,
+                prod_root=prod,
+                app_data_dir=app,
+                now_dt=asw.parse_iso_datetime("2026-11-27T12:00:00Z"),
+                days=7,
+                window_days=28,
+                use_git=False,
+                include_context_audit=False,
+            )
+            self.assertEqual(rep_no_brain["meta"]["usage_status"], "unavailable_no_brain_dir")
+            self.assertFalse(rep_no_brain["meta"]["usage_complete"])
+            self.assertTrue(rep_no_brain["inventory_candidates"]["usage_based_pruning_skipped"])
+            self.assertEqual(rep_no_brain["inventory_candidates"]["prune_or_merge_candidates"], [])
+            self.assertEqual(rep_no_brain["inventory_candidates"]["zero_usage_28d_skills"], [])
+            for r in rep_no_brain["skills"]:
+                self.assertIsNone(r["usage_28d"])
+                self.assertNotIn("prune_or_merge_candidate", r["tags"])
+            md = asw.render_markdown(rep_no_brain)
+            self.assertIn("unavailable_no_brain_dir", md)
+            self.assertIn("判定省略", md)
+
+            # 2. brain ディレクトリありだがトランスクリプト 0 件
+            (app / "brain").mkdir(parents=True)
+            rep_empty = asw.build_weekly_report(
+                repo_root=repo,
+                prod_root=prod,
+                app_data_dir=app,
+                now_dt=asw.parse_iso_datetime("2026-11-27T12:00:00Z"),
+                days=7,
+                window_days=28,
+                use_git=False,
+                include_context_audit=False,
+            )
+            self.assertEqual(rep_empty["meta"]["usage_status"], "unavailable_no_transcripts")
+            self.assertEqual(rep_empty["inventory_candidates"]["prune_or_merge_candidates"], [])
+
+            # 3. 読込失敗ファイルがある場合 (partial_read_errors) も統廃合候補に入れない
+            s_dir = app / "brain" / "sess-bad" / ".system_generated" / "logs"
+            s_dir.mkdir(parents=True)
+            (s_dir / "transcript.jsonl").mkdir()  # ファイルではなくディレクトリにして OSError を誘発
+            rep_partial = asw.build_weekly_report(
+                repo_root=repo,
+                prod_root=prod,
+                app_data_dir=app,
+                now_dt=asw.parse_iso_datetime("2026-11-27T12:00:00Z"),
+                days=7,
+                window_days=28,
+                use_git=False,
+                include_context_audit=False,
+            )
+            self.assertEqual(rep_partial["meta"]["usage_status"], "partial_read_errors")
+            self.assertFalse(rep_partial["meta"]["usage_complete"])
+            self.assertEqual(rep_partial["meta"]["unreadable_transcripts"], 1)
+            self.assertEqual(rep_partial["inventory_candidates"]["prune_or_merge_candidates"], [])
+
+    def test_run_command_position_and_cwd_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "dev_repo"
+            prod = root / "prod_plugin"
+            other = root / "other_dir"
+            app = root / "app_data"
+            _build_fixture_repo(repo)
+            prod.mkdir(parents=True)
+            other.mkdir(parents=True)
+
+            prod_script = str(prod / "skills" / "alpha-skill" / "scripts" / "run_alpha.py")
+            s_log = app / "brain" / "sess-cmd" / ".system_generated" / "logs" / "transcript.jsonl"
+            events = [
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-11-25T10:00:00Z",
+                    "tool_calls": [
+                        # 非 python コマンドの引数・閲覧・差分確認は計上しない
+                        {"name": "run_command", "args": {"CommandLine": f'git diff -- "{prod_script}"'}},
+                        {"name": "run_command", "args": {"CommandLine": f'rg foo "{prod_script}"'}},
+                        {"name": "run_command", "args": {"CommandLine": f'python -c "print(\'{prod_script}\')"'}},
+                        # 相対パス + Cwd=other -> 対象外
+                        {"name": "run_command", "args": {"CommandLine": "python skills/alpha-skill/scripts/run_alpha.py", "Cwd": str(other)}},
+                        # 相対パス + Cwd=repo -> maintenance (+1)
+                        {"name": "run_command", "args": {"CommandLine": "python skills/alpha-skill/scripts/run_alpha.py", "Cwd": str(repo)}},
+                        # 相対パス + Cwd=prod -> usage (+1)
+                        {"name": "run_command", "args": {"CommandLine": "python -B skills/alpha-skill/scripts/run_alpha.py", "Cwd": str(prod)}},
+                        # Set-Location で prod に移動して相対実行 -> usage (+1)
+                        {"name": "run_command", "args": {"CommandLine": f'Set-Location "{prod}"; python skills/alpha-skill/scripts/other_alpha.py --only-b', "Cwd": str(other)}},
+                    ],
+                }
+            ]
+            _write_text(s_log, "\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n")
+
+            rep = asw.build_weekly_report(
+                repo_root=repo,
+                prod_root=prod,
+                app_data_dir=app,
+                now_dt=asw.parse_iso_datetime("2026-11-27T12:00:00Z"),
+                days=7,
+                window_days=28,
+                use_git=False,
+                include_context_audit=False,
+            )
+            alpha = {r["name"]: r for r in rep["skills"]}["alpha-skill"]
+            self.assertEqual(alpha["script_runs_7d"], 2)
+            self.assertEqual(alpha["maintenance_touches_28d"], 1)
+
+    def test_repo_alias_matches_maintenance_when_resolve_differs(self) -> None:
+        """Windows 8.3 短縮名のように入力パスと resolve() 後が異なる場合でも保守作業として計上される。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_repo = root / "long_directory_name_repo"
+            alias_repo = root / "SHORT~1"
+            prod = root / "prod"
+            app = root / "app"
+            _build_fixture_repo(real_repo)
+            prod.mkdir(parents=True)
+
+            s_log = app / "brain" / "sess-alias" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_text(
+                s_log,
+                json.dumps(
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-25T10:00:00Z",
+                        "tool_calls": [
+                            {
+                                "name": "read_file",
+                                "args": {"Path": str(alias_repo / "skills" / "beta-helper" / "SKILL.md")},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+            )
+
+            rep = asw.build_weekly_report(
+                repo_root=real_repo.resolve(),
+                prod_root=prod,
+                app_data_dir=app,
+                now_dt=asw.parse_iso_datetime("2026-11-27T12:00:00Z"),
+                days=7,
+                window_days=28,
+                use_git=False,
+                include_context_audit=False,
+                repo_root_aliases=(alias_repo,),
+            )
+            beta = {r["name"]: r for r in rep["skills"]}["beta-helper"]
+            self.assertEqual(beta["maintenance_touches_28d"], 1)
+
+    def test_context_audit_until_boundary_and_trusted_script_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            untrusted_repo = root / "untrusted_repo"
+            prod = root / "prod"
+            app = root / "app"
+            _build_fixture_repo(untrusted_repo)
+            prod.mkdir(parents=True)
+
+            # 1. 悪意ある --repo 配下の偽 audit_context_metrics.py は実行されないこと
+            marker = root / "pwned.txt"
+            _write_text(
+                untrusted_repo / "skills" / "session-context-audit" / "scripts" / "audit_context_metrics.py",
+                f"from pathlib import Path\nPath({str(marker)!r}).write_text('pwned', encoding='utf-8')\n",
+            )
+
+            # 2. 実信頼パス側（本プラグイン実体）のテスト用に、一時ログで半開区間境界 [cutoff, now_dt) を検証
+            #    2026-11-26T12:00:00Z (in after), 2026-11-27T12:00:00Z (== now_dt: 除外), 2026-11-28T00:00:00Z (> now_dt: 除外)
+            for sid, ts in (
+                ("sess-before", "2026-11-18T12:00:00Z"),
+                ("sess-after", "2026-11-26T12:00:00Z"),
+                ("sess-at-now", "2026-11-27T12:00:00Z"),
+                ("sess-future", "2026-11-28T00:00:00Z"),
+            ):
+                p = app / "brain" / sid / ".system_generated" / "logs" / "transcript.jsonl"
+                ev = [
+                    {"type": "USER_INPUT", "created_at": ts, "content": "check"},
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": ts,
+                        "input_tokens": 100,
+                        "cache_read_tokens": 900,
+                        "output_tokens": 10,
+                        "model": "gemini-test",
+                        "tool_calls": [
+                            {"name": "read_file", "args": {"Path": str(prod / "skills" / "alpha-skill" / "SKILL.md")}}
+                        ],
+                    },
+                ]
+                _write_text(p, "\n".join(json.dumps(x) for x in ev) + "\n")
+
+            rep = asw.build_weekly_report(
+                repo_root=untrusted_repo,
+                prod_root=prod,
+                app_data_dir=app,
+                now_dt=asw.parse_iso_datetime("2026-11-27T12:00:00Z"),
+                days=7,
+                window_days=28,
+                use_git=False,
+                include_context_audit=True,
+            )
+            self.assertFalse(marker.exists(), "未信頼 --repo のスクリプトが実行されてはいけません")
+            ca = rep["context_audit"]
+            self.assertEqual(ca["status"], "ok")
+            self.assertEqual(ca["before_sessions"], 1)
+            self.assertEqual(ca["after_sessions"], 1)
+            alpha = {r["name"]: r for r in rep["skills"]}["alpha-skill"]
+            # sess-after (7d/28d) と sess-before (28d) のみ計上。sess-at-now と sess-future は除外。
+            self.assertEqual(alpha["usage_7d"], 1)
+            self.assertEqual(alpha["usage_28d"], 2)
+
+            # 3. 信頼スクリプト側を偽の外部へ差し替えようとしても拒否されること
+            fake_trusted = root / "fake_trusted"
+            _write_text(fake_trusted / "skills" / "session-context-audit" / "scripts" / "audit_context_metrics.py", "print('{}')\n")
+            with mock.patch.object(asw, "_is_reparse_or_symlink", return_value=True):
+                res = asw.run_context_audit_summary(
+                    app,
+                    now_dt=asw.parse_iso_datetime("2026-11-27T12:00:00Z"),
+                    days=7,
+                    trusted_plugin_root=fake_trusted,
+                )
+            self.assertEqual(res["status"], "error")
+            self.assertEqual(res["error"], "untrusted_context_audit_script_path")
+
+            # Markdown に失敗理由が出ることも確認
+            rep_err = dict(rep, context_audit=res)
+            self.assertIn("untrusted_context_audit_script_path", asw.render_markdown(rep_err))
+
+    def test_no_pycache_written_and_git_no_optional_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            copied_scripts = root / "skills" / "plugin-authoring" / "scripts"
+            copied_scripts.mkdir(parents=True)
+            shutil.copy2(SCRIPT_DIR / "audit_skills_weekly.py", copied_scripts / "audit_skills_weekly.py")
+            shutil.copy2(SCRIPT_DIR / "check_plugin.py", copied_scripts / "check_plugin.py")
+            _build_fixture_repo(root)
+
+            env = os.environ.copy()
+            env.pop("PYTHONDONTWRITEBYTECODE", None)
+            env["PYTHONUTF8"] = "1"
+            # -B を付けずに実行しても __pycache__ を生成しないこと
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(copied_scripts / "audit_skills_weekly.py"),
+                    "--repo",
+                    str(root),
+                    "--prod-root",
+                    str(root / "prod_empty"),
+                    "--app-data-dir",
+                    str(root / "app_empty"),
+                    "--no-git",
+                    "--format",
+                    "json",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse((copied_scripts / "__pycache__").exists())
+
+            with mock.patch.object(asw.subprocess, "run") as mock_run:
+                mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+                asw._run_git(root, "status", "--porcelain")
+                called_cmd = mock_run.call_args[0][0]
+                called_env = mock_run.call_args[1]["env"]
+                self.assertIn("--no-optional-locks", called_cmd)
+                self.assertEqual(called_env.get("GIT_OPTIONAL_LOCKS"), "0")
 
     def test_git_sync_mismatch_and_merged_branches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -314,7 +613,6 @@ class TestAuditSkillsWeekly(unittest.TestCase):
             run_git(prod, "config", "user.email", "test@example.com")
             run_git(prod, "config", "user.name", "Tester")
 
-            # repo 側にマージ済み残存ブランチを作成し、1 コミット進める
             run_git(repo, "checkout", "-b", "merged-old")
             run_git(repo, "checkout", "main")
             _write_text(repo / "README.md", "# updated\n")

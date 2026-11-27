@@ -71,7 +71,7 @@ description: shared-skills プラグインへのルールやスキル追加、�
 
 ```powershell
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python "$HOME/.gemini/config/plugins/shared-skills/skills/plugin-authoring/scripts/audit_skills_weekly.py" `
+python -B "$HOME/.gemini/config/plugins/shared-skills/skills/plugin-authoring/scripts/audit_skills_weekly.py" `
   --repo "E:\Documents\code\skills4agy" `
   --prod-root "$HOME\.gemini\config\plugins\shared-skills" `
   --include-context-audit `

@@ -12,19 +12,25 @@ CI（check_plugin.py / check_hygiene.py / run_all_tests.py）では検知しに�
 
 from __future__ import annotations
 
-import argparse
-import ast
-from collections import defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-import glob
-import json
-import os
-from pathlib import Path
-import re
-import subprocess
 import sys
-from typing import Any, Iterable, Optional, Sequence
+
+# 本番プラグイン配下の check_plugin 等を読み込む際に __pycache__ を生成しないよう無効化する
+sys.dont_write_bytecode = True
+
+import argparse  # noqa: E402
+import ast  # noqa: E402
+from collections import defaultdict  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+import glob  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+from pathlib import Path  # noqa: E402
+import posixpath  # noqa: E402
+import re  # noqa: E402
+import stat  # noqa: E402
+import subprocess  # noqa: E402
+from typing import Any, Optional, Sequence  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -135,10 +141,21 @@ SKILL_PATH_RE = re.compile(
 RULE_PATH_RE = re.compile(
     r"(?:^|/)rules/([a-z0-9-]+)\.md(?:$|[\"'`\s])", re.IGNORECASE
 )
-CMD_SCRIPT_RE = re.compile(
-    r"([^\s\"'`=;|><()]*?skills/([a-z0-9-]+)/scripts/([a-z0-9_]+\.py))",
+SKILL_SCRIPT_TAIL_RE = re.compile(
+    r"(?:^|/)skills/([a-z0-9-]+)/scripts/([a-z0-9_]+\.py)$",
     re.IGNORECASE,
 )
+PYTHON_EXECUTABLES: frozenset[str] = frozenset(
+    {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}
+)
+PYTHON_VALUE_FLAGS: frozenset[str] = frozenset({"-W", "-X", "-Q"})
+PYTHON_NON_SCRIPT_FLAGS: frozenset[str] = frozenset({"-c", "-m", "-"})
+CD_COMMANDS: frozenset[str] = frozenset(
+    {"cd", "set-location", "sl", "chdir", "pushd", "push-location"}
+)
+POSIX_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+PS_ENV_ASSIGN_RE = re.compile(r"^\$env:[A-Za-z_][A-Za-z0-9_]*=.*$", re.IGNORECASE)
+WINDOWS_ABS_RE = re.compile(r"^[a-z]:(?:/|$)")
 BACKTICK_IDENT_RE = re.compile(r"`([a-z][a-z0-9_-]{2,})`")
 LONG_FLAG_RE = re.compile(r"(?<![A-Za-z0-9_-])(--[a-z][a-z0-9-]{1,})")
 VERSION_STAMP_RE = re.compile(r"\b(20\d{2}-\d{2})(?:\s*版)?\b")
@@ -283,15 +300,21 @@ def normalize_posix_lower(raw_path: Any) -> str:
     return text
 
 
-def _path_roots(path: Path) -> tuple[str, ...]:
-    candidates = [normalize_posix_lower(str(path))]
-    try:
-        real_str = normalize_posix_lower(os.path.realpath(path))
-        if real_str and real_str not in candidates:
-            candidates.append(real_str)
-    except OSError:
-        pass
-    return tuple(c.rstrip("/") for c in candidates if c)
+def _path_roots(*paths: Path) -> tuple[str, ...]:
+    """パス群の元文字列表現・abspath・realpath のすべてを重複なしタプルで返す（8.3 短縮名対応）。"""
+    candidates: list[str] = []
+    for path in paths:
+        for raw in (str(path), os.path.abspath(path)):
+            norm = normalize_posix_lower(raw).rstrip("/")
+            if norm and norm not in candidates:
+                candidates.append(norm)
+        try:
+            real_norm = normalize_posix_lower(os.path.realpath(path)).rstrip("/")
+            if real_norm and real_norm not in candidates:
+                candidates.append(real_norm)
+        except OSError:
+            pass
+    return tuple(candidates)
 
 
 def _classify_path_origin(
@@ -322,19 +345,246 @@ def _classify_path_origin(
     return "other"
 
 
+def _split_shell_segments(cmd_str: str) -> list[str]:
+    """クォート外の区切り文字で単純コマンド列へ分割し、判定不能な構文セグメントは除外する。"""
+    joined = re.sub(r"`\r?\n\s*", " ", cmd_str)
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: Optional[str] = None
+    unparseable = False
+    i = 0
+    n = len(joined)
+    while i < n:
+        ch = joined[i]
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            elif quote == '"' and ch == "\\" and i + 1 < n and joined[i + 1] == '"':
+                buf.append(ch)
+                i += 1
+                buf.append(joined[i])
+                i += 1
+                continue
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch in ('"', "'"):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "`" or (ch == "$" and i + 1 < n and joined[i + 1] in ("(", "{")):
+            unparseable = True
+        if ch in (";", "|", "\r", "\n") or (ch == "&" and i + 1 < n and joined[i + 1] == "&"):
+            seg = "".join(buf).strip()
+            if seg and not unparseable:
+                segments.append(seg)
+            buf = []
+            unparseable = False
+            if (ch == "&" and i + 1 < n and joined[i + 1] == "&") or (
+                ch == "|" and i + 1 < n and joined[i + 1] == "|"
+            ):
+                i += 2
+            else:
+                i += 1
+            continue
+        buf.append(ch)
+        i += 1
+
+    if quote is not None:
+        return segments
+    tail = "".join(buf).strip()
+    if tail and not unparseable:
+        segments.append(tail)
+    return segments
+
+
+def _tokenize_segment(seg: str) -> Optional[list[str]]:
+    """単一コマンドセグメントをクォート解除しつつトークン化する（Windows パスを保持）。"""
+    tokens: list[str] = []
+    buf: list[str] = []
+    quote: Optional[str] = None
+    has_token = False
+    i = 0
+    n = len(seg)
+    while i < n:
+        ch = seg[i]
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            elif quote == '"' and ch == "\\" and i + 1 < n and seg[i + 1] == '"':
+                buf.append('"')
+                i += 2
+                continue
+            else:
+                buf.append(ch)
+            i += 1
+            continue
+
+        if ch in ('"', "'"):
+            quote = ch
+            has_token = True
+            i += 1
+            continue
+        if ch.isspace():
+            if has_token:
+                tokens.append("".join(buf))
+                buf = []
+                has_token = False
+            i += 1
+            continue
+        buf.append(ch)
+        has_token = True
+        i += 1
+
+    if quote is not None:
+        return None
+    if has_token:
+        tokens.append("".join(buf))
+    return tokens
+
+
+def _is_abs_path_norm(norm_path: str) -> bool:
+    return bool(
+        norm_path.startswith("/")
+        or WINDOWS_ABS_RE.match(norm_path)
+        or norm_path.startswith("$home/")
+    )
+
+
+def _resolve_with_cwd(path_norm: str, current_cwd: str) -> Optional[str]:
+    if not path_norm:
+        return None
+    if _is_abs_path_norm(path_norm):
+        return path_norm
+    if not current_cwd:
+        return None
+    base = current_cwd.rstrip("/")
+    joined = posixpath.normpath(f"{base}/{path_norm}")
+    # Windows ドライブレター "c:/..." の normpath はそのまま維持される
+    return joined
+
+
+def _extract_executed_python_scripts(
+    cmd_str: str,
+    *,
+    initial_cwd: str,
+    allow_unresolved_relative: bool,
+) -> list[str]:
+    """run_command 文字列から python 系実行コマンドのスクリプト引数パスだけを抽出する。"""
+    current_cwd = normalize_posix_lower(initial_cwd).rstrip("/") if initial_cwd else ""
+    results: list[str] = []
+    for seg in _split_shell_segments(cmd_str):
+        tokens = _tokenize_segment(seg)
+        if not tokens:
+            continue
+
+        idx = 0
+        # 先頭の環境変数代入（VAR=val / $env:VAR=val / $env:VAR = val）をスキップ
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if (
+                tok.lower().startswith("$env:")
+                and "=" not in tok
+                and idx + 2 < len(tokens)
+                and tokens[idx + 1] == "="
+            ):
+                idx += 3
+                continue
+            if POSIX_ENV_ASSIGN_RE.match(tok) or PS_ENV_ASSIGN_RE.match(tok):
+                idx += 1
+                continue
+            break
+
+        if idx < len(tokens) and tokens[idx] == "&":
+            idx += 1
+        if idx >= len(tokens):
+            continue
+
+        cmd_norm = normalize_posix_lower(tokens[idx])
+        cmd_base = cmd_norm.rsplit("/", 1)[-1]
+
+        if cmd_base in CD_COMMANDS:
+            target: Optional[str] = None
+            j = idx + 1
+            while j < len(tokens):
+                t = tokens[j]
+                if t.lower() in ("-path", "-literalpath") and j + 1 < len(tokens):
+                    target = tokens[j + 1]
+                    break
+                if not t.startswith("-"):
+                    target = t
+                    break
+                j += 1
+            if target:
+                t_norm = normalize_posix_lower(target).rstrip("/")
+                resolved = _resolve_with_cwd(t_norm, current_cwd)
+                if resolved:
+                    current_cwd = resolved
+            continue
+
+        if cmd_base not in PYTHON_EXECUTABLES:
+            continue
+
+        # Python のオプションを読み飛ばし、最初のスクリプト引数だけを取得する
+        script_tok: Optional[str] = None
+        j = idx + 1
+        while j < len(tokens):
+            arg = tokens[j]
+            if arg == "--":
+                if j + 1 < len(tokens):
+                    script_tok = tokens[j + 1]
+                break
+            if arg in PYTHON_NON_SCRIPT_FLAGS:
+                break
+            if arg in PYTHON_VALUE_FLAGS:
+                j += 2
+                continue
+            if arg.startswith("-"):
+                j += 1
+                continue
+            script_tok = arg
+            break
+
+        if not script_tok:
+            continue
+        s_norm = normalize_posix_lower(script_tok)
+        if not s_norm.endswith(".py"):
+            continue
+        resolved = _resolve_with_cwd(s_norm, current_cwd)
+        if resolved is not None:
+            results.append(resolved)
+        elif allow_unresolved_relative:
+            results.append(s_norm)
+
+    return results
+
+
 def _run_git(
     repo_dir: Path, *args: str, timeout: float = 10.0
 ) -> Optional[subprocess.CompletedProcess[str]]:
     if not repo_dir.exists():
         return None
+    env = os.environ.copy()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     try:
         return subprocess.run(
-            ["git", "-C", str(repo_dir), "-c", "core.quotePath=false", *args],
+            [
+                "git",
+                "--no-optional-locks",
+                "-C",
+                str(repo_dir),
+                "-c",
+                "core.quotePath=false",
+                *args,
+            ],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            env=env,
             check=False,
             shell=False,
         )
@@ -425,11 +675,18 @@ def _strip_quoted_arg_values(text: str) -> str:
     return cleaned
 
 
-def _extract_doc_flags_for_skill(skill_dir: Path, script_names: set[str]) -> set[str]:
-    """スキル文書内のスクリプト呼び出し行に紐づく --flag 記載を抽出する。"""
+def _extract_doc_flags_by_script(
+    skill_dir: Path, script_names: set[str]
+) -> dict[str, set[str]]:
+    """スキル文書内のスクリプト呼び出し行に紐づく --flag 記載をスクリプト単位で抽出する。"""
     if not script_names:
-        return set()
-    flags: set[str] = set()
+        return {}
+    flags_by_script: dict[str, set[str]] = defaultdict(set)
+    ordered_names = sorted(script_names, key=lambda s: (-len(s), s))
+
+    def detect_scripts(text: str) -> list[str]:
+        return [sn for sn in ordered_names if sn in text]
+
     for md_path in sorted(skill_dir.rglob("*.md")):
         try:
             lines = md_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -441,30 +698,41 @@ def _extract_doc_flags_for_skill(skill_dir: Path, script_names: set[str]) -> set
             if FENCE_RE.match(line):
                 if in_fence:
                     block_text = "\n".join(block_buf)
-                    if any(sn in block_text for sn in script_names):
-                        in_script_cmd = False
+                    if detect_scripts(block_text):
+                        active_script: Optional[str] = None
                         for b_line in block_buf:
                             stripped = b_line.strip()
                             if not stripped or stripped.startswith("#"):
-                                in_script_cmd = False
+                                active_script = None
                                 continue
-                            if any(sn in b_line for sn in script_names):
-                                in_script_cmd = True
-                            if in_script_cmd or stripped.startswith("--"):
-                                flags.update(LONG_FLAG_RE.findall(_strip_quoted_arg_values(b_line)))
+                            matched = detect_scripts(b_line)
+                            if len(matched) == 1:
+                                active_script = matched[0]
+                            elif len(matched) > 1:
+                                # 1 行に複数スクリプトが混在する場合は誤帰属を避けてリセット
+                                active_script = None
+                            if active_script is not None and (
+                                matched or stripped.startswith("--")
+                            ):
+                                flags_by_script[active_script].update(
+                                    LONG_FLAG_RE.findall(_strip_quoted_arg_values(b_line))
+                                )
                             if not stripped.endswith(("`", "\\")):
-                                in_script_cmd = False
+                                active_script = None
                     block_buf = []
                 in_fence = not in_fence
                 continue
             if in_fence:
                 block_buf.append(line)
             else:
-                # 地の文ではスクリプト名を含むインラインコード片のみから抽出する
+                # 地の文では単一スクリプト名を含むインラインコード片のみから抽出する
                 for seg in BACKTICK_PATH_RE.findall(line):
-                    if any(sn in seg for sn in script_names):
-                        flags.update(LONG_FLAG_RE.findall(_strip_quoted_arg_values(seg)))
-    return flags
+                    matched = detect_scripts(seg)
+                    if len(matched) == 1:
+                        flags_by_script[matched[0]].update(
+                            LONG_FLAG_RE.findall(_strip_quoted_arg_values(seg))
+                        )
+    return dict(flags_by_script)
 
 
 def _count_ast_tests(test_path: Path) -> int:
@@ -529,15 +797,24 @@ def collect_inventory(
                         non_tests.append(py)
 
             test_count = sum(_count_ast_tests(tp) for tp in tests)
-            impl_flags: set[str] = set()
+            impl_flags_by_script: dict[str, set[str]] = {}
+            all_impl_flags: set[str] = set()
             for sp in non_tests:
-                impl_flags.update(_extract_argparse_flags(sp))
-            # argparse の既定ヘルプフラグは文書記載を許容する
-            allowed_flags = impl_flags | {"--help"}
-            doc_flags = _extract_doc_flags_for_skill(
+                sflags = _extract_argparse_flags(sp)
+                impl_flags_by_script[sp.name] = sflags
+                all_impl_flags.update(sflags)
+            doc_flags_by_script = _extract_doc_flags_by_script(
                 skill_dir, {sp.name for sp in non_tests}
             )
-            doc_only = sorted(f for f in doc_flags if f not in allowed_flags)
+            doc_only_list: list[str] = []
+            for sname, dflags in sorted(doc_flags_by_script.items()):
+                # argparse の既定ヘルプフラグは文書記載を許容する
+                allowed = impl_flags_by_script.get(sname, set()) | {"--help"}
+                for fl in sorted(dflags):
+                    if fl not in allowed:
+                        doc_only_list.append(f"{sname}:{fl}")
+            doc_only = doc_only_list
+            impl_flags = all_impl_flags
 
             staleness_days: Optional[int] = None
             last_commit_iso: Optional[str] = None
@@ -632,15 +909,17 @@ def scan_transcripts(
     app_data_dir: Path,
     prod_root: Path,
     repo_root: Path,
+    repo_root_aliases: Sequence[Path] = (),
+    prod_root_aliases: Sequence[Path] = (),
     now_dt: datetime,
     days: int,
     window_days: int,
 ) -> dict[str, Any]:
     """ローカルの transcript.jsonl を走査して利用実績とフックフォールバックを集計する。"""
     brain_dir = app_data_dir / "brain"
-    prod_roots = _path_roots(prod_root)
-    repo_roots = _path_roots(repo_root)
-    same_root = set(prod_roots) == set(repo_roots)
+    prod_roots = _path_roots(prod_root, *prod_root_aliases)
+    repo_roots = _path_roots(repo_root, *repo_root_aliases)
+    same_root = bool(set(prod_roots) & set(repo_roots))
 
     cutoff_short = now_dt - timedelta(days=days)
     cutoff_window = now_dt - timedelta(days=window_days)
@@ -648,6 +927,7 @@ def scan_transcripts(
     skill_usage: dict[str, UsageCounter] = defaultdict(UsageCounter)
     rule_usage: dict[str, UsageCounter] = defaultdict(UsageCounter)
     total_transcripts = 0
+    unreadable_transcripts = 0
     recent_sessions_7d: set[str] = set()
     recent_sessions_28d: set[str] = set()
     malformed_lines = 0
@@ -657,7 +937,10 @@ def scan_transcripts(
     if not brain_dir.is_dir():
         return {
             "brain_dir_exists": False,
+            "usage_status": "unavailable_no_brain_dir",
+            "usage_complete": False,
             "total_transcripts": 0,
+            "unreadable_transcripts": 0,
             "active_sessions_7d": 0,
             "active_sessions_28d": 0,
             "malformed_lines": 0,
@@ -668,6 +951,22 @@ def scan_transcripts(
         }
 
     transcripts = sorted(brain_dir.glob("*/.system_generated/logs/transcript.jsonl"))
+    if not transcripts:
+        return {
+            "brain_dir_exists": True,
+            "usage_status": "unavailable_no_transcripts",
+            "usage_complete": False,
+            "total_transcripts": 0,
+            "unreadable_transcripts": 0,
+            "active_sessions_7d": 0,
+            "active_sessions_28d": 0,
+            "malformed_lines": 0,
+            "skill_usage": skill_usage,
+            "rule_usage": rule_usage,
+            "pretool_fallback_7d": 0,
+            "pretool_fallback_28d": 0,
+        }
+
     for tp in transcripts:
         total_transcripts += 1
         session_id = tp.parents[2].name
@@ -679,6 +978,7 @@ def scan_transcripts(
         try:
             fh = tp.open("r", encoding="utf-8", errors="replace")
         except OSError:
+            unreadable_transcripts += 1
             continue
 
         with fh:
@@ -696,7 +996,8 @@ def scan_transcripts(
                     continue
 
                 step_dt = try_parse_datetime(obj.get("created_at")) or fallback_dt
-                if step_dt > now_dt:
+                # audit_context_metrics.py の --until と同じ半開区間 [cutoff, now_dt) に揃える
+                if step_dt >= now_dt:
                     continue
                 in_28d = step_dt >= cutoff_window
                 in_7d = step_dt >= cutoff_short
@@ -794,20 +1095,19 @@ def scan_transcripts(
                         cmd_str = str(decode_tool_arg(raw_cmd) or "")
                         if not cmd_str:
                             continue
-                        norm_cmd = cmd_str.replace("\\", "/").lower()
+                        raw_cwd = args.get("Cwd") or args.get("cwd") or ""
+                        initial_cwd = str(decode_tool_arg(raw_cwd) or "")
+                        executed_paths = _extract_executed_python_scripts(
+                            cmd_str,
+                            initial_cwd=initial_cwd,
+                            allow_unresolved_relative=same_root,
+                        )
                         seen_in_call: set[tuple[str, str, str]] = set()
-                        for m in CMD_SCRIPT_RE.finditer(norm_cmd):
-                            full_tok, sname, script_name = m.group(1), m.group(2), m.group(3)
-                            if script_name.startswith("test_"):
-                                origin = _classify_path_origin(
-                                    full_tok,
-                                    prod_roots=prod_roots,
-                                    repo_roots=repo_roots,
-                                    same_root=same_root,
-                                )
-                                if origin != "other" and in_28d:
-                                    skill_usage[sname].maintenance_touches_28d += 1
+                        for full_tok in executed_paths:
+                            m = SKILL_SCRIPT_TAIL_RE.search(full_tok)
+                            if not m:
                                 continue
+                            sname, script_name = m.group(1), m.group(2)
                             origin = _classify_path_origin(
                                 full_tok,
                                 prod_roots=prod_roots,
@@ -815,6 +1115,10 @@ def scan_transcripts(
                                 same_root=same_root,
                             )
                             if origin == "other":
+                                continue
+                            if script_name.startswith("test_"):
+                                if in_28d:
+                                    skill_usage[sname].maintenance_touches_28d += 1
                                 continue
                             key = (origin, sname, script_name)
                             if key in seen_in_call:
@@ -833,9 +1137,13 @@ def scan_transcripts(
                                     in_28d=in_28d,
                                 )
 
+    usage_status = "partial_read_errors" if unreadable_transcripts > 0 else "ok"
     return {
         "brain_dir_exists": True,
+        "usage_status": usage_status,
+        "usage_complete": usage_status == "ok",
         "total_transcripts": total_transcripts,
+        "unreadable_transcripts": unreadable_transcripts,
         "active_sessions_7d": len(recent_sessions_7d),
         "active_sessions_28d": len(recent_sessions_28d),
         "malformed_lines": malformed_lines,
@@ -1192,24 +1500,68 @@ def check_git_sync(
     }
 
 
+def _is_reparse_or_symlink(path: Path) -> bool:
+    if os.path.islink(path):
+        return True
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return True
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    attrs = getattr(st, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attrs & reparse_flag)
+
+
+def _is_safe_trusted_script_path(root: Path, target: Path) -> bool:
+    """root から target までにリンクやリパースポイントがなく、実体が root 配下か検証する。"""
+    try:
+        real_root = Path(os.path.realpath(root))
+        real_target = Path(os.path.realpath(target))
+    except OSError:
+        return False
+    if not real_target.is_relative_to(real_root):
+        return False
+    try:
+        rel = target.relative_to(root)
+    except ValueError:
+        return False
+    cur = root
+    if not os.path.lexists(cur) or _is_reparse_or_symlink(cur):
+        return False
+    for part in rel.parts:
+        cur = cur / part
+        if not os.path.lexists(cur) or _is_reparse_or_symlink(cur):
+            return False
+    return target.is_file()
+
+
 def run_context_audit_summary(
-    repo_root: Path,
     app_data_dir: Path,
     *,
     now_dt: datetime,
     days: int,
+    trusted_plugin_root: Optional[Path] = None,
 ) -> dict[str, Any]:
-    """既存の session-context-audit CLI をオフラインで呼び出し、週次 KPI を抽出する。"""
+    """信頼済みプラグイン配下の session-context-audit CLI のみをオフライン実行し、週次 KPI を抽出する。"""
+    plugin_root = trusted_plugin_root or DEFAULT_REPO_ROOT
     script_path = (
-        repo_root
+        plugin_root
         / "skills"
         / "session-context-audit"
         / "scripts"
         / "audit_context_metrics.py"
     )
-    if not script_path.is_file():
-        return {"status": "missing_script"}
-    cutoff_iso = (now_dt - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not os.path.lexists(script_path):
+        return {"status": "missing_script", "error": f"script not found: {script_path}"}
+    if not _is_safe_trusted_script_path(plugin_root, script_path):
+        return {
+            "status": "error",
+            "error": "untrusted_context_audit_script_path",
+        }
+    cutoff_iso = (now_dt - timedelta(days=days)).isoformat()
+    until_iso = now_dt.isoformat()
     cmd = [
         sys.executable,
         "-B",
@@ -1218,12 +1570,16 @@ def run_context_audit_summary(
         str(app_data_dir),
         "--cutoff",
         cutoff_iso,
+        "--until",
+        until_iso,
         "--scope",
         "parent",
         "--no-full-lookup",
         "--format",
         "json",
     ]
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
         proc = subprocess.run(
             cmd,
@@ -1232,6 +1588,7 @@ def run_context_audit_summary(
             encoding="utf-8",
             errors="replace",
             timeout=60.0,
+            env=env,
             check=False,
             shell=False,
         )
@@ -1304,15 +1661,22 @@ def run_context_audit_summary(
     return {
         "status": "ok",
         "cutoff": cutoff_iso,
+        "until": until_iso,
         "before_sessions": before_obj.get("n", 0),
         "after_sessions": after_obj.get("n", 0),
         "kpis": kpis,
     }
 
 
-def _assign_skill_tags(skill: SkillInventory, usage: UsageCounter) -> list[str]:
+def _assign_skill_tags(
+    skill: SkillInventory,
+    usage: UsageCounter,
+    *,
+    usage_complete: bool,
+    usage_unavailable: bool,
+) -> list[str]:
     tags: list[str] = []
-    if usage.total_usage_28d == 0 and (
+    if usage_complete and usage.total_usage_28d == 0 and (
         skill.desc_chars >= 180
         or (skill.staleness_days is not None and skill.staleness_days >= 14)
     ):
@@ -1321,10 +1685,13 @@ def _assign_skill_tags(skill: SkillInventory, usage: UsageCounter) -> list[str]:
         tags.append("trim_description_candidate")
     if skill.body_lines >= SKILL_BODY_SOFT_LIMIT:
         tags.append("split_body_candidate")
+    has_usage_or_blocks = (
+        (not usage_unavailable and usage.total_usage_28d > 0) or skill.code_blocks >= 3
+    )
     if (
         not skill.non_test_scripts
         and (skill.body_lines >= 100 or skill.numbered_steps >= 6)
-        and (usage.total_usage_28d > 0 or skill.code_blocks >= 3)
+        and has_usage_or_blocks
     ):
         tags.append("mechanization_candidate")
     if skill.doc_only_flags:
@@ -1332,9 +1699,14 @@ def _assign_skill_tags(skill: SkillInventory, usage: UsageCounter) -> list[str]:
     return tags
 
 
-def _assign_rule_tags(rule: RuleInventory, usage: UsageCounter) -> list[str]:
+def _assign_rule_tags(
+    rule: RuleInventory,
+    usage: UsageCounter,
+    *,
+    usage_complete: bool,
+) -> list[str]:
     tags: list[str] = []
-    if usage.total_usage_28d == 0 and (
+    if usage_complete and usage.total_usage_28d == 0 and (
         rule.desc_chars >= 80
         or (rule.staleness_days is not None and rule.staleness_days >= 14)
     ):
@@ -1354,6 +1726,8 @@ def build_weekly_report(
     window_days: int,
     use_git: bool,
     include_context_audit: bool,
+    repo_root_aliases: Sequence[Path] = (),
+    prod_root_aliases: Sequence[Path] = (),
 ) -> dict[str, Any]:
     """全 6 主眼の週次監査レポートデータ構造を組み立てる。"""
     skills, rules, agents_info = collect_inventory(
@@ -1363,10 +1737,15 @@ def build_weekly_report(
         app_data_dir=app_data_dir,
         prod_root=prod_root,
         repo_root=repo_root,
+        repo_root_aliases=repo_root_aliases,
+        prod_root_aliases=prod_root_aliases,
         now_dt=now_dt,
         days=days,
         window_days=window_days,
     )
+    usage_status: str = tx_data["usage_status"]
+    usage_complete: bool = tx_data["usage_complete"]
+    usage_unavailable: bool = usage_status.startswith("unavailable_")
     skill_usage_map: dict[str, UsageCounter] = tx_data["skill_usage"]
     rule_usage_map: dict[str, UsageCounter] = tx_data["rule_usage"]
 
@@ -1375,22 +1754,27 @@ def build_weekly_report(
     for s in skills:
         total_skill_desc_chars += s.desc_chars
         u = skill_usage_map.get(s.name, UsageCounter())
-        tags = _assign_skill_tags(s, u)
+        tags = _assign_skill_tags(
+            s,
+            u,
+            usage_complete=usage_complete,
+            usage_unavailable=usage_unavailable,
+        )
         skill_rows.append(
             {
                 "name": s.name,
-                "usage_7d": u.total_usage_7d,
-                "usage_28d": u.total_usage_28d,
-                "skill_md_reads_7d": u.skill_md_reads_7d,
-                "skill_md_reads_28d": u.skill_md_reads_28d,
-                "aux_reads_7d": u.aux_reads_7d,
-                "aux_reads_28d": u.aux_reads_28d,
-                "script_runs_7d": u.script_runs_7d,
-                "script_runs_28d": u.script_runs_28d,
-                "sessions_7d": len(u.sessions_7d),
-                "sessions_28d": len(u.sessions_28d),
-                "maintenance_touches_28d": u.maintenance_touches_28d,
-                "last_used_at": u.last_used_dt.isoformat() if u.last_used_dt else None,
+                "usage_7d": None if usage_unavailable else u.total_usage_7d,
+                "usage_28d": None if usage_unavailable else u.total_usage_28d,
+                "skill_md_reads_7d": None if usage_unavailable else u.skill_md_reads_7d,
+                "skill_md_reads_28d": None if usage_unavailable else u.skill_md_reads_28d,
+                "aux_reads_7d": None if usage_unavailable else u.aux_reads_7d,
+                "aux_reads_28d": None if usage_unavailable else u.aux_reads_28d,
+                "script_runs_7d": None if usage_unavailable else u.script_runs_7d,
+                "script_runs_28d": None if usage_unavailable else u.script_runs_28d,
+                "sessions_7d": None if usage_unavailable else len(u.sessions_7d),
+                "sessions_28d": None if usage_unavailable else len(u.sessions_28d),
+                "maintenance_touches_28d": None if usage_unavailable else u.maintenance_touches_28d,
+                "last_used_at": None if usage_unavailable else (u.last_used_dt.isoformat() if u.last_used_dt else None),
                 "desc_chars": s.desc_chars,
                 "body_lines": s.body_lines,
                 "has_scripts": bool(s.non_test_scripts),
@@ -1411,16 +1795,16 @@ def build_weekly_report(
     for r in rules:
         total_rule_desc_chars += r.desc_chars
         u = rule_usage_map.get(r.name, UsageCounter())
-        tags = _assign_rule_tags(r, u)
+        tags = _assign_rule_tags(r, u, usage_complete=usage_complete)
         rule_rows.append(
             {
                 "name": r.name,
-                "usage_7d": u.rule_reads_7d,
-                "usage_28d": u.rule_reads_28d,
-                "sessions_7d": len(u.sessions_7d),
-                "sessions_28d": len(u.sessions_28d),
-                "maintenance_touches_28d": u.maintenance_touches_28d,
-                "last_used_at": u.last_used_dt.isoformat() if u.last_used_dt else None,
+                "usage_7d": None if usage_unavailable else u.rule_reads_7d,
+                "usage_28d": None if usage_unavailable else u.rule_reads_28d,
+                "sessions_7d": None if usage_unavailable else len(u.sessions_7d),
+                "sessions_28d": None if usage_unavailable else len(u.sessions_28d),
+                "maintenance_touches_28d": None if usage_unavailable else u.maintenance_touches_28d,
+                "last_used_at": None if usage_unavailable else (u.last_used_dt.isoformat() if u.last_used_dt else None),
                 "desc_chars": r.desc_chars,
                 "body_lines": r.body_lines,
                 "staleness_days": r.staleness_days,
@@ -1428,8 +1812,20 @@ def build_weekly_report(
             }
         )
 
-    skill_rows.sort(key=lambda r: (-r["usage_28d"], -r["desc_chars"], r["name"]))
-    rule_rows.sort(key=lambda r: (-r["usage_28d"], -r["desc_chars"], r["name"]))
+    skill_rows.sort(
+        key=lambda r: (
+            -(r["usage_28d"] if r["usage_28d"] is not None else -1),
+            -r["desc_chars"],
+            r["name"],
+        )
+    )
+    rule_rows.sort(
+        key=lambda r: (
+            -(r["usage_28d"] if r["usage_28d"] is not None else -1),
+            -r["desc_chars"],
+            r["name"],
+        )
+    )
 
     boundaries = analyze_boundaries_and_conflicts(skills, rules)
     coupling_hooks = analyze_coupling_and_hooks(
@@ -1441,11 +1837,9 @@ def build_weekly_report(
     hygiene_blind_spots = check_doc_hygiene_blind_spots(repo_root)
     git_sync = check_git_sync(repo_root, prod_root, use_git=use_git)
     context_audit = (
-        run_context_audit_summary(
-            repo_root, app_data_dir, now_dt=now_dt, days=days
-        )
+        run_context_audit_summary(app_data_dir, now_dt=now_dt, days=days)
         if include_context_audit
-        else {"status": "skipped"}
+        else {"status": "skipped", "error": "--include-context-audit 未指定"}
     )
 
     budget = {
@@ -1477,17 +1871,27 @@ def build_weekly_report(
     }
 
     inventory_candidates = {
-        "zero_usage_28d_skills": [
-            r["name"] for r in skill_rows if r["usage_28d"] == 0
-        ],
-        "zero_usage_28d_rules": [
-            r["name"] for r in rule_rows if r["usage_28d"] == 0
-        ],
-        "prune_or_merge_candidates": [
-            r["name"]
-            for r in skill_rows
-            if "prune_or_merge_candidate" in r["tags"]
-        ],
+        "usage_status": usage_status,
+        "usage_based_pruning_skipped": not usage_complete,
+        "zero_usage_28d_skills": (
+            [r["name"] for r in skill_rows if r["usage_28d"] == 0]
+            if usage_complete
+            else []
+        ),
+        "zero_usage_28d_rules": (
+            [r["name"] for r in rule_rows if r["usage_28d"] == 0]
+            if usage_complete
+            else []
+        ),
+        "prune_or_merge_candidates": (
+            [
+                r["name"]
+                for r in skill_rows
+                if "prune_or_merge_candidate" in r["tags"]
+            ]
+            if usage_complete
+            else []
+        ),
         "mechanization_candidates": [
             r["name"]
             for r in skill_rows
@@ -1513,7 +1917,10 @@ def build_weekly_report(
             "repo_root": str(repo_root),
             "prod_root": str(prod_root),
             "brain_dir_exists": tx_data["brain_dir_exists"],
+            "usage_status": usage_status,
+            "usage_complete": usage_complete,
             "total_transcripts": tx_data["total_transcripts"],
+            "unreadable_transcripts": tx_data["unreadable_transcripts"],
             "active_sessions_7d": tx_data["active_sessions_7d"],
             "active_sessions_28d": tx_data["active_sessions_28d"],
             "malformed_lines": tx_data["malformed_lines"],
@@ -1551,12 +1958,19 @@ def render_markdown(report: dict[str, Any]) -> str:
     gs = report["git_sync"]
     ca = report["context_audit"]
 
+    usage_note = (
+        f"`{meta['usage_status']}`（利用ゼロに基づく統廃合候補判定は省略）"
+        if not meta.get("usage_complete", True)
+        else "`ok`"
+    )
+
     lines: list[str] = [
         "# 週次 SKILL 監査定量レポート",
         "",
         f"- **計測時刻 (UTC)**: `{meta['generated_at']}`",
         f"- **計測窓**: 直近 `{meta['days']}` 日 / `{meta['window_days']}` 日",
-        f"- **ログ走査**: `{meta['total_transcripts']}` トランスクリプト（直近窓アクティブ `{meta['active_sessions_28d']}` セッション、7日 `{meta['active_sessions_7d']}` セッション）",
+        f"- **ログ走査**: `{meta['total_transcripts']}` トランスクリプト（読込不可 `{meta.get('unreadable_transcripts', 0)}` 件、直近窓アクティブ `{meta['active_sessions_28d']}` セッション、7日 `{meta['active_sessions_7d']}` セッション）",
+        f"- **利用集計状態**: {usage_note}",
         "",
         "## 1. 常時コンテキスト予算と規模サマリ",
         "",
@@ -1570,7 +1984,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     if ca.get("status") == "ok":
         lines.extend(
             [
-                f"### セッション指標比較 (`audit_context_metrics.py`, cutoff `{ca['cutoff']}`)",
+                f"### セッション指標比較 (`audit_context_metrics.py`, cutoff `{ca['cutoff']}`, until `{ca.get('until', '-')}`)",
                 "",
                 f"比較母数: before `{ca['before_sessions']}` 件 / after `{ca['after_sessions']}` 件",
                 "",
@@ -1584,6 +1998,16 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"| `{k}` | {_fmt_val(vals['before'], is_pct=is_pct)} | {_fmt_val(vals['after'], is_pct=is_pct)} | {_fmt_val(vals['delta_pct'])} |"
             )
         lines.append("")
+    else:
+        reason = ca.get("error") or ca.get("status") or "unknown"
+        lines.extend(
+            [
+                "### セッション指標比較 (`audit_context_metrics.py`)",
+                "",
+                f"- **状態**: `{ca.get('status', 'unknown')}`（詳細: {reason}）",
+                "",
+            ]
+        )
 
     lines.extend(
         [
@@ -1594,11 +2018,15 @@ def render_markdown(report: dict[str, Any]) -> str:
         ]
     )
     for r in report["skills"]:
-        triple = f"{r['skill_md_reads_28d']}/{r['aux_reads_28d']}/{r['script_runs_28d']}"
+        triple = (
+            "-"
+            if r["skill_md_reads_28d"] is None
+            else f"{r['skill_md_reads_28d']}/{r['aux_reads_28d']}/{r['script_runs_28d']}"
+        )
         st_info = f"{r['script_count']}/{r['test_case_count']}件"
         tags = ", ".join(f"`{t}`" for t in r["tags"]) if r["tags"] else "-"
         lines.append(
-            f"| `{r['name']}` | {r['usage_7d']} | {r['usage_28d']} | {triple} | {r['sessions_28d']} | {r['maintenance_touches_28d']} | {r['desc_chars']} | {r['body_lines']} | {st_info} | {tags} |"
+            f"| `{r['name']}` | {_fmt_val(r['usage_7d'])} | {_fmt_val(r['usage_28d'])} | {triple} | {_fmt_val(r['sessions_28d'])} | {_fmt_val(r['maintenance_touches_28d'])} | {r['desc_chars']} | {r['body_lines']} | {st_info} | {tags} |"
         )
     lines.append("")
 
@@ -1613,20 +2041,27 @@ def render_markdown(report: dict[str, Any]) -> str:
     for r in report["rules"]:
         tags = ", ".join(f"`{t}`" for t in r["tags"]) if r["tags"] else "-"
         lines.append(
-            f"| `{r['name']}` | {r['usage_7d']} | {r['usage_28d']} | {r['sessions_28d']} | {r['maintenance_touches_28d']} | {r['desc_chars']} | {r['body_lines']} | {tags} |"
+            f"| `{r['name']}` | {_fmt_val(r['usage_7d'])} | {_fmt_val(r['usage_28d'])} | {_fmt_val(r['sessions_28d'])} | {_fmt_val(r['maintenance_touches_28d'])} | {r['desc_chars']} | {r['body_lines']} | {tags} |"
         )
     lines.append("")
+
+    if cand.get("usage_based_pruning_skipped"):
+        skip_msg = f"判定省略（利用集計状態: `{cand.get('usage_status')}`）"
+        zero_skill_txt = skip_msg
+        zero_rule_txt = skip_msg
+        prune_txt = skip_msg
+    else:
+        zero_skill_txt = ", ".join(f"`{n}`" for n in cand["zero_usage_28d_skills"]) or "なし"
+        zero_rule_txt = ", ".join(f"`{n}`" for n in cand["zero_usage_28d_rules"]) or "なし"
+        prune_txt = ", ".join(f"`{n}`" for n in cand["prune_or_merge_candidates"]) or "なし"
 
     lines.extend(
         [
             "## 4. 機械化・統合・廃止の一次候補",
             "",
-            f"- **28日実利用ゼロのスキル ({len(cand['zero_usage_28d_skills'])}件)**: "
-            + (", ".join(f"`{n}`" for n in cand["zero_usage_28d_skills"]) or "なし"),
-            f"- **28日実利用ゼロのルール ({len(cand['zero_usage_28d_rules'])}件)**: "
-            + (", ".join(f"`{n}`" for n in cand["zero_usage_28d_rules"]) or "なし"),
-            f"- **統廃合・見直し候補 (`prune_or_merge_candidate`)**: "
-            + (", ".join(f"`{n}`" for n in cand["prune_or_merge_candidates"]) or "なし"),
+            f"- **28日実利用ゼロのスキル ({len(cand['zero_usage_28d_skills'])}件)**: {zero_skill_txt}",
+            f"- **28日実利用ゼロのルール ({len(cand['zero_usage_28d_rules'])}件)**: {zero_rule_txt}",
+            f"- **統廃合・見直し候補 (`prune_or_merge_candidate`)**: {prune_txt}",
             f"- **機械化候補 (`mechanization_candidate`)**: "
             + (", ".join(f"`{n}`" for n in cand["mechanization_candidates"]) or "なし"),
             f"- **description 圧縮候補 (>220文字)**: "
@@ -1664,10 +2099,39 @@ def render_markdown(report: dict[str, Any]) -> str:
                 or "なし"
             ),
             f"- **横断スクリプト import 結合**: {len(ch['cross_skill_imports'])} 件",
-            f"- **`PreToolUse` フックフォールバック発生**: 7d `{ch['pretool_fallback_7d']}` 件 / 28d `{ch['pretool_fallback_28d']}` 件",
-            f"- **REVIEW.md / .sloplintignore 実在切れ**: REVIEW={len(blind['missing_review_exclusions'])} 件, sloplintignore={len(blind['missing_slop_ignores'])} 件",
         ]
     )
+    for edge in ch["cross_skill_imports"]:
+        lines.append(
+            f"  - `{edge['from_skill']}/{edge['from_script']}` -> `{edge['to_skill']}` (`{edge['module']}`)"
+        )
+
+    hooks_list = ch.get("hooks") or []
+    if ch.get("hooks_error"):
+        hooks_txt = f"存在=True, 読込エラー={ch['hooks_error']}"
+    elif not ch.get("hooks_exists"):
+        hooks_txt = "hooks.json なし"
+    elif not hooks_list:
+        hooks_txt = "hooks.json あり（定義 0 件）"
+    else:
+        hooks_txt = "; ".join(
+            f"`{h['name']}` enabled={h['enabled']} timeout={h['timeouts']} cmd={h['commands']}"
+            for h in hooks_list
+        )
+    lines.append(f"- **`hooks.json` 状態**: {hooks_txt}")
+    lines.append(
+        f"- **`PreToolUse` フックフォールバック発生**: 7d `{ch['pretool_fallback_7d']}` 件 / 28d `{ch['pretool_fallback_28d']}` 件"
+    )
+
+    missing_rev = blind["missing_review_exclusions"]
+    missing_slop = blind["missing_slop_ignores"]
+    lines.append(
+        f"- **REVIEW.md / .sloplintignore 実在切れ**: REVIEW={len(missing_rev)} 件, sloplintignore={len(missing_slop)} 件"
+    )
+    for p in missing_rev:
+        lines.append(f"  - REVIEW.md 除外切れ: `{p}`")
+    for p in missing_slop:
+        lines.append(f"  - .sloplintignore 切れ: `{p}`")
 
     if not gs.get("skipped"):
         repo_g = gs.get("repo", {})
@@ -1768,11 +2232,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         now_dt = datetime.now(timezone.utc)
 
-    repo_root = args.repo.resolve()
+    raw_repo = args.repo.expanduser()
+    repo_root = raw_repo.resolve()
     if not repo_root.is_dir():
         print(f"エラー: --repo ディレクトリが見つかりません: {repo_root}", file=sys.stderr)
         return 2
-    prod_root = args.prod_root.expanduser()
+    raw_prod = args.prod_root.expanduser()
+    prod_root = raw_prod.resolve() if raw_prod.exists() else raw_prod
     app_data_dir = args.app_data_dir.expanduser()
 
     report = build_weekly_report(
@@ -1784,6 +2250,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         window_days=args.window_days,
         use_git=not args.no_git,
         include_context_audit=args.include_context_audit,
+        repo_root_aliases=(raw_repo,),
+        prod_root_aliases=(raw_prod,),
     )
 
     if args.format == "json":

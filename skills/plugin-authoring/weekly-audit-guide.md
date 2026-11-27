@@ -16,11 +16,13 @@ CI（`check_plugin.py`、`check_hygiene.py`、`run_all_tests.py`）は形式と�
 
 ## 実行手順
 
+監査対象は開発クローン（`E:\Documents\code\skills4agy`）に統一し、決定論的検査スクリプトの実行時は本番クローンへ `__pycache__` を残さないよう `python -B` を付与する。
+
 1. まず決定論的計測 CLI をオフラインで実行し、全 6 主眼の定量データを取得する。
 
 ```powershell
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python "$HOME/.gemini/config/plugins/shared-skills/skills/plugin-authoring/scripts/audit_skills_weekly.py" `
+python -B "$HOME/.gemini/config/plugins/shared-skills/skills/plugin-authoring/scripts/audit_skills_weekly.py" `
   --repo "E:\Documents\code\skills4agy" `
   --prod-root "$HOME\.gemini\config\plugins\shared-skills" `
   --days 7 `
@@ -29,13 +31,15 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/plugin-authoring/scrip
   --format markdown
 ```
 
-2. 構造検査、文体衛生、単体テストの現行状態を確認する。
+2. 監査対象である開発クローン（`E:\Documents\code\skills4agy`）上で構造検査、文体衛生、単体テストを実行する。
+   - 開発クローンと本番クローンが未同期の場合は、検査結果が開発クローン基準である旨と `git_sync` の `HEAD` 差分を週次レポートへ明記する。
 
 ```powershell
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python "$HOME/.gemini/config/plugins/shared-skills/skills/plugin-authoring/scripts/check_plugin.py"
-python "$HOME/.gemini/config/plugins/shared-skills/skills/plugin-authoring/scripts/check_hygiene.py"
-python "$HOME/.gemini/config/plugins/shared-skills/skills/plugin-authoring/scripts/run_all_tests.py"
+Set-Location "E:\Documents\code\skills4agy"
+python -B skills/plugin-authoring/scripts/check_plugin.py
+python -B skills/plugin-authoring/scripts/check_hygiene.py
+python -B skills/plugin-authoring/scripts/run_all_tests.py
 ```
 
 3. 環境変数 `GEMINI_API_KEY` が設定されている場合のみ、Decision 1 による陳腐化と機械化の一次スクリーニングを追加する。
@@ -44,8 +48,8 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/plugin-authoring/scrip
 
 ```powershell
 $env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"
-python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py" docs --repo "E:\Documents\code\skills4agy" --dry-run --format table
-python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py" docs --repo "E:\Documents\code\skills4agy" --format table
+python -B "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py" docs --repo "E:\Documents\code\skills4agy" --dry-run --format table
+python -B "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scripts/screen_drift_decision1.py" docs --repo "E:\Documents\code\skills4agy" --format table
 ```
 
 4. 取得した定量値と該当スキルの実ファイル照合に基づき、重点 2 軸の判定を下して週次監査レポート Artifact を生成する。
