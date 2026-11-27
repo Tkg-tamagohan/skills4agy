@@ -345,63 +345,116 @@ def _classify_path_origin(
     return "other"
 
 
-def _is_powershell_command(cmd_str: str, initial_cwd: str = "") -> bool:
-    """コマンド文字列と作業ディレクトリから PowerShell 構文か POSIX シェル構文かを推定する。"""
+def _extract_unquoted_text(cmd_str: str) -> str:
+    """シェル種別推定のため、引用符内部を空白へ置換したクォート外テキストを抽出する。"""
+    out: list[str] = []
+    quote: Optional[str] = None
+    i = 0
+    n = len(cmd_str)
+    while i < n:
+        ch = cmd_str[i]
+        if quote is not None:
+            if quote == '"' and ch == "\\" and i + 1 < n and cmd_str[i + 1] in ('"', "\\", "$", "`"):
+                i += 2
+                continue
+            if quote == '"' and ch == "`" and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(" ")
+            i += 2
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            out.append(" ")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _is_powershell_command(
+    cmd_str: str, initial_cwd: str = "", explicit_shell: str = ""
+) -> bool:
+    """明示シェル・作業ディレクトリ・クォート外構文から PowerShell か POSIX シェルかを判定する。"""
+    if explicit_shell:
+        low = explicit_shell.strip().lower()
+        if any(tok in low for tok in ("powershell", "pwsh")):
+            return True
+        if any(tok in low for tok in ("bash", "zsh", "fish", "dash", "sh")):
+            return False
     if initial_cwd:
         if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", initial_cwd):
             return True
+        if initial_cwd.startswith("/"):
+            return False
+    unquoted = _extract_unquoted_text(cmd_str)
     if re.search(
-        r"(?i)\b(?:Set-Location|Push-Location)\b|\$env:|[A-Za-z]:\\|`\r?\n",
-        cmd_str,
+        r"(?i)(?:^|[;&|\r\n])\s*(?:Set-Location|Push-Location|\$env:[A-Za-z_][A-Za-z0-9_]*\s*=)",
+        unquoted,
     ):
         return True
-    if initial_cwd and initial_cwd.startswith("/"):
-        return False
+    if re.search(r"(?:^|\s)[A-Za-z]:\\", unquoted):
+        return True
     return os.name == "nt"
 
 
 def _split_shell_segments(cmd_str: str, *, powershell: bool) -> list[str]:
-    """クォート外の区切り文字で単純コマンド列へ分割し、判定不能な構文セグメントは除外する。"""
-    joined = (
-        re.sub(r"`\r?\n\s*", " ", cmd_str)
-        if powershell
-        else re.sub(r"\\\r?\n\s*", " ", cmd_str)
-    )
+    """クォート外の区切り文字で単純コマンド列へ分割し、状態追跡で行継続を処理する。"""
     segments: list[str] = []
     buf: list[str] = []
     quote: Optional[str] = None
     unparseable = False
     i = 0
-    n = len(joined)
+    n = len(cmd_str)
     while i < n:
-        ch = joined[i]
+        ch = cmd_str[i]
         if quote is not None:
             if powershell:
                 if quote == '"':
-                    if ch == "`" and i + 1 < n:
-                        buf.append(ch)
-                        buf.append(joined[i + 1])
-                        i += 2
-                        continue
-                    if ch == '"' and i + 1 < n and joined[i + 1] == '"':
+                    if ch == "`":
+                        if i + 1 < n and cmd_str[i + 1] == "\n":
+                            i += 2
+                            continue
+                        if i + 2 < n and cmd_str[i + 1] == "\r" and cmd_str[i + 2] == "\n":
+                            i += 3
+                            continue
+                        if i + 1 < n:
+                            buf.append(ch)
+                            buf.append(cmd_str[i + 1])
+                            i += 2
+                            continue
+                    if ch == '"' and i + 1 < n and cmd_str[i + 1] == '"':
                         buf.append('""')
                         i += 2
                         continue
                     if ch == '"':
                         quote = None
                 elif quote == "'":
-                    if ch == "'" and i + 1 < n and joined[i + 1] == "'":
+                    if ch == "'" and i + 1 < n and cmd_str[i + 1] == "'":
                         buf.append("''")
                         i += 2
                         continue
                     if ch == "'":
                         quote = None
             else:
-                if quote == '"' and ch == "\\" and i + 1 < n and joined[i + 1] in ('"', "\\", "$", "`"):
-                    buf.append(ch)
-                    buf.append(joined[i + 1])
-                    i += 2
-                    continue
+                if quote == '"' and ch == "\\":
+                    if i + 1 < n and cmd_str[i + 1] == "\n":
+                        i += 2
+                        continue
+                    if i + 2 < n and cmd_str[i + 1] == "\r" and cmd_str[i + 2] == "\n":
+                        i += 3
+                        continue
+                    if i + 1 < n and cmd_str[i + 1] in ('"', "\\", "$", "`"):
+                        buf.append(ch)
+                        buf.append(cmd_str[i + 1])
+                        i += 2
+                        continue
                 if ch == quote:
                     quote = None
             buf.append(ch)
@@ -413,23 +466,42 @@ def _split_shell_segments(cmd_str: str, *, powershell: bool) -> list[str]:
             buf.append(ch)
             i += 1
             continue
-        if powershell and ch == "`" and i + 1 < n:
-            buf.append(ch)
-            buf.append(joined[i + 1])
-            i += 2
-            continue
+        if powershell and ch == "`":
+            if i + 1 < n and cmd_str[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 2 < n and cmd_str[i + 1] == "\r" and cmd_str[i + 2] == "\n":
+                i += 3
+                continue
+            if i + 1 < n:
+                buf.append(ch)
+                buf.append(cmd_str[i + 1])
+                i += 2
+                continue
+        if not powershell and ch == "\\":
+            if i + 1 < n and cmd_str[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 2 < n and cmd_str[i + 1] == "\r" and cmd_str[i + 2] == "\n":
+                i += 3
+                continue
+            if i + 1 < n:
+                buf.append(ch)
+                buf.append(cmd_str[i + 1])
+                i += 2
+                continue
         if (not powershell and ch == "`") or (
-            ch == "$" and i + 1 < n and joined[i + 1] in ("(", "{")
+            ch == "$" and i + 1 < n and cmd_str[i + 1] in ("(", "{")
         ):
             unparseable = True
-        if ch in (";", "|", "\r", "\n") or (ch == "&" and i + 1 < n and joined[i + 1] == "&"):
+        if ch in (";", "|", "\r", "\n") or (ch == "&" and i + 1 < n and cmd_str[i + 1] == "&"):
             seg = "".join(buf).strip()
             if seg and not unparseable:
                 segments.append(seg)
             buf = []
             unparseable = False
-            if (ch == "&" and i + 1 < n and joined[i + 1] == "&") or (
-                ch == "|" and i + 1 < n and joined[i + 1] == "|"
+            if (ch == "&" and i + 1 < n and cmd_str[i + 1] == "&") or (
+                ch == "|" and i + 1 < n and cmd_str[i + 1] == "|"
             ):
                 i += 2
             else:
@@ -551,10 +623,11 @@ def _extract_executed_python_scripts(
     *,
     initial_cwd: str,
     allow_unresolved_relative: bool,
+    explicit_shell: str = "",
 ) -> list[str]:
     """run_command 文字列から python 系実行コマンドのスクリプト引数パスだけを抽出する。"""
     current_cwd = normalize_posix_lower(initial_cwd).rstrip("/") if initial_cwd else ""
-    is_ps = _is_powershell_command(cmd_str, initial_cwd)
+    is_ps = _is_powershell_command(cmd_str, initial_cwd, explicit_shell=explicit_shell)
     results: list[str] = []
     for seg in _split_shell_segments(cmd_str, powershell=is_ps):
         tokens = _tokenize_segment(seg, powershell=is_ps)
@@ -1178,10 +1251,13 @@ def scan_transcripts(
                             continue
                         raw_cwd = args.get("Cwd") or args.get("cwd") or ""
                         initial_cwd = str(decode_tool_arg(raw_cwd) or "")
+                        raw_shell = args.get("Shell") or args.get("shell") or ""
+                        explicit_shell = str(decode_tool_arg(raw_shell) or "")
                         executed_paths = _extract_executed_python_scripts(
                             cmd_str,
                             initial_cwd=initial_cwd,
                             allow_unresolved_relative=same_root,
+                            explicit_shell=explicit_shell,
                         )
                         seen_in_call: set[tuple[str, str, str]] = set()
                         for full_tok in executed_paths:

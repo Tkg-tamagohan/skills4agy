@@ -483,6 +483,82 @@ class TestAuditSkillsWeekly(unittest.TestCase):
             toks = asw._tokenize_segment(segs[1], powershell=False)
             self.assertEqual(toks[-1], 'a "quoted; &&" b')
 
+            # 1. POSIX の表示文字列に含まれる "Set-Location ...; python ..." で誤判定・誤計上しないこと
+            quoted_ps_text = (
+                'printf \'%s\\n\' "Windows: \\"Set-Location /opt/prod_plugin; '
+                'python skills/alpha-skill/scripts/run_alpha.py; Get-Location\\""'
+            )
+            self.assertEqual(
+                asw._extract_executed_python_scripts(
+                    quoted_ps_text,
+                    initial_cwd="/opt/prod_plugin",
+                    allow_unresolved_relative=False,
+                ),
+                [],
+            )
+            with mock.patch.object(asw.os, "name", "posix"):
+                self.assertEqual(
+                    asw._extract_executed_python_scripts(
+                        quoted_ps_text,
+                        initial_cwd="",
+                        allow_unresolved_relative=True,
+                    ),
+                    [],
+                )
+            self.assertFalse(
+                asw._is_powershell_command(
+                    'Set-Location "C:\\\\prod\\\\"',
+                    initial_cwd="",
+                    explicit_shell="bash",
+                )
+            )
+            self.assertTrue(
+                asw._is_powershell_command(
+                    "echo ok",
+                    initial_cwd="",
+                    explicit_shell="powershell",
+                )
+            )
+
+            # 2. POSIX でエスケープ済みバックスラッシュ \\ 直後の改行が独立コマンド境界として扱われ、
+            #    単一 \ の行継続と両方正しく抽出されること
+            escaped_bs_multiline = (
+                "printf '%s\\n' \\\\\n"
+                "python -B skills/alpha-skill/scripts/run_alpha.py"
+            )
+            self.assertEqual(
+                asw._extract_executed_python_scripts(
+                    escaped_bs_multiline,
+                    initial_cwd="/opt/prod_plugin",
+                    allow_unresolved_relative=False,
+                ),
+                ["/opt/prod_plugin/skills/alpha-skill/scripts/run_alpha.py"],
+            )
+            line_cont_cmd = (
+                "python -B \\\n"
+                "skills/alpha-skill/scripts/run_alpha.py"
+            )
+            self.assertEqual(
+                asw._extract_executed_python_scripts(
+                    line_cont_cmd,
+                    initial_cwd="/opt/prod_plugin",
+                    allow_unresolved_relative=False,
+                ),
+                ["/opt/prod_plugin/skills/alpha-skill/scripts/run_alpha.py"],
+            )
+
+            # 3. Set-Location を使わず Windows ドライブ付き Cwd + cd "<path>\\" を使う経路（os.name 非依存）
+            with mock.patch.object(asw.os, "name", "posix"):
+                win_cd_cmd = 'cd "C:\\prod\\"; python -B skills/alpha-skill/scripts/run_alpha.py'
+                self.assertEqual(
+                    asw._extract_executed_python_scripts(
+                        win_cd_cmd,
+                        initial_cwd="C:\\work",
+                        allow_unresolved_relative=False,
+                    ),
+                    ["c:/prod/skills/alpha-skill/scripts/run_alpha.py"],
+                )
+
     def test_repo_alias_matches_maintenance_when_resolve_differs(self) -> None:
         """Windows 8.3 短縮名のように入力パスと resolve() 後が異なる場合でも保守作業として計上される。"""
         with tempfile.TemporaryDirectory() as tmp:
