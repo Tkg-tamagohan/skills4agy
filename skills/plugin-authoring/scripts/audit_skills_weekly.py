@@ -379,29 +379,6 @@ def _extract_unquoted_text(cmd_str: str) -> str:
     return "".join(out)
 
 
-def _count_posix_backticks(text: str) -> int:
-    """PowerShell の `` エスケープとトークン内空白エスケープ（<非空白>`<空白>）を除いたバッククォート数を返す。"""
-    count = 0
-    i = 0
-    n = len(text)
-    while i < n:
-        if text[i] == "`":
-            if i + 1 < n and text[i + 1] == "`":
-                i += 2
-                continue
-            if (
-                i > 0
-                and not text[i - 1].isspace()
-                and i + 1 < n
-                and text[i + 1] in (" ", "\t")
-            ):
-                i += 2
-                continue
-            count += 1
-        i += 1
-    return count
-
-
 def _has_powershell_line_continuation(unquoted: str) -> bool:
     """クォート外テキストに POSIX コマンド置換でない PowerShell バッククォート行継続があるか判定する。"""
     in_backtick_subst = False
@@ -409,17 +386,28 @@ def _has_powershell_line_continuation(unquoted: str) -> bool:
         if not raw_line.endswith("\n"):
             continue
         line = raw_line.rstrip("\r\n")
-        if (
-            not in_backtick_subst
-            and len(line) >= 2
-            and line[-1] == "`"
-            and line[-2] in (" ", "\t")
-        ):
-            before = line[:-1]
-            if before.strip() and _count_posix_backticks(before) % 2 == 0:
-                return True
-        if _count_posix_backticks(line) % 2 == 1:
-            in_backtick_subst = not in_backtick_subst
+        i = 0
+        n = len(line)
+        while i < n:
+            if line[i] == "`":
+                if in_backtick_subst:
+                    in_backtick_subst = False
+                    i += 1
+                    continue
+                if i + 1 < n and line[i + 1] == "`":
+                    i += 2
+                    continue
+                if i == n - 1:
+                    if i >= 1 and line[i - 1] in (" ", "\t") and line[:i].strip():
+                        return True
+                    in_backtick_subst = True
+                    i += 1
+                    continue
+                if i > 0 and not line[i - 1].isspace() and line[i + 1] in (" ", "\t"):
+                    i += 2
+                    continue
+                in_backtick_subst = True
+            i += 1
     return False
 
 
