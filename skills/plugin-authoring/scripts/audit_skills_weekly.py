@@ -379,6 +379,23 @@ def _extract_unquoted_text(cmd_str: str) -> str:
     return "".join(out)
 
 
+def _has_powershell_line_continuation(unquoted: str) -> bool:
+    """クォート外テキストに POSIX コマンド置換でない PowerShell バッククォート行継続があるか判定する。"""
+    in_backtick_subst = False
+    for raw_line in unquoted.splitlines(keepends=True):
+        if not raw_line.endswith("\n"):
+            continue
+        line = raw_line.rstrip("\r\n")
+        m = re.search(r"(`+)$", line)
+        if not in_backtick_subst and m and len(m.group(1)) % 2 == 1:
+            before = line[: m.start()]
+            if before.strip() and before.count("`") % 2 == 0:
+                return True
+        if line.count("`") % 2 == 1:
+            in_backtick_subst = not in_backtick_subst
+    return False
+
+
 def _is_powershell_command(
     cmd_str: str, initial_cwd: str = "", explicit_shell: str = ""
 ) -> bool:
@@ -397,7 +414,7 @@ def _is_powershell_command(
         return True
     if re.search(r"(?:^|[\s;&|])[A-Za-z]:\\", unquoted):
         return True
-    if re.search(r"(?<!`)(?:``)*`(?:\r?\n)", unquoted):
+    if _has_powershell_line_continuation(unquoted):
         return True
     if initial_cwd:
         if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", initial_cwd):
