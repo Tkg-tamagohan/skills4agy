@@ -1,6 +1,6 @@
 ---
 name: chrome-extension-real-input-testing
-description: MV3 Chrome 拡張を実 UI(trusted イベント)で検証するときに使用する。拡張 reload 後の content script 再注入、YouTube ボットウォール下での DOM レベル検証、isolated world でのプロパティ偽装不可、ミニプレイヤー検証、オーバーレイ位置の座標系、CDP や Playwright による修飾キー付きホイール送出、広告ブロッカー常駐環境での障害を扱う。拡張のビルドや基本設計は chrome-extensions、DevTools MCP の基本操作は chrome-devtools に委ねる。
+description: MV3 Chrome 拡張を実 UI(trusted イベント)で検証するときに使用する。reload 後の再注入、ボットウォール下の DOM 検証、isolated world 制約、ミニプレイヤー、オーバーレイ座標系、修飾キー付きホイール送出、広告ブロッカー障害を扱う。設計は chrome-extensions、DevTools 基本操作は chrome-devtools に委ねる。
 ---
 
 # Chrome 拡張(MV3)を実 UI で検証する際のノウハウ

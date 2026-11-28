@@ -12,6 +12,7 @@ description: Antigravity 過去ログを横断解析し、トークン消費、�
 ## 責任範囲の境界
 
 - **進行中セッションの引き継ぎ**：現在の会話を区切って次セッションへ渡す軽量メモ作成は `session-handoff` に委ねる。
+- **過去セッションの語句検索**：別会話で下した決定、却下案、エラー原因の原文を探す作業は `session-log-search` に委ねる。
 - **Decisions API の一般仕様**：エンドポイント仕様や質問型の詳細は `gemini-decisions-api` に委ねる。
 - **API キーの発行と登録**：`GEMINI_API_KEY` の取得と環境変数設定の案内は `scoped-secret-provisioning` に委ねる。
 - **Windows シェルの実行制約**：UTF-8 設定やパス引用の回避策は `windows-cli-pitfalls` に委ねる。

@@ -1,6 +1,6 @@
 ---
 name: cloudflare-access-setup
-description: Cloudflare Pages などのサイトを Cloudflare Access（Zero Trust）で保護する設定手順。Zero Trust 組織の作成、アプリケーションとポリシーの API での設定、メール OTP（IdP）の有効化、遮断と拒否の実機確認を扱う。公開サイトに非公開の管理ツールを併設するとき、Access の設定や確認を求められたときに使用する。CLI の一般作法は cf-cli、公開/非公開の構成判断は cloudflare-pages-private-admin に委ねる。
+description: Cloudflare Pages 等を Cloudflare Access（Zero Trust）で保護する手順。組織作成、API でのアプリとポリシー設定、メール OTP 有効化、遮断と拒否の実機確認を扱う。公開サイトに非公開管理画面を併設するときや Access 設定時に使用する。CLI は cf-cli、構成判断は cloudflare-pages-private-admin に委ねる。
 ---
 
 # Cloudflare Access の設定
