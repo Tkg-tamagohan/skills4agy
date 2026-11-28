@@ -171,7 +171,8 @@ class TestDecisionCommon(unittest.TestCase):
         self.assertEqual(ctx.exception.errno, errno.EACCES)
 
     def test_dc08_glob_rejects_trailing_newline(self) -> None:
-        """DC-08: glob_to_regex が \\Z 終端を使い、末尾改行付きパスを拒否して通常パスを許容する。"""
+        """DC-08: glob_to_regex がパターン前後空白除去と \\Z 終端を両立し、glob_match が末尾改行付きパスを拒否する。"""
+        self.assertIsNotNone(dc.glob_to_regex("\t*.md\u3000").match("guide.md"))
         self.assertIsNone(dc.glob_to_regex("*.md").match("guide.md\n"))
         self.assertFalse(dc.glob_match("docs/guide.md\n", "docs/**/*.md"))
         self.assertTrue(dc.glob_match("docs/guide.md", "docs/**/*.md"))

@@ -88,12 +88,19 @@ def emit_cli_error(
         print(f"ERROR [{code}]: {safe_msg}", file=target)
 
 
-def normalize_posix_rel_path(path_str: str) -> str:
+def _normalize_rel_separators(path_str: str, *, strip_whitespace: bool) -> str:
     """バックスラッシュをスラッシュへ揃え、先頭の ./ を除いた相対パス文字列を返す。"""
-    norm = path_str.replace("\\", "/").strip(" ")
+    norm = path_str.replace("\\", "/")
+    if strip_whitespace:
+        norm = norm.strip()
     while norm.startswith("./"):
         norm = norm[2:]
     return norm
+
+
+def normalize_posix_rel_path(path_str: str) -> str:
+    """バックスラッシュをスラッシュへ揃え、前後の空白と先頭の ./ を除いた相対パス文字列を返す。"""
+    return _normalize_rel_separators(path_str, strip_whitespace=True)
 
 
 def glob_to_regex(pattern: str) -> re.Pattern[str]:
@@ -123,8 +130,9 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
 
 
 def glob_match(path_str: str, pattern: str) -> bool:
-    """正規化済み POSIX 相対パスに対して ** を含む glob 一致判定を行う。"""
-    return bool(glob_to_regex(pattern).match(normalize_posix_rel_path(path_str)))
+    """POSIX 相対パス（前後空白・改行を除去せず区切りのみ正規化）に対して ** を含む glob 一致判定を行う。"""
+    norm_path = _normalize_rel_separators(path_str, strip_whitespace=False)
+    return bool(glob_to_regex(pattern).match(norm_path))
 
 
 def is_broken_pipe_error(exc: BaseException) -> bool:
