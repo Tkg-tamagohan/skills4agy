@@ -2964,6 +2964,8 @@ def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
                     entries += 1
                     if entries > MAX_DRIFT_GLOB_SCAN_ENTRIES:
                         return False
+                    if any(ord(ch) < 32 for ch in dname):
+                        return False
                     dpath = Path(dirpath) / dname
                     rel_dir_posix = dpath.relative_to(anchor).as_posix()
                     if not _glob_can_descend_into(rel_dir_posix, raw):
@@ -2976,6 +2978,8 @@ def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
                 for fname in filenames:
                     entries += 1
                     if entries > MAX_DRIFT_GLOB_SCAN_ENTRIES:
+                        return False
+                    if any(ord(ch) < 32 for ch in fname):
                         return False
                     full = Path(dirpath) / fname
                     rel_posix = full.relative_to(anchor).as_posix()

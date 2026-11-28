@@ -2596,6 +2596,52 @@ class TestPretoolGuard(unittest.TestCase):
                 expected = bool(dc.glob_to_regex(pat).match(rel_path))
                 self.assertEqual(pg._glob_path_match(rel_path, pat), expected)
 
+    def test_p2_46_drift_glob_rejects_control_chars_in_walk_entries(self) -> None:
+        """P2-46: os.walk 内のファイル名・ディレクトリ名に改行等の制御文字が含まれる場合は一致判定前に Stage 1 拒否する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            docs_dir = wt / "docs"
+            docs_dir.mkdir()
+
+            def _walk_newline_file(
+                _root: Any, *, followlinks: bool = False, onerror: Any = None
+            ) -> Any:
+                yield (str(docs_dir), [], ["guide.md\n"])
+
+            def _walk_newline_dir(
+                _root: Any, *, followlinks: bool = False, onerror: Any = None
+            ) -> Any:
+                dirs = ["sub\n"]
+                yield (str(docs_dir), dirs, [])
+                if "sub\n" in dirs:
+                    yield (str(docs_dir / "sub\n"), [], ["guide.md"])
+
+            for walk_fn in (_walk_newline_file, _walk_newline_dir):
+                with (
+                    self.subTest(walk_fn=walk_fn.__name__),
+                    mock.patch.object(
+                        pg,
+                        "_read_git_origin_url",
+                        return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+                    ),
+                    mock.patch.object(pg.os, "walk", side_effect=walk_fn),
+                    mock.patch.object(
+                        pg, "_is_safe_resolved_non_secret_file", return_value=True
+                    ),
+                    mock.patch.object(pg, "_is_reparse_or_symlink", return_value=False),
+                ):
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            'python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths "docs/**/*.md" --dry-run',
+                            cwd=str(wt),
+                        )
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

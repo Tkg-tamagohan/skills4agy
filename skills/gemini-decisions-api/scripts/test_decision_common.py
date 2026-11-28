@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""decision_common.py の単体テスト（テスト ID: DC-01–DC-07）。
+"""decision_common.py の単体テスト（テスト ID: DC-01–DC-08）。
 
 数値判定・抽出、usage 集計、Markdown 表セル整形、エラー出力マスク、POSIX glob 一致、およびパイプ切断時の安全な標準出力書き込みを検証する。
 """
@@ -169,6 +169,12 @@ class TestDecisionCommon(unittest.TestCase):
         with self.assertRaises(OSError) as ctx:
             dc.safe_write_stdout("x", stream=_RecordingStream(write_exc=OSError(errno.EACCES, "denied")))
         self.assertEqual(ctx.exception.errno, errno.EACCES)
+
+    def test_dc08_glob_rejects_trailing_newline(self) -> None:
+        """DC-08: glob_to_regex が \\Z 終端を使い、末尾改行付きパスを拒否して通常パスを許容する。"""
+        self.assertIsNone(dc.glob_to_regex("*.md").match("guide.md\n"))
+        self.assertFalse(dc.glob_match("docs/guide.md\n", "docs/**/*.md"))
+        self.assertTrue(dc.glob_match("docs/guide.md", "docs/**/*.md"))
 
 
 if __name__ == "__main__":

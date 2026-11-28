@@ -90,7 +90,7 @@ def emit_cli_error(
 
 def normalize_posix_rel_path(path_str: str) -> str:
     """バックスラッシュをスラッシュへ揃え、先頭の ./ を除いた相対パス文字列を返す。"""
-    norm = path_str.replace("\\", "/").strip()
+    norm = path_str.replace("\\", "/").strip(" ")
     while norm.startswith("./"):
         norm = norm[2:]
     return norm
@@ -118,7 +118,7 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
         else:
             parts.append(re.escape(pat[i]))
             i += 1
-    parts.append("$")
+    parts.append(r"\Z")
     return re.compile("".join(parts))
 
 
