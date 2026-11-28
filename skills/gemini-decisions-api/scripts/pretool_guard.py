@@ -2258,25 +2258,15 @@ def _has_reparse_in_tree(root: Path, target: Path) -> bool:
     return False
 
 
-def _is_safe_non_secret_existing_file(path_str: str, *, cwd: str = "") -> bool:
-    """--body-file / -F 等に渡されるファイルパスが安全で、実在時はリンク/秘密混入がないか検証する。"""
-    raw = (path_str or "").strip()
-    if not raw or raw == "-" or any(ord(ch) < 32 for ch in raw):
-        return False
-    if any(ch in raw for ch in "*?[]"):
-        return False
-    if _is_secret_file_path(raw):
-        return False
-    expanded = _expand_safe_path_vars(raw)
-    if expanded is None:
-        return False
-    base_cwd = Path(cwd) if cwd else Path.cwd()
-    cand = Path(expanded) if Path(expanded).is_absolute() else (base_cwd / expanded)
+def _is_safe_resolved_non_secret_file(
+    cand: Path, *, base_cwd: Path | None = None, is_relative: bool = False
+) -> bool:
+    """解決済みファイルが存在時にリンク・バイナリ・秘密混入なしの一時検査安全ファイルか検証する。"""
     if not os.path.lexists(cand):
         return True
     if _is_reparse_or_symlink(cand) or not cand.is_file():
         return False
-    if not Path(expanded).is_absolute() and _has_reparse_in_tree(base_cwd, cand):
+    if is_relative and base_cwd is not None and _has_reparse_in_tree(base_cwd, cand):
         return False
     try:
         if cand.stat().st_size > MAX_SAFE_INSPECT_FILE_BYTES:
@@ -2290,6 +2280,26 @@ def _is_safe_non_secret_existing_file(path_str: str, *, cwd: str = "") -> bool:
     if _has_inline_secret_literal(text, strict_shell_quotes=False):
         return False
     return True
+
+
+def _is_safe_non_secret_existing_file(path_str: str, *, cwd: str = "") -> bool:
+    """--body-file / -F 等に渡されるファイルパスが安全で、実在時はリンク/秘密混入がないか検証する。"""
+    raw = (path_str or "").strip()
+    if not raw or raw == "-" or any(ord(ch) < 32 for ch in raw):
+        return False
+    if any(ch in raw for ch in "*?[]"):
+        return False
+    if _is_secret_file_path(raw):
+        return False
+    expanded = _expand_safe_path_vars(raw)
+    if expanded is None:
+        return False
+    base_cwd = Path(cwd) if cwd else Path.cwd()
+    is_relative = not Path(expanded).is_absolute()
+    cand = (base_cwd / expanded) if is_relative else Path(expanded)
+    return _is_safe_resolved_non_secret_file(
+        cand, base_cwd=base_cwd, is_relative=is_relative
+    )
 
 
 def _is_safe_temp_output_path(target: str, *, cwd: str = "") -> bool:
@@ -2782,9 +2792,7 @@ def _glob_can_descend_into(rel_dir_posix: str, pattern: str) -> bool:
         return True
     for idx, pat_seg in enumerate(pat_parts):
         if "**" in pat_seg:
-            if idx >= len(dir_parts):
-                return True
-            return dc.glob_match(dir_parts[idx], pat_seg)
+            return True
         if idx >= len(dir_parts):
             return True
         if not dc.glob_match(dir_parts[idx], pat_seg):
@@ -2856,10 +2864,10 @@ def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
                         return False
                     dpath = Path(dirpath) / dname
                     rel_dir_posix = dpath.relative_to(anchor).as_posix()
-                    if _is_reparse_or_symlink(dpath):
-                        if _glob_can_descend_into(rel_dir_posix, raw):
-                            return False
+                    if not _glob_can_descend_into(rel_dir_posix, raw):
                         continue
+                    if _is_reparse_or_symlink(dpath):
+                        return False
                     kept_dirs.append(dname)
                 dirnames[:] = kept_dirs
 
@@ -2878,7 +2886,9 @@ def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
                         return False
                     if _is_secret_file_path(rel_posix):
                         return False
-                    if not _is_safe_non_secret_existing_file(rel_posix, cwd=str(anchor)):
+                    if not _is_safe_resolved_non_secret_file(
+                        full, base_cwd=anchor, is_relative=True
+                    ):
                         return False
             if walk_error:
                 return False

@@ -2331,6 +2331,92 @@ class TestPretoolGuard(unittest.TestCase):
                         )
                     )
 
+    def test_p2_41_drift_glob_brackets_filename_and_input_separation(self) -> None:
+        """P2-41: グロブ一致先の角括弧ファイル名 [draft].md を allow し、秘密入り [secret].md と非グロブ --input [draft].md を拒否する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / "skills" / "test-suite-pruning" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            (wt / "skills" / "test-suite-pruning" / "scripts" / "screen_tests_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            docs_dir = wt / "docs"
+            docs_dir.mkdir()
+            (docs_dir / "[draft].md").write_text("# draft notes\n", encoding="utf-8")
+
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                ok_res = pg.evaluate_stage1(
+                    "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                    cwd=str(wt),
+                )
+                self.assertIsNotNone(ok_res)
+                self.assertEqual(ok_res[0], "allow")
+
+                # 非グロブ引数 (--input) は既存方針どおり角括弧をワイルドカード構文として拒否する
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        "python skills/test-suite-pruning/scripts/screen_tests_decision1.py --input docs/[draft].md --dry-run",
+                        cwd=str(wt),
+                    )
+                )
+
+                # 秘密情報を含む [secret].md は実ファイル検査で拒否する
+                (docs_dir / "[secret].md").write_text(
+                    "token=" + ("ghp_" + "F" * 36) + "\n", encoding="utf-8"
+                )
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                        cwd=str(wt),
+                    )
+                )
+
+    def test_p2_42_drift_glob_prunes_unreachable_dirs(self) -> None:
+        """P2-42: *.md 等で非到達のサブディレクトリを枝刈りし、大量ファイル配下でも MAX_DRIFT_GLOB_SCAN_ENTRIES を消費せず allow する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            (wt / "README.md").write_text("# root readme\n", encoding="utf-8")
+            heavy_dir = wt / "heavy_dir"
+            heavy_dir.mkdir()
+            for idx in range(15):
+                (heavy_dir / f"item_{idx:02d}.md").write_text("# heavy\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(
+                    pg,
+                    "_read_git_origin_url",
+                    return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+                ),
+                mock.patch.object(pg, "MAX_DRIFT_GLOB_SCAN_ENTRIES", 5),
+            ):
+                ok_res = pg.evaluate_stage1(
+                    "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths *.md --dry-run",
+                    cwd=str(wt),
+                )
+                self.assertIsNotNone(ok_res)
+                self.assertEqual(ok_res[0], "allow")
+
+                # 到達対象ディレクトリ内のエントリ数が上限を超える場合はフェイルクローズで拒否
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths heavy_dir/**/*.md --dry-run",
+                        cwd=str(wt),
+                    )
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
