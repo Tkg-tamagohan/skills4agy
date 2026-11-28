@@ -46,6 +46,7 @@ description: 任意の Git リポジトリの git diff とルール文書を Gem
 
 差分取得では `git -c core.quotePath=false diff --no-ext-diff --unified=15` を UTF-8 で実行し、バイナリ差分とロックファイル（`Cargo.lock`、`package-lock.json`、`pnpm-lock.yaml`、`yarn.lock`、`uv.lock`、`poetry.lock`）を既定除外する。
 変更ファイルに `.env` 系（`.env.example` 等の雛形を除く）が含まれる場合、または追加行や文脈行に秘密鍵ヘッダ（`BEGIN ... PRIVATE KEY` 等）や主要 API トークン形式（`AIza...`、`ghp_` や `github_pat_` 等の GitHub トークン、`sk-...`、`AKIA...`、`cog_...`）が含まれる場合は、API 送信前に終了コード `2` で遮断する（エラー出力に実値は出さない）。
+テスト用のダミーキーは秘密トークン判定長を下回る短い文字列（例: AIza 以降 20 文字未満）にし、誤って遮断（終了コード 2）を踏まないようにする。
 入力文字数が既定上限 `400,000` 文字を超える場合、または質問数が `1,000` 問を超える場合は無言で切り詰めず、終了コード `2` で `--paths` や `--rules` による分割を案内する。
 
 ## 実行手順
@@ -72,6 +73,7 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts
   --base main --paths "src/**" --rules "$HOME/.gemini/config/plugins/shared-skills/skills/systems-pre-pr-audit/SKILL.md" --strict
 ```
 
+`--base <ref>` はコミット済み差分（`base...HEAD`）のみを対象とし、未コミットの変更だけでは `skipped_empty_diff` になるため、追跡済みファイルの未コミット変更には引数なし実行（ステージ済みなら `--staged`）や `--diff-file` を、未追跡ファイルも含む作業ツリー全体の検査には `pr_ops.py invariant-check` を使う。
 呼び出し経路は `--backend auto`（既定）で `google-genai >= 3.2.0`（`api_version="v1beta"`）を優先し、`ImportError` または `client.decisions` 不在時は `run_decisions.py` 経由の REST へ自動で切り替える。
 
 ## 閾値と終了コード

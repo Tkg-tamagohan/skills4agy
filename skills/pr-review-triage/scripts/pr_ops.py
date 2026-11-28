@@ -2,7 +2,7 @@
 """PR レビュー運用（状態取得・不変条件検査・トリアージ反映・安全コミット＆push）統合 CLI。
 
 外部依存を持たず Python 標準ライブラリのみで動作し、
-全サブコマンドで秘密情報・BOM・置換文字 (U+FFFD)・保護ブランチ操作を事前検査する。
+全サブコマンドで秘密情報・BOM・置換文字 (U+FFFD)・想定外 ASCII 制御文字・単独 CR・保護ブランチ操作を事前検査する。
 """
 
 from __future__ import annotations
@@ -75,6 +75,45 @@ GITHUB_PR_URL_RE = re.compile(
 GITHUB_REMOTE_RE = re.compile(
     r"^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
+UNEXPECTED_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\r(?!\n)")
+
+
+def _find_unexpected_control_char_codes(text: str) -> list[str]:
+    """想定外 ASCII 制御文字または単独 CR のコードポイントを重複なく返す。"""
+    seen: set[str] = set()
+    codes: list[str] = []
+    for match in UNEXPECTED_CONTROL_CHAR_RE.finditer(text):
+        code = f"U+{ord(match.group(0)):04X}"
+        if code not in seen:
+            seen.add(code)
+            codes.append(code)
+    return codes
+
+
+def _has_unexpected_control_chars(text: str) -> bool:
+    """想定外 ASCII 制御文字または単独 CR を含むか判定する。"""
+    return bool(UNEXPECTED_CONTROL_CHAR_RE.search(text))
+
+
+def _iter_pr_text_bodies(pr_data: Any) -> list[str]:
+    """PR データ内の本文・コメント・レビュー本文を空白除去せず列挙する。"""
+    if not isinstance(pr_data, dict):
+        return []
+    bodies: list[str] = []
+    if isinstance(pr_data.get("body"), str):
+        bodies.append(pr_data["body"])
+    for key in ("comments", "reviews"):
+        raw = pr_data.get(key)
+        if isinstance(raw, dict):
+            items = raw.get("nodes") or []
+        elif isinstance(raw, list):
+            items = raw
+        else:
+            items = []
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("body"), str):
+                bodies.append(item["body"])
+    return bodies
 
 PROTECTED_BRANCHES = frozenset(
     {
@@ -298,8 +337,14 @@ def _validate_non_secret_path(path_str: str, label: str, *, cwd: Path | None = N
     return target
 
 
-def _validate_text_hygiene(text: str, label: str, *, forbid_ufffd: bool = True) -> None:
-    """秘密情報パターン、Bearer トークン、U+FFFD を検査する。"""
+def _validate_text_hygiene(
+    text: str,
+    label: str,
+    *,
+    forbid_ufffd: bool = True,
+    forbid_control_chars: bool = True,
+) -> None:
+    """秘密情報パターン、Bearer トークン、U+FFFD、想定外制御文字を検査する。"""
     hits = decision_hygiene.scan_text_for_secrets(text)
     if hits:
         raise PrOpsError(
@@ -316,6 +361,13 @@ def _validate_text_hygiene(text: str, label: str, *, forbid_ufffd: bool = True) 
             "replacement_char_detected",
             f"{label} に置換文字 (U+FFFD) が含まれています。",
         )
+    if forbid_control_chars:
+        ctrl_codes = _find_unexpected_control_char_codes(text)
+        if ctrl_codes:
+            raise PrOpsError(
+                "control_char_detected",
+                f"{label} に想定外の ASCII 制御文字または単独 CR（{', '.join(ctrl_codes)}）が含まれています。",
+            )
 
 
 def _read_text_file_checked(
@@ -324,8 +376,9 @@ def _read_text_file_checked(
     *,
     cwd: Path | None = None,
     forbid_ufffd: bool = True,
+    forbid_control_chars: bool = True,
 ) -> str:
-    """BOM なし UTF-8・リンク拒否・機密検査・U+FFFD 検査を通した上でファイルを読み込む。"""
+    """BOM なし UTF-8・リンク拒否・機密検査・U+FFFD・制御文字検査を通した上でファイルを読み込む。"""
     target = _validate_non_secret_path(path_str, label, cwd=cwd)
     if not target.exists() or not target.is_file():
         raise PrOpsError("input_not_found", f"{label} が見つかりません: {path_str}")
@@ -346,7 +399,12 @@ def _read_text_file_checked(
     except UnicodeDecodeError as exc:
         raise PrOpsError("input_decode_error", f"{label} を UTF-8 として読めません ({path_str}): {exc}") from exc
 
-    _validate_text_hygiene(text, label, forbid_ufffd=forbid_ufffd)
+    _validate_text_hygiene(
+        text,
+        label,
+        forbid_ufffd=forbid_ufffd,
+        forbid_control_chars=forbid_control_chars,
+    )
     return text
 
 
@@ -356,15 +414,27 @@ def _read_json_file_checked(
     *,
     cwd: Path | None = None,
     forbid_ufffd: bool = True,
+    forbid_control_chars: bool = True,
 ) -> Any:
-    text = _read_text_file_checked(path_str, label, cwd=cwd, forbid_ufffd=forbid_ufffd)
+    text = _read_text_file_checked(
+        path_str,
+        label,
+        cwd=cwd,
+        forbid_ufffd=forbid_ufffd,
+        forbid_control_chars=forbid_control_chars,
+    )
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise PrOpsError("invalid_json", f"{label} の JSON パースに失敗しました: {exc}") from exc
 
     for field_name, val in decision_hygiene.iter_string_fields(data, label):
-        _validate_text_hygiene(val, field_name, forbid_ufffd=forbid_ufffd)
+        _validate_text_hygiene(
+            val,
+            field_name,
+            forbid_ufffd=forbid_ufffd,
+            forbid_control_chars=forbid_control_chars,
+        )
     return data
 
 
@@ -740,6 +810,8 @@ def _format_status_summary(payload: dict[str, Any]) -> str:
         lines.append(
             f"Devin Review: decision={devin.get('decision')} | can_conclude_clean={devin.get('can_conclude_clean')} | exit_code={payload.get('devin_review_exit_code')}"
         )
+    if pr.get("body_control_char_found"):
+        lines.append("WARNING: PR 本文に想定外の ASCII 制御文字または単独 CR が含まれています。")
     return "\n".join(lines)
 
 
@@ -767,6 +839,7 @@ def handle_status(args: argparse.Namespace, *, runner: CommandRunner) -> int:
 
     head_oid = str(pr_data.get("headRefOid") or graphql_head or "")
     pr_url = str(pr_data.get("url") or f"https://github.com/{repo}/pull/{pr_num}")
+    body_control_char_found = _has_unexpected_control_chars(str(pr_data.get("body") or ""))
 
     payload: dict[str, Any] = {
         "ok": True,
@@ -779,6 +852,7 @@ def handle_status(args: argparse.Namespace, *, runner: CommandRunner) -> int:
             "headRefName": str(pr_data.get("headRefName") or ""),
             "headRefOid": head_oid,
             "baseRefName": str(pr_data.get("baseRefName") or ""),
+            "body_control_char_found": body_control_char_found,
             "comments_count": len(pr_data.get("comments") or []) if isinstance(pr_data.get("comments"), list) else 0,
             "reviews_count": len(pr_data.get("reviews") or []) if isinstance(pr_data.get("reviews"), list) else 0,
         },
@@ -1072,7 +1146,13 @@ def handle_invariant_check(args: argparse.Namespace, *, runner: CommandRunner) -
     resolved_base_sha = _resolve_base_commit(args.base, git_cwd, runner)
 
     if args.pr_json:
-        pr_data = _read_json_file_checked(args.pr_json, "--pr-json", cwd=cwd, forbid_ufffd=False)
+        pr_data = _read_json_file_checked(
+            args.pr_json,
+            "--pr-json",
+            cwd=cwd,
+            forbid_ufffd=False,
+            forbid_control_chars=False,
+        )
     else:
         repo, pr_num = _resolve_repo_and_pr(args.repo, args.pr, cwd, runner)
         pr_data = _fetch_pr_view(pr_num, repo, cwd, runner, fields="body,comments,reviews")
@@ -1397,22 +1477,21 @@ def handle_apply_triage(args: argparse.Namespace, *, runner: CommandRunner) -> i
         merged_after = pr_guardrails.merge_guardrails(sources_after)
         unresolved_after = [t["id"] for t in threads_after if not t["isResolved"]]
 
-        ufffd_found = False
-        for src in sources_after:
-            if "\ufffd" in (src.get("body") or ""):
-                ufffd_found = True
-                break
-        if not ufffd_found:
-            for th in threads_after:
-                if any("\ufffd" in (c.get("body") or "") for c in th.get("comments") or []):
-                    ufffd_found = True
-                    break
+        verify_texts = _iter_pr_text_bodies(pr_after)
+        for th in threads_after:
+            for comment in th.get("comments") or []:
+                if isinstance(comment, dict) and isinstance(comment.get("body"), str):
+                    verify_texts.append(comment["body"])
+
+        ufffd_found = any("\ufffd" in text for text in verify_texts)
+        control_char_found = any(_has_unexpected_control_chars(text) for text in verify_texts)
 
         commit_match = (head_after.lower() == effective_sha) if effective_sha is not None else None
         guardrails_strict_ok = len(merged_after["warnings"]) == 0
         verification_ok = (
             guardrails_strict_ok
             and not ufffd_found
+            and not control_char_found
             and (commit_match is not False)
         )
         result["verification"] = {
@@ -1424,6 +1503,7 @@ def handle_apply_triage(args: argparse.Namespace, *, runner: CommandRunner) -> i
             "guardrails_warnings": merged_after["warnings"],
             "guardrails_active_count": merged_after["active_count"],
             "ufffd_found": ufffd_found,
+            "control_char_found": control_char_found,
         }
         if not verification_ok:
             result["ok"] = False
@@ -1457,7 +1537,7 @@ def _validate_stage_file_arg(raw_path: str, cwd: Path) -> str:
                 raw_bytes = target.read_bytes()
                 if b"\x00" not in raw_bytes:
                     text = raw_bytes.decode("utf-8", errors="replace")
-                    _validate_text_hygiene(text, f"--files ({cleaned})", forbid_ufffd=False)
+                    _validate_text_hygiene(text, f"--files ({cleaned})", forbid_ufffd=False, forbid_control_chars=False)
         except OSError as exc:
             raise PrOpsError("input_read_error", f"ステージ対象ファイルを読めません ({cleaned}): {exc}") from exc
     return cleaned

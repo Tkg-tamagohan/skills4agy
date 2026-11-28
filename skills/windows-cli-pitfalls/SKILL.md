@@ -96,22 +96,8 @@ Python スクリプトの標準入力へ UTF-8 テキストを渡すときはパ
 PR や Issue の本文は一時ファイルに書き出して `--body-file` で渡し、GraphQL ミューテーションは Python から `subprocess.run` で呼び、`json.dumps` で本文を JSON 文字列化して渡す。
 `git commit -F <temp_file>` や `gh pr comment --body-file <temp_file>` へ渡す日本語一時ファイルはリポジトリ外（`$env:TEMP` や `<Artifact Directory Path>/scratch/`）へ UTF-8（BOM なし）で作成し、実行後に削除する。
 PowerShell 5.1 の `Set-Content -Encoding UTF8` と `Out-File -Encoding UTF8` は先頭へ BOM（`\ufeff`）を付与するため使わず、Python の `encoding="utf-8"` または `[System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))` で書き出す。
-
-```python
-import json, subprocess
-q = 'mutation { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: "%s", body: %s}) { comment { id } } }' % (tid, json.dumps("日本語の返信本文", ensure_ascii=False))
-r = subprocess.run(["gh", "api", "graphql", "-f", "query=" + q], capture_output=True, text=True, encoding="utf-8")
-print(r.stdout)
-```
-
-```powershell
-# NG（Set-Content -Encoding UTF8 は BOM \ufeff を付与し、作業ツリーへ一時ファイルが残り得る）
-"日本語コミットメッセージ" | Set-Content -Path commit_msg.txt -Encoding UTF8; git commit -F commit_msg.txt
-# OK（リポジトリ外へ BOM なし UTF-8 で書き出し、実行後に削除する）
-$msg = Join-Path $env:TEMP "commit_msg.txt"
-[System.IO.File]::WriteAllText($msg, "日本語コミットメッセージ", [System.Text.UTF8Encoding]::new($false))
-git commit -F $msg; Remove-Item $msg
-```
+PowerShell 5.1 の二重引用文字列 `"..."` やヒアストリング `@"..."@` は、一時ファイル書き出し時でも Markdown のバッククォート（`` `a ``、`` `b ``、`` `f ``、`` `n ``、`` `r ``、`` `t ``、`` `v ``、`` `0 ``）を ASCII 制御文字へ展開し、PR 本文や JSON 返信を破壊する。
+Markdown 本文や JSON を生成するときは `write_file`、単一引用ヒアストリング `@'...'@`、または Python を使い、二重引用符や `@"..."@` を通さない（詳細なコード例は `references/ps51-examples.md` を参照する）。
 
 ## PowerShell 5.1 における外部コマンド引数の引用符剥離と $ 展開
 
@@ -120,23 +106,7 @@ Windows PowerShell 5.1 はネイティブ実行ファイル（`gh.exe`、`python
 また、PowerShell のエスケープ文字はバックスラッシュではなくバッククォートであるため、二重引用 `"..."` の内側に `\$owner` のような GraphQL 変数や `\"` を書いても PowerShell が解釈し、`Variable reference is not valid` や `SyntaxError: unterminated string literal` を起こす。
 短いワンライナーでは外側を二重引用 `"`、内側を単一引用 `'` にして `"` の剥離を防ぐ。
 `--jq` の複雑な整形や二重引用を含む処理、あるいは `$` や正規表現のバックスラッシュ、バッククォートを含む処理は `<Artifact Directory Path>/scratch/` 配下へ `.py` ファイルとして保存し、`gh ... --json` の出力を `json.loads` で処理する。
-
-```powershell
-# NG（シングルクォート内でも " が剥離し、二重引用内では $ と \" が崩れる）
-gh pr view 5 --json body --jq '.body | split("\n")'
-python -c 'import pathlib; print(pathlib.Path("a.txt").read_text("utf-8"))'
-gh api graphql -f query="query(\$num: Int!) { ... }"
-# OK（短いワンライナーは外側を二重引用、内側を単一引用にし、複雑な処理は scratch/*.py へ保存する）
-python -c "import pathlib; print(pathlib.Path('a.txt').read_text('utf-8'))"
-$env:PYTHONUTF8="1"; $env:PYTHONIOENCODING="utf-8"; python "...\scratch\inspect_pr.py"
-```
-
-```python
-# scratch/inspect_pr.py（--jq の複雑な整形を避け json.loads で処理する）
-import json, subprocess
-r = subprocess.run(["gh", "pr", "view", "5", "--json", "body"], capture_output=True, text=True, encoding="utf-8", check=True)
-print(json.loads(r.stdout)["body"].splitlines())
-```
+具体的な NG と OK の対比および `scratch/inspect_pr.py` の例は `references/ps51-examples.md` を参照する。
 
 ## PowerShell 5.1 の UTF-8 読み取り、Start-Process 引用、.NET 例外
 
@@ -145,18 +115,7 @@ PowerShell 5.1 の `Get-Content` は既定エンコーディングがシステ�
 PowerShell 5.1 の `-Command` 等では `.NET` メソッド（`TcpClient.Connect` 等）が例外を投げても既定では後続文が実行され終了コード 0 になるため、冒頭で `$ErrorActionPreference = 'Stop'` を設定し `try/finally` で後処理と失敗終了を両立させる。
 また、`.NET` メソッド例外は `System.Management.Automation.MethodInvocationException` に包まれるため、リトライや原因種別の判定では `$_.Exception` 単体ではなく `.InnerException` 連鎖を展開して照合する。
 PowerShell 6/7（`pwsh`）配下や混在環境から Windows PowerShell 5.1（`powershell.exe`）を起動すると引き継いだ `PSModulePath` で `Get-Acl` や `Set-Acl` 等のセキュリティモジュール読込が壊れるため、起動直後に既定配置の PS 6/7 パス（独自の 5.1 モジュールパスに `PowerShell` を含む場合やカスタム配置の `pwsh` がある場合は固有パスで絞る）を除去し `$PSHOME\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1` を明示インポートする。
-
-```powershell
-# UTF-8 読み取り / Start-Process の空白パス保護
-$text = [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false))
-Start-Process -FilePath $exe -ArgumentList @("--config", "`"C:\Program Files\App\cfg.json`"")
-# .NET 例外で失敗終了させ、原因判定時は InnerException 連鎖を辿る
-$ErrorActionPreference = 'Stop'; $c = New-Object Net.Sockets.TcpClient
-try { $c.Connect('127.0.0.1', 8080) } finally { $c.Dispose() }
-# 既定配置の PS 6/7 由来 PSModulePath を除去し Security モジュールを明示読込
-$env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '\\PowerShell(\\|$)' }) -join ';'
-Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -Force
-```
+UTF-8 読み取り、空白パス保護、`.NET` 例外の失敗終了、`PSModulePath` 整理の具体例は `references/ps51-examples.md` を参照する。
 
 ## Select-Object -First による上流コマンドの非ゼロ終了
 
@@ -192,6 +151,7 @@ Git Bash と Windows プロセスを併用する場合、Git Bash では `$TEMP`
 - 外部コマンド引数へホーム配下のパスを渡すときは、PowerShell と bash の双方で展開される二重引用の `"$HOME/..."` を使う。
 - PowerShell で `.ps1` ラッパーが実行ポリシーで拒否されるコマンドは `.cmd`（例: `pnpm.cmd`）を明示する。
 - 文字化けや `Bad unicode escape` はシェル引数やパイプの文字コードを疑い、`--body-file` や `git commit -F` にはリポジトリ外へ作成した BOM なし UTF-8 一時ファイルを渡して実行後に削除し、GraphQL ミューテーションは Python の `subprocess.run` へ逃がす。
+- Markdown のバッククォートを含む PR 本文や JSON は PowerShell の `"..."` や `@"..."@` で生成せず、`write_file`、`@'...'@`、または Python で BOM なし UTF-8 へ書き出す。
 - 短いワンライナーは外側を二重引用、内側を単一引用にし、シングルクォート内に二重引用符を含む `--jq` 式や `$`、`\"`、バックスラッシュを含む処理は `scratch/*.py` へ保存して `json.loads` 等で処理する。
 - Python 由来の decode と encode のエラーは `$env:PYTHONUTF8="1"` と `$env:PYTHONIOENCODING="utf-8"` で環境側を直す（共有スクリプト自体に環境依存の差分を入れない）。
 - 状態変更コマンド（`git commit` 等）と読み取り確認コマンドや一般の制御構文は 1 回の `run_command` に連結せず別呼び出しに分け、確認判定とコマンド許可の粒度を保つ（ワークツリーへのローカル `Set-Location`、`origin` の非保護ブランチを明示した通常 `git push origin <branch>`、`if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` の定型連結は `pretool_guard.py` の第 1 段ホワイトリスト対象）。
