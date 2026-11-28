@@ -94,6 +94,27 @@ def _has_unexpected_control_chars(text: str) -> bool:
     """想定外 ASCII 制御文字または単独 CR を含むか判定する。"""
     return bool(UNEXPECTED_CONTROL_CHAR_RE.search(text))
 
+
+def _iter_pr_text_bodies(pr_data: Any) -> list[str]:
+    """PR データ内の本文・コメント・レビュー本文を空白除去せず列挙する。"""
+    if not isinstance(pr_data, dict):
+        return []
+    bodies: list[str] = []
+    if isinstance(pr_data.get("body"), str):
+        bodies.append(pr_data["body"])
+    for key in ("comments", "reviews"):
+        raw = pr_data.get(key)
+        if isinstance(raw, dict):
+            items = raw.get("nodes") or []
+        elif isinstance(raw, list):
+            items = raw
+        else:
+            items = []
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("body"), str):
+                bodies.append(item["body"])
+    return bodies
+
 PROTECTED_BRANCHES = frozenset(
     {
         "main",
@@ -1125,7 +1146,13 @@ def handle_invariant_check(args: argparse.Namespace, *, runner: CommandRunner) -
     resolved_base_sha = _resolve_base_commit(args.base, git_cwd, runner)
 
     if args.pr_json:
-        pr_data = _read_json_file_checked(args.pr_json, "--pr-json", cwd=cwd, forbid_ufffd=False)
+        pr_data = _read_json_file_checked(
+            args.pr_json,
+            "--pr-json",
+            cwd=cwd,
+            forbid_ufffd=False,
+            forbid_control_chars=False,
+        )
     else:
         repo, pr_num = _resolve_repo_and_pr(args.repo, args.pr, cwd, runner)
         pr_data = _fetch_pr_view(pr_num, repo, cwd, runner, fields="body,comments,reviews")
@@ -1450,28 +1477,14 @@ def handle_apply_triage(args: argparse.Namespace, *, runner: CommandRunner) -> i
         merged_after = pr_guardrails.merge_guardrails(sources_after)
         unresolved_after = [t["id"] for t in threads_after if not t["isResolved"]]
 
-        ufffd_found = False
-        control_char_found = False
-        for src in sources_after:
-            src_body = src.get("body") or ""
-            if "\ufffd" in src_body:
-                ufffd_found = True
-            if _has_unexpected_control_chars(src_body):
-                control_char_found = True
-            if ufffd_found and control_char_found:
-                break
-        if not (ufffd_found and control_char_found):
-            for th in threads_after:
-                for comment in th.get("comments") or []:
-                    comment_body = comment.get("body") or ""
-                    if "\ufffd" in comment_body:
-                        ufffd_found = True
-                    if _has_unexpected_control_chars(comment_body):
-                        control_char_found = True
-                    if ufffd_found and control_char_found:
-                        break
-                if ufffd_found and control_char_found:
-                    break
+        verify_texts = _iter_pr_text_bodies(pr_after)
+        for th in threads_after:
+            for comment in th.get("comments") or []:
+                if isinstance(comment, dict) and isinstance(comment.get("body"), str):
+                    verify_texts.append(comment["body"])
+
+        ufffd_found = any("\ufffd" in text for text in verify_texts)
+        control_char_found = any(_has_unexpected_control_chars(text) for text in verify_texts)
 
         commit_match = (head_after.lower() == effective_sha) if effective_sha is not None else None
         guardrails_strict_ok = len(merged_after["warnings"]) == 0

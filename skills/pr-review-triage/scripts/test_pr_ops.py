@@ -1606,7 +1606,13 @@ class TestPrOpsControlChars(unittest.TestCase):
                     self.assertIn(expected_u, err)
 
     def test_ctrl_03_apply_triage_verify_detects_control_chars_in_sources_and_threads(self) -> None:
-        def make_runner(*, pr_body: str = "", comment_body: str = "clean", thread_body: str = "clean"):
+        def make_runner(
+            *,
+            pr_body: str = "",
+            comment_body: str = "clean",
+            reviews: Any = None,
+            thread_body: str = "clean",
+        ):
             def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
                 if cmd[:4] == ["git", "remote", "get-url", "origin"]:
                     return pr_ops.CmdResult(0, "https://github.com/octo/repo.git\n", "")
@@ -1618,7 +1624,7 @@ class TestPrOpsControlChars(unittest.TestCase):
                                 "headRefOid": "1234567890abcdef",
                                 "body": pr_body,
                                 "comments": [{"author": {"login": "me"}, "createdAt": "2026-11-28T00:00:00Z", "body": comment_body}],
-                                "reviews": [],
+                                "reviews": [] if reviews is None else reviews,
                             },
                             ensure_ascii=False,
                         ),
@@ -1677,7 +1683,11 @@ class TestPrOpsControlChars(unittest.TestCase):
 
             for case_name, kwargs in (
                 ("sources_pr_body", {"pr_body": "PR本文\x07混入"}),
+                ("sources_pr_body_whitespace_only_ff", {"pr_body": "\x0c"}),
                 ("sources_pr_comment", {"comment_body": "コメント\r単独CR"}),
+                ("sources_pr_comment_whitespace_only_cr", {"comment_body": "\r"}),
+                ("sources_pr_reviews_list", {"reviews": [{"body": "レビュー\x07混入"}]}),
+                ("sources_pr_reviews_nodes", {"reviews": {"nodes": [{"body": "レビュー\r単独CR"}]}}),
                 ("threads_comment", {"thread_body": "スレッド返信\x1b混入"}),
             ):
                 with self.subTest(case=case_name):
@@ -1695,6 +1705,7 @@ class TestPrOpsControlChars(unittest.TestCase):
                 runner=make_runner(
                     pr_body="正常 CRLF\r\n\tタブ\nLF",
                     comment_body="正常コメント\r\n\tOK",
+                    reviews=[{"body": "正常レビュー\n\tOK\r\n"}],
                     thread_body="正常スレッド\n\tOK\r\n",
                 ),
             )
@@ -1846,6 +1857,55 @@ class TestPrOpsControlChars(unittest.TestCase):
                 capture_output=True,
             ).stdout
             self.assertEqual(committed_bytes, fixture_bytes)
+
+    def test_ctrl_06_invariant_check_pr_json_allows_control_chars(self) -> None:
+        observed_rules_text = ""
+
+        def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+            nonlocal observed_rules_text
+            if cmd[:4] == ["git", "-c", "core.quotePath=false", "status"]:
+                return pr_ops.CmdResult(0, "", "")
+            if cmd[:3] == ["git", "rev-parse", "--show-toplevel"]:
+                return pr_ops.CmdResult(0, str(cwd), "")
+            if cmd[:3] == ["git", "rev-parse", "--verify"]:
+                return pr_ops.CmdResult(0, "deadbeef1234567890abcdef1234567890abcdef\n", "")
+            if len(cmd) >= 2 and cmd[1].endswith("check_invariants_decision1.py"):
+                rules_path = Path(cmd[cmd.index("--rules") + 1])
+                observed_rules_text = rules_path.read_text(encoding="utf-8")
+                return pr_ops.CmdResult(0, json.dumps({"status": "dry_run", "violations": []}), "")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pr_json = Path(tmp) / "pr_with_ctrl.json"
+            pr_json.write_text(
+                json.dumps(
+                    {
+                        "body": "PR 本文に\x07と単独\rが含まれる",
+                        "comments": [
+                            {
+                                "author": {"login": "bot"},
+                                "createdAt": "2026-11-28T00:00:00Z",
+                                "body": (
+                                    "コメント\x0c\n"
+                                    "<!-- pr-review-triage:guardrails:v1 -->\n"
+                                    "- [PRG-001] (active) 対象: `skills/**` | ルール: PR JSON スナップショットを許容する\n"
+                                    "<!-- /pr-review-triage:guardrails:v1 -->"
+                                ),
+                            }
+                        ],
+                        "reviews": [{"body": "レビュー\rテキスト"}],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = _run_cli_capture(
+                ["invariant-check", "--pr-json", str(pr_json), "--cwd", tmp, "--dry-run"],
+                runner=fake_runner,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("PR JSON スナップショットを許容する", observed_rules_text)
+            self.assertEqual(json.loads(stdout)["status"], "dry_run")
 
 
 if __name__ == "__main__":

@@ -73,7 +73,7 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/invariant-gate/scripts
   --base main --paths "src/**" --rules "$HOME/.gemini/config/plugins/shared-skills/skills/systems-pre-pr-audit/SKILL.md" --strict
 ```
 
-`--base <ref>` はコミット済み差分（`base...HEAD`）のみを対象とし、未コミットや未追跡の変更だけでは `skipped_empty_diff` になるため、コミット前の検査には引数なし実行、`--diff-file`、または `pr_ops.py invariant-check` を使う。
+`--base <ref>` はコミット済み差分（`base...HEAD`）のみを対象とし、未コミットの変更だけでは `skipped_empty_diff` になるため、追跡済みファイルの未コミット変更には引数なし実行（ステージ済みなら `--staged`）や `--diff-file` を、未追跡ファイルも含む作業ツリー全体の検査には `pr_ops.py invariant-check` を使う。
 呼び出し経路は `--backend auto`（既定）で `google-genai >= 3.2.0`（`api_version="v1beta"`）を優先し、`ImportError` または `client.decisions` 不在時は `run_decisions.py` 経由の REST へ自動で切り替える。
 
 ## 閾値と終了コード
