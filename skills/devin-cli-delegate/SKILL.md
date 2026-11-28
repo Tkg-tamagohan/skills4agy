@@ -42,6 +42,8 @@ devin models list
 
 Devin Desktop がシェル環境に `ACP_BACKEND=windsurf` を設定する場合があるため、起動前に環境変数 `ACP_BACKEND` を除去する。
 また、日本語や改行、バッククォートを含むプロンプトをコマンド引数へ直接渡すと PowerShell で引用崩れを起こすため、一時ファイル（`<Artifact Directory Path>\scratch\` 配下など）へ UTF-8 で書き出して `--prompt-file` で渡す。
+`--prompt-file` に書き出す本文では背景を親の要約で伝えず、ポインタ（`#seq`、`file:L-L`、`ADR-ID`）と未加工の抜粋 5〜15 箇所を時系列順に並べ、抜粋の合計を 9,000 文字（約 4,500 トークン）以内に収める。
+あわせて、回答中の主張ごとに根拠を `[file:L-L]` 形式で引用するようプロンプト末尾で求める。
 
 ### 3. ローカル非対話実行と出力回収
 

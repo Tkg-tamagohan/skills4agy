@@ -3,6 +3,7 @@
 `run_workflow` の `agent()` や `invoke_subagent` でワーカーへ渡すプロンプトの骨格と、完了時の `finish` 用 JSON Schema である。
 `<...>` は対象ごとに埋める。
 リポジトリ固有の規約（仕様の正となる文書、廃止用語、文体スキル、禁止する git 操作、lint、typecheck、test のコマンド）は共通規約の節にまとめ、全ワーカーへ同じ内容を付ける。
+ワーカーへ渡す Evidence は親が要約した伝言ではなく、ポインタ（`#seq`、`file:L-L`、`ADR-ID`）と未加工の抜粋 5〜15 箇所を時系列順に並べたエビデンスパックとし、抜粋の合計は日本語とスタックトレースを含めて 9,000 文字（約 4,500 トークン）以内に収める。
 
 ## 計画ワーカー
 
@@ -14,7 +15,7 @@ Target item: "<item_name>".
 The evidence below comes from the first pass and may have line offsets or false positives. Verify the target files on the current branch before writing the plan, then inspect the full scope deeply.
 
 ## Evidence
-<First-pass evidence: file, line numbers, observed symptoms>
+<First-pass evidence pack: pointers first (#seq, file:L-L, ADR-ID), then 5-15 verbatim excerpts in chronological order (max 9,000 characters total, about 4,500 tokens). Do not paraphrase or summarize the excerpts.>
 (For Decision 1 pre-screening candidates, treat probabilities and labels as hints only; confirm actual lines and behavior on the current branch.)
 
 ## Plan Contents (write in Japanese, following `japanese-tech-writing`)

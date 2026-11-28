@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""triage_transcript_decision1.py のユニットテスト（SH-01–SH-16）。"""
+"""triage_transcript_decision1.py のユニットテスト（SH-01–SH-20）。"""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def _make_row(
 
 
 class TestTriageTranscriptDecision1(unittest.TestCase):
-    """SH-01–SH-16 の仕様検証テスト。"""
+    """SH-01–SH-20 の仕様検証テスト。"""
 
     def test_SH_01_load_jsonl_skips_blank_and_broken_lines(self) -> None:
         """SH-01: 空行、不正 JSON 行、非オブジェクト行を警告付きでスキップし有効行のみ読み込む。"""
@@ -67,6 +67,7 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             rows, warnings = mod.load_transcript_raw_rows(p)
             self.assertEqual(len(rows), 2)
             self.assertEqual([r["step_index"] for r in rows], [0, 1])
+            self.assertEqual([r[mod.LINE_IDX_KEY] for r in rows], [0, 4])
             self.assertEqual(len(warnings), 2)
 
     def test_SH_02_user_input_extracts_request_and_strips_boilerplate(self) -> None:
@@ -221,14 +222,19 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             p.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
 
             def fake_api(payload: dict, **_kwargs) -> dict:
+                outcomes = [
+                    ("drop_noise", 0.90),
+                    ("keep_decision", 0.92),
+                    ("keep_gotcha", 0.88),
+                    ("keep_state", 0.85),
+                    ("drop_noise", 0.95),
+                    ("drop_noise", 0.55),
+                ]
+                qkeys = list(payload["questions"].keys())
                 return {
                     "answers": {
-                        "step_0000": {"type": "choice", "choice": "drop_noise", "confidence": 0.90},
-                        "step_0001": {"type": "choice", "choice": "keep_decision", "confidence": 0.92},
-                        "step_0002": {"type": "choice", "choice": "keep_gotcha", "confidence": 0.88},
-                        "step_0003": {"type": "choice", "choice": "keep_state", "confidence": 0.85},
-                        "step_0004": {"type": "choice", "choice": "drop_noise", "confidence": 0.95},
-                        "step_0005": {"type": "choice", "choice": "drop_noise", "confidence": 0.55},
+                        qkey: {"type": "choice", "choice": choice, "confidence": conf}
+                        for qkey, (choice, conf) in zip(qkeys, outcomes)
                     }
                 }
 
@@ -648,6 +654,140 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
             parsed = json.loads(proc.stdout.decode("utf-8"))
             self.assertIn("\U0001f680", parsed["recent"][0]["text"])
+
+    def test_SH_17_rewound_step_indices_produce_unique_question_keys(self) -> None:
+        """SH-17: 巻き戻しで step_index が重複再追記されても質問キーが衝突せず検証を通過する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "transcript.jsonl"
+            rows_in = [
+                _make_row(0, step_type="USER_INPUT", content="<USER_REQUEST>初回</USER_REQUEST>"),
+                _make_row(1, content="旧案"),
+                _make_row(2, content="途中応答"),
+                _make_row(0, step_type="USER_INPUT", content="<USER_REQUEST>やり直し</USER_REQUEST>"),
+                _make_row(1, content="新案"),
+            ]
+            p.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows_in), encoding="utf-8")
+            rows, warnings = mod.load_transcript_raw_rows(p)
+            self.assertEqual(warnings, [])
+            chunks, recent, chunk_warnings, truncated = mod.build_chunks(
+                rows,
+                keep_recent=0,
+                max_chars=240_000,
+                max_chunks=4,
+                max_step_chars=1200,
+                include_thinking=False,
+            )
+            self.assertEqual(recent, [])
+            self.assertEqual(chunk_warnings, [])
+            self.assertEqual(truncated, 0)
+            self.assertEqual(len(chunks), 1)
+            payload = mod.build_decision_payload(chunks[0])
+            self.assertEqual(len(payload["questions"]), 5)
+            self.assertEqual(len(set(payload["questions"].keys())), 5)
+            self.assertEqual(run_decisions.validate_payload(payload), [])
+
+    def test_SH_18_markdown_preserves_1000_char_decision_and_infers_conv_id(self) -> None:
+        """SH-18: brain 配下のパスから conv_id を推定し、約 1,000 文字の決定を途中省略せず出力する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            conv_id = "conv-abc-1234"
+            log_dir = Path(tmp) / "brain" / conv_id / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            p = log_dir / "transcript.jsonl"
+            long_decision = "決定事項の本文: " + ("あ" * 980) + " :末尾確認"
+            rows_in = [
+                _make_row(0, content=long_decision),
+            ]
+            p.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows_in), encoding="utf-8")
+
+            def fake_api(payload: dict, **_kwargs) -> dict:
+                return {
+                    "answers": {
+                        qkey: {"type": "choice", "choice": "keep_decision", "confidence": 0.95}
+                        for qkey in payload["questions"]
+                    }
+                }
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = mod.main(
+                    ["--transcript", str(p), "--keep-recent", "0", "--format", "markdown"],
+                    api_caller=fake_api,
+                )
+            self.assertEqual(rc, 0)
+            md = buf.getvalue()
+            self.assertIn(conv_id, md)
+            self.assertIn("line_idx=0", md)
+            self.assertIn("末尾確認", md)
+            self.assertNotIn("...[省略]...", md)
+
+    def test_SH_19_lazy_full_transcript_lookup_and_missing_fallback(self) -> None:
+        """SH-19: truncated_fields 付きの重要エラーは transcript_full.jsonl を遅延参照し、不在時は警告で継続する。"""
+        dummy_secret = "ghp_" + "AbCdEf1234567890abcdef"
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "transcript.jsonl"
+            full_p = Path(tmp) / "transcript_full.jsonl"
+            truncated_row = _make_row(
+                0,
+                step_type="GENERIC",
+                status="ERROR",
+                content="Command exited with code 1\nshort preview",
+            )
+            truncated_row["truncated_fields"] = ["content"]
+            full_row = _make_row(
+                0,
+                step_type="GENERIC",
+                status="ERROR",
+                content=(
+                    "Created At: 2026-11-28T00:00:00Z\n"
+                    "Command exited with code 1\n"
+                    + ("stack frame info\n" * 40)
+                    + f"token={dummy_secret}\nROOT_CAUSE_LINE"
+                ),
+            )
+            p.write_text(json.dumps(truncated_row, ensure_ascii=False) + "\n", encoding="utf-8")
+            full_p.write_text(json.dumps(full_row, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            def fake_api(payload: dict, **_kwargs) -> dict:
+                return {
+                    "answers": {
+                        qkey: {"type": "choice", "choice": "keep_gotcha", "confidence": 0.91}
+                        for qkey in payload["questions"]
+                    }
+                }
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = mod.main(
+                    ["--transcript", str(p), "--keep-recent", "0", "--format", "json"],
+                    api_caller=fake_api,
+                )
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+            kept_item = data["kept"][0]
+            self.assertIn("full_excerpt", kept_item)
+            self.assertIn("ROOT_CAUSE_LINE", kept_item["full_excerpt"])
+            self.assertIn("[REDACTED]", kept_item["full_excerpt"])
+            self.assertNotIn(dummy_secret, kept_item["full_excerpt"])
+
+            full_p.unlink()
+            buf_missing = io.StringIO()
+            with contextlib.redirect_stdout(buf_missing):
+                rc_missing = mod.main(
+                    ["--transcript", str(p), "--keep-recent", "0", "--format", "json"],
+                    api_caller=fake_api,
+                )
+            self.assertEqual(rc_missing, 0)
+            data_missing = json.loads(buf_missing.getvalue())
+            self.assertNotIn("full_excerpt", data_missing["kept"][0])
+            self.assertTrue(
+                any("transcript_full.jsonl" in w for w in data_missing["meta"]["warnings"])
+            )
+
+    def test_SH_20_criteria_preserve_rejected_alternatives(self) -> None:
+        """SH-20: 却下案が drop_noise へ誤分類されないよう分類基準が定義されている。"""
+        self.assertIn("却下", mod.STEP_CHOICE_CRITERIA["keep_decision"])
+        self.assertIn("却下", mod.STEP_CHOICE_CRITERIA["drop_noise"])
+        self.assertNotIn("解決済みの途中探索", mod.STEP_CHOICE_CRITERIA["drop_noise"])
 
 
 if __name__ == "__main__":

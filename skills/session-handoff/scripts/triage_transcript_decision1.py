@@ -34,16 +34,20 @@ DEFAULT_MAX_STEP_CHARS = 1_200
 DEFAULT_GENERIC_NORMAL_CHARS = 360
 DEFAULT_GENERIC_ERROR_CHARS = 800
 DEFAULT_THINKING_CHARS = 300
+DEFAULT_RENDER_EXCERPT_CHARS = 1_200
+DEFAULT_FULL_ERROR_CHARS = 2_000
 DEFAULT_TIMEOUT = 30.0
 MAX_QUESTIONS_PER_REQUEST = 1_000
+LINE_IDX_KEY = "_line_idx"
 
 STEP_CHOICE_CRITERIA: dict[str, str] = {
     "drop_noise": (
-        "解決済みの途中探索、重複するファイル読み込み、完了済みの定型出力など、"
-        "次セッションへ引き継ぐ必要がないステップ"
+        "重複するファイル読み込み、完了済みの定型出力、結論に影響しなかった途中探索など、"
+        "次セッションへ引き継ぐ必要がないステップ（採用判断の根拠となった却下案や比較検討を含むステップは除く）"
     ),
     "keep_decision": (
-        "確定した設計方針、要件、仕様、制約、ユーザーとの合意事項を含むステップ"
+        "確定した設計方針、要件、仕様、制約、ユーザーとの合意事項、"
+        "および採用判断の根拠となった却下案と却下理由を含むステップ"
     ),
     "keep_gotcha": (
         "失敗した試行、エラー原因、環境固有の制約、再発防止の教訓を含むステップ"
@@ -98,10 +102,21 @@ class TranscriptStep:
     raw_content: str = ""
     tool_summary: str = ""
     thinking_excerpt: str = ""
+    line_idx: int = -1
+    truncated_fields: tuple[str, ...] = ()
+    full_excerpt: str = ""
+
+    @property
+    def label(self) -> str:
+        if self.line_idx >= 0:
+            return f"STEP {self.step_index:04d} L{self.line_idx:05d}"
+        return f"STEP {self.step_index:04d}"
 
     @property
     def question_key(self) -> str:
-        return f"step_{self.step_index:04d}"
+        if self.line_idx < 0:
+            return f"step_{self.step_index:04d}"
+        return f"step_{self.step_index:04d}_l{self.line_idx:05d}"
 
 
 @dataclass
@@ -245,6 +260,15 @@ def normalize_step(
     if not parts:
         return None
 
+    line_idx_val = raw.get(LINE_IDX_KEY)
+    line_idx = line_idx_val if isinstance(line_idx_val, int) else -1
+    raw_truncated = raw.get("truncated_fields")
+    truncated_fields = (
+        tuple(str(item) for item in raw_truncated)
+        if isinstance(raw_truncated, list)
+        else ()
+    )
+
     body = mask_secrets("\n".join(parts))
     return TranscriptStep(
         step_index=step_index_val,
@@ -257,6 +281,8 @@ def normalize_step(
         raw_content=raw_content,
         tool_summary=tool_summary,
         thinking_excerpt=thinking_excerpt,
+        line_idx=line_idx,
+        truncated_fields=truncated_fields,
     )
 
 
@@ -277,6 +303,7 @@ def load_transcript_raw_rows(path: Path) -> tuple[list[dict[str, Any]], list[str
             if not isinstance(obj, dict):
                 warnings.append(f"L{line_no}: JSON オブジェクトではない行をスキップしました")
                 continue
+            obj[LINE_IDX_KEY] = line_no - 1
             rows.append(obj)
     return rows, warnings
 
@@ -332,7 +359,7 @@ def resolve_transcript_path(
 def format_step_block(step: TranscriptStep) -> str:
     """共有 input に含める 1 ステップ分のテキスト表現を組み立てる。"""
     err_tag = " | ERROR_SIGNAL" if step.is_error_signal else ""
-    header = f"[STEP {step.step_index:04d} | {step.step_type} | {step.source}{err_tag}]"
+    header = f"[{step.label} | {step.step_type} | {step.source}{err_tag}]"
     return f"{header}\n{step.normalized_text}"
 
 
@@ -433,7 +460,7 @@ def build_decision_payload(
         questions[step.question_key] = {
             "type": "choice",
             "instructions": (
-                f"[STEP {step.step_index:04d}] は次のセッションへ引き継ぐべき重要情報を含みますか？"
+                f"[{step.label}] は次のセッションへ引き継ぐべき重要情報を含みますか？"
                 "会話全体の流れを踏まえ、最も当てはまる区分を1つ選んでください。"
             ),
             "criteria": dict(STEP_CHOICE_CRITERIA),
@@ -488,9 +515,98 @@ def classify_chunk_answers(
     return results
 
 
+def conversation_id_from_path(path: Path) -> str:
+    """transcript.jsonl の格納パスから conversation_id を推定する。"""
+    if (
+        path.name == "transcript.jsonl"
+        and len(path.parents) >= 3
+        and path.parents[0].name == "logs"
+        and path.parents[1].name == ".system_generated"
+    ):
+        return path.parents[2].name
+    return ""
+
+
+def load_full_contents(full_path: Path, line_idxs: set[int]) -> dict[int, str]:
+    """transcript_full.jsonl から指定行番号の content のみを遅延抽出する。"""
+    if not line_idxs:
+        return {}
+    contents: dict[int, str] = {}
+    with full_path.open("r", encoding="utf-8", errors="replace") as fh:
+        for idx, raw_line in enumerate(fh):
+            if idx not in line_idxs:
+                continue
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                contents[idx] = str(obj.get("content") or "")
+            if len(contents) >= len(line_idxs):
+                break
+    return contents
+
+
+def attach_full_excerpts(
+    classified: list[ClassifiedStep],
+    transcript_path: Path,
+    warnings: list[str],
+) -> None:
+    """切り詰められた重要エラー出力に限り transcript_full.jsonl から完全版の抜粋を補う。"""
+    targets = [
+        c.step
+        for c in classified
+        if c.choice in ("keep_decision", "keep_gotcha")
+        and c.step.line_idx >= 0
+        and c.step.is_error_signal
+        and "content" in c.step.truncated_fields
+    ]
+    if not targets:
+        return
+
+    full_path = transcript_path.with_name("transcript_full.jsonl")
+    try:
+        same_file = full_path == transcript_path or (
+            full_path.exists()
+            and transcript_path.exists()
+            and full_path.resolve() == transcript_path.resolve()
+        )
+    except OSError:
+        same_file = full_path == transcript_path
+
+    if same_file or not full_path.is_file():
+        warnings.append(
+            f"transcript_full.jsonl が参照できないため、切り詰められたエラー出力の完全版取得をスキップしました: {full_path}"
+        )
+        return
+
+    try:
+        full_contents = load_full_contents(full_path, {s.line_idx for s in targets})
+    except (OSError, UnicodeDecodeError) as exc:
+        warnings.append(
+            mask_secrets(f"transcript_full.jsonl の読み込みに失敗しました ({exc})")
+        )
+        return
+
+    for step in targets:
+        raw_text = full_contents.get(step.line_idx, "")
+        if not raw_text.strip():
+            continue
+        masked = mask_secrets(raw_text)
+        cleaned = TIMESTAMP_HEADER_RE.sub("", masked).strip()
+        if cleaned:
+            step.full_excerpt = truncate_head_tail(
+                cleaned, DEFAULT_FULL_ERROR_CHARS, head_ratio=0.35
+            )
+
+
 def render_markdown(
     *,
     transcript_path: Path,
+    conv_id: str = "",
     classified: list[ClassifiedStep],
     recent_steps: list[TranscriptStep],
     warnings: list[str],
@@ -511,6 +627,8 @@ def render_markdown(
         "",
         "## Summary",
         f"- transcript: `{transcript_path}`",
+        f"- conv_id: `{conv_id}`" if conv_id else "- conv_id: 不明",
+        "- 引用形式: (conv_id, line_idx, step_index)（line_idx は 0 始まり、read_file では StartLine=line_idx+1）",
         f"- 評価対象ステップ: {len(classified)} 件（API 呼び出し: {api_calls} 回）",
         f"- 保持判定: {kept_total} 件（Decisions: {len(decisions)} / Gotchas: {len(gotchas)} / Active State: {len(states)}）",
         f"- 境界候補（低信頼度 drop_noise）: {len(borderlines)} 件",
@@ -522,6 +640,11 @@ def render_markdown(
     for warn in warnings:
         lines.append(f"- 警告: {warn}")
 
+    def format_step_tag(step: TranscriptStep) -> str:
+        if step.line_idx >= 0:
+            return f"[STEP {step.step_index:04d} | line_idx={step.line_idx}]"
+        return f"[STEP {step.step_index:04d}]"
+
     def append_classified_section(title: str, items: list[ClassifiedStep]) -> None:
         lines.extend(["", f"## {title}"])
         if not items:
@@ -529,10 +652,17 @@ def render_markdown(
             return
         for item in items:
             s = item.step
-            excerpt = truncate_head_tail(s.normalized_text, 400, head_ratio=0.7).replace("\n", "\n  ")
-            lines.append(
-                f"- **[STEP {s.step_index:04d}]** (`{s.step_type}`, confidence={item.confidence:.2f})\n  {excerpt}"
+            excerpt = truncate_head_tail(
+                s.normalized_text, DEFAULT_RENDER_EXCERPT_CHARS, head_ratio=0.7
+            ).replace("\n", "\n  ")
+            entry = (
+                f"- **{format_step_tag(s)}** (`{s.step_type}`, confidence={item.confidence:.2f})\n"
+                f"  {excerpt}"
             )
+            if s.full_excerpt:
+                full_indented = s.full_excerpt.replace("\n", "\n  ")
+                entry += f"\n  [transcript_full L{s.line_idx}] {full_indented}"
+            lines.append(entry)
 
     append_classified_section("Decisions（確定仕様・方針候補）", decisions)
     append_classified_section("Gotchas（失敗・制約候補）", gotchas)
@@ -545,8 +675,10 @@ def render_markdown(
         lines.append("- 該当なし")
     else:
         for s in recent_steps:
-            excerpt = truncate_head_tail(s.normalized_text, 400, head_ratio=0.7).replace("\n", "\n  ")
-            lines.append(f"- **[STEP {s.step_index:04d}]** (`{s.step_type}`)\n  {excerpt}")
+            excerpt = truncate_head_tail(
+                s.normalized_text, DEFAULT_RENDER_EXCERPT_CHARS, head_ratio=0.7
+            ).replace("\n", "\n  ")
+            lines.append(f"- **{format_step_tag(s)}** (`{s.step_type}`)\n  {excerpt}")
 
     return "\n".join(lines) + "\n"
 
@@ -599,6 +731,7 @@ def render_skipped_markdown(
 def render_json_result(
     *,
     transcript_path: Path,
+    conv_id: str = "",
     classified: list[ClassifiedStep],
     recent_steps: list[TranscriptStep],
     warnings: list[str],
@@ -616,25 +749,35 @@ def render_json_result(
     """機械処理用の構造化 JSON 辞書を生成する。"""
 
     def serialize_classified(item: ClassifiedStep) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "step_index": item.step.step_index,
+            "line_idx": item.step.line_idx,
             "type": item.step.step_type,
             "source": item.step.source,
+            "truncated_fields": list(item.step.truncated_fields),
             "choice": item.choice,
             "confidence": round(item.confidence, 4),
             "is_borderline": item.is_borderline,
             "probabilities": item.probabilities,
             "text": item.step.normalized_text,
         }
+        if item.step.full_excerpt:
+            data["full_excerpt"] = item.step.full_excerpt
+        return data
 
     def serialize_step(step: TranscriptStep) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "step_index": step.step_index,
+            "line_idx": step.line_idx,
             "type": step.step_type,
             "source": step.source,
+            "truncated_fields": list(step.truncated_fields),
             "is_error_signal": step.is_error_signal,
             "text": step.normalized_text,
         }
+        if step.full_excerpt:
+            data["full_excerpt"] = step.full_excerpt
+        return data
 
     kept = [c for c in classified if c.choice != "drop_noise"]
     borderline = [c for c in classified if c.is_borderline]
@@ -642,6 +785,7 @@ def render_json_result(
 
     meta: dict[str, Any] = {
         "transcript_path": str(transcript_path),
+        "conv_id": conv_id,
         "dry_run": dry_run,
         "skipped_below_threshold": skipped_below_threshold,
         "api_calls": api_calls,
@@ -809,9 +953,11 @@ def main(
             app_data_dir=app_data_dir,
         )
         file_bytes = transcript_path.stat().st_size
+        conv_id = args.conversation_id or conversation_id_from_path(transcript_path)
         raw_rows, parse_warnings = load_transcript_raw_rows(transcript_path)
         json_meta_kwargs: dict[str, Any] = {
             "transcript_path": transcript_path,
+            "conv_id": conv_id,
             "drop_borderline": args.drop_borderline,
             "transcript_steps": len(raw_rows),
             "transcript_bytes": file_bytes,
@@ -942,6 +1088,7 @@ def main(
             print(
                 render_markdown(
                     transcript_path=transcript_path,
+                    conv_id=conv_id,
                     classified=[],
                     recent_steps=recent_steps,
                     warnings=warnings,
@@ -998,6 +1145,8 @@ def main(
             classify_chunk_answers(chunk, enriched, min_confidence=args.min_confidence)
         )
 
+    attach_full_excerpts(all_classified, transcript_path, warnings)
+
     if args.format == "json":
         out = render_json_result(
             **json_meta_kwargs,
@@ -1012,6 +1161,7 @@ def main(
         print(
             render_markdown(
                 transcript_path=transcript_path,
+                conv_id=conv_id,
                 classified=all_classified,
                 recent_steps=recent_steps,
                 warnings=warnings,
