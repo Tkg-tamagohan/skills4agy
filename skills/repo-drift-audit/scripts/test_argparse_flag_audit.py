@@ -151,6 +151,77 @@ class ArgparseFlagAuditTests(unittest.TestCase):
             )
             self.assertEqual(afa.find_doc_only_flags([md], [sp]), [])
 
+    def test_AFA_07_subcommand_scoped_flags_and_shared_helper(self) -> None:
+        """AFA-07: 別サブコマンド専用フラグの誤用を検知し、共有ヘルパや parents 継承フラグは許容する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "cli.py"
+            cli.write_text(
+                "import argparse\n\n"
+                "def _add_shared(p: argparse.ArgumentParser) -> None:\n"
+                "    p.add_argument('--dry-run', action='store_true')\n\n"
+                "def build() -> argparse.ArgumentParser:\n"
+                "    base = argparse.ArgumentParser(add_help=False)\n"
+                "    base.add_argument('--base-opt')\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    parser.add_argument('--global-opt')\n"
+                "    subs = parser.add_subparsers(dest='cmd')\n"
+                "    d = subs.add_parser('docs', parents=[base])\n"
+                "    d.add_argument('--repo')\n"
+                "    _add_shared(d)\n"
+                "    b = subs.add_parser('backlog')\n"
+                "    b.add_argument('--backlog')\n"
+                "    _add_shared(b)\n"
+                "    return parser\n",
+                encoding="utf-8",
+            )
+            md_bad = root / "bad.md"
+            md_bad.write_text(
+                "```bash\n"
+                "python cli.py docs --repo . --base-opt x --dry-run --backlog BACKLOG.md\n"
+                "```\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(afa.find_doc_only_flags([md_bad], [cli]), ["cli.py:--backlog"])
+
+            md_ok = root / "ok.md"
+            md_ok.write_text(
+                "Run `cli.py backlog --backlog BACKLOG.md --dry-run --global-opt 1`.\n"
+                "Run `cli.py --dry-run` (without subcommand).\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(afa.find_doc_only_flags([md_ok], [cli]), [])
+
+            # backlog は base を継承していないため --base-opt を誤用すると検知される
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text("`cli.py backlog --base-opt 1`", [cli]),
+                ["cli.py:--base-opt"],
+            )
+
+    def test_AFA_08_subcommand_preserved_across_line_continuations(self) -> None:
+        """AFA-08: 複数行継続（\\ や `）でサブコマンド文脈を引き継ぎ、次行の不正フラグを検知する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "tool.py"
+            cli.write_text(
+                "import argparse\n"
+                "p = argparse.ArgumentParser()\n"
+                "subs = p.add_subparsers(dest='cmd')\n"
+                "s1 = subs.add_parser('scan')\n"
+                "s1.add_argument('--repo')\n"
+                "s2 = subs.add_parser('plan')\n"
+                "s2.add_argument('--stdin', action='store_true')\n",
+                encoding="utf-8",
+            )
+            doc_text = (
+                "```bash\n"
+                "python tool.py scan \\\n"
+                "  --repo . \\\n"
+                "  --stdin\n"
+                "```\n"
+            )
+            self.assertEqual(afa.find_doc_only_flags_in_text(doc_text, [cli]), ["tool.py:--stdin"])
+
 
 if __name__ == "__main__":
     unittest.main()

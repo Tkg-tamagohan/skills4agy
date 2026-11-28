@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -285,6 +287,40 @@ def format_report_table(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def discard_broken_stdout() -> None:
+    """パイプ切断後に CPython 終了時フラッシュが exit 120 を起こさないよう sys.stdout を破棄する。"""
+    old_stdout = sys.stdout
+    devnull_stream: Any = None
+    try:
+        devnull_stream = open(os.devnull, "w", encoding="utf-8")
+    except OSError:
+        devnull_stream = None
+
+    if old_stdout is not None:
+        fileno_fn = getattr(old_stdout, "fileno", None)
+        if callable(fileno_fn):
+            try:
+                fd = fileno_fn()
+                devnull_fd = os.open(os.devnull, os.O_WRONLY)
+                try:
+                    os.dup2(devnull_fd, fd)
+                finally:
+                    os.close(devnull_fd)
+            except (AttributeError, OSError, io.UnsupportedOperation, ValueError):
+                pass
+
+    if devnull_stream is not None:
+        sys.stdout = devnull_stream
+
+    if old_stdout is not None and old_stdout is not sys.stdout:
+        close_fn = getattr(old_stdout, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except (OSError, ValueError):
+                pass
+
+
 def emit_report(
     report: dict[str, Any],
     output_format: str,
@@ -296,7 +332,10 @@ def emit_report(
         text = format_report_table(report)
     else:
         text = json.dumps(report, ensure_ascii=False, indent=2)
-    return decision_common.safe_write_stdout(text, stream=stream)
+    ok = decision_common.safe_write_stdout(text, stream=stream)
+    if not ok and stream is None:
+        discard_broken_stdout()
+    return ok
 
 
 def emit_error(

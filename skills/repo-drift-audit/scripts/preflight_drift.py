@@ -29,6 +29,7 @@ if str(_DECISIONS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_DECISIONS_SCRIPTS_DIR))
 
 import decision_common  # noqa: E402
+import decision_hygiene  # noqa: E402
 import drift_format  # noqa: E402
 import drift_repo  # noqa: E402
 
@@ -83,10 +84,21 @@ SECRET_BASENAMES: frozenset[str] = frozenset(
 SECRET_SUFFIXES: frozenset[str] = frozenset({".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"})
 TEST_DIR_NAMES: frozenset[str] = frozenset({"test", "tests", "__tests__"})
 TEST_FILENAME_RE = re.compile(
-    r"(?:^test_.*|_test\.[^.]+|\.test\.[^.]+|\.spec\.[^.]+)$",
+    r"^(?:test_.*|.*(?:_test|\.test|\.spec)\.[^.]+)$",
     re.IGNORECASE,
 )
 VALID_VERDICTS: frozenset[str] = frozenset({"confirmed", "false_positive", "already_resolved"})
+
+
+def _mask_str(text: str) -> str:
+    return decision_hygiene.mask_secrets(
+        text,
+        extra_patterns=(decision_hygiene.BEARER_TOKEN_RE,),
+    )
+
+
+def _mask_list(values: list[str]) -> list[str]:
+    return [_mask_str(v) for v in values]
 
 
 @dataclass
@@ -268,12 +280,12 @@ def run_scan(
             docs_scanned += 1
             _extract_spec_ids_from_text(text, rel, compiled_patterns, doc_locs)
             if suffix == ".md":
-                missing_paths = drift_repo.extract_missing_path_hints(text, rel, ctx)
-                missing_flags = drift_repo.extract_missing_flag_hints(text, rel, ctx)
+                missing_paths = _mask_list(drift_repo.extract_missing_path_hints(text, rel, ctx))
+                missing_flags = _mask_list(drift_repo.extract_missing_flag_hints(text, rel, ctx))
                 if missing_paths or missing_flags:
                     doc_hints.append(
                         {
-                            "file": rel,
+                            "file": _mask_str(rel),
                             "missing_path_hints": missing_paths,
                             "missing_flag_hints": missing_flags,
                         }
@@ -314,25 +326,25 @@ def run_scan(
     duplicate_groups.sort(key=lambda g: (-g["count"], -g["size_bytes"], g["files"][0]))
 
     doc_only_ids = [
-        {"id": spec_id, "locations": doc_locs[spec_id]}
+        {"id": _mask_str(spec_id), "locations": _mask_list(doc_locs[spec_id])}
         for spec_id in sorted(doc_locs)
         if spec_id not in code_all_locs
     ]
     doc_only_excluding_tests = [
         {
-            "id": spec_id,
-            "locations": doc_locs[spec_id],
-            "test_locations": code_test_locs.get(spec_id, []),
+            "id": _mask_str(spec_id),
+            "locations": _mask_list(doc_locs[spec_id]),
+            "test_locations": _mask_list(code_test_locs.get(spec_id, [])),
         }
         for spec_id in sorted(doc_locs)
         if spec_id not in code_non_test_locs
     ]
     code_only_ids = [
         {
-            "id": spec_id,
-            "locations": code_all_locs[spec_id],
-            "non_test_locations": code_non_test_locs.get(spec_id, []),
-            "test_locations": code_test_locs.get(spec_id, []),
+            "id": _mask_str(spec_id),
+            "locations": _mask_list(code_all_locs[spec_id]),
+            "non_test_locations": _mask_list(code_non_test_locs.get(spec_id, [])),
+            "test_locations": _mask_list(code_test_locs.get(spec_id, [])),
             "is_test_only": spec_id not in code_non_test_locs,
         }
         for spec_id in sorted(code_all_locs)
@@ -377,7 +389,7 @@ def run_scan(
 
 
 def _safe_candidate_text(text: str) -> str:
-    return drift_repo.mask_secret(text)
+    return _mask_str(text)
 
 
 def build_candidates_from_scan(scan_report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -984,8 +996,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _discard_broken_stdout() -> None:
+    discard_fn = getattr(drift_format, "discard_broken_stdout", None)
+    if callable(discard_fn):
+        discard_fn()
+
+
 def _write_output(text: str) -> bool:
-    return decision_common.safe_write_stdout(text)
+    ok = decision_common.safe_write_stdout(text)
+    if not ok:
+        _discard_broken_stdout()
+    return ok
 
 
 def main(
@@ -1037,6 +1058,7 @@ def main(
         )
     except OSError as exc:
         if decision_common.is_broken_pipe_error(exc):
+            _discard_broken_stdout()
             return 0
         drift_format.emit_error("unexpected_error", str(exc), 2, err_fmt, "")
         return 2
@@ -1045,6 +1067,7 @@ def main(
         return exc.exit_code
     except Exception as exc:  # noqa: BLE001
         if decision_common.is_broken_pipe_error(exc):
+            _discard_broken_stdout()
             return 0
         drift_format.emit_error("unexpected_error", str(exc), 2, err_fmt, "")
         return 2

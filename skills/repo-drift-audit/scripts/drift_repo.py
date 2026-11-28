@@ -101,9 +101,11 @@ QUESTION_KEY_SAFE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 LINE_SUFFIX_RE = re.compile(r":L?\d+(?:-L?\d+)?$")
 WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:(?:[/\\]|$)")
 STANDALONE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\.[A-Za-z0-9]+$")
-PY_SCRIPT_REF_RE = re.compile(r"([A-Za-z0-9_./\\-]+\.py)(?![A-Za-z0-9_.-])")
+PY_SCRIPT_REF_RE = re.compile(
+    r"((?:(?:\$\{?HOME\}?|~|%[A-Za-z_][A-Za-z0-9_]*%)[/\\])?[A-Za-z0-9_./\\-]+\.py)(?![A-Za-z0-9_.-])"
+)
 HOME_SKILL_SCRIPT_RE = re.compile(
-    r"^(?:\$HOME|\$\{HOME\}|~)/.+?/(skills/[A-Za-z0-9_.-]+/scripts/[^/\s]+)$"
+    r"^(?i:\$(?:HOME|\{HOME\})|~|%(?:USERPROFILE|HOME)%)/(?:.+?/)?(skills/[A-Za-z0-9_.-]+/scripts/[^/\s]+)$"
 )
 SHELL_TOKEN_RE = re.compile(r'"([^"]*)"|\'([^\']*)\'|(\S+)')
 CMD_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;)\s*")
@@ -843,6 +845,17 @@ def _is_dummy_standalone_filename(name: str) -> bool:
     return False
 
 
+def _normalize_repo_script_ref(raw_ref: str) -> str:
+    """$HOME/~/ %USERPROFILE% 配下の skills/<name>/scripts/... 参照をリポジトリ相対 POSIX へ正規化する。"""
+    norm = raw_ref.strip().replace("\\", "/")
+    home_match = HOME_SKILL_SCRIPT_RE.match(norm)
+    if home_match:
+        return home_match.group(1)
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
 def _resolve_repo_candidate(candidate: str, doc_relpath: str, ctx: RepoContext) -> bool:
     """相対パス候補が doc 相対または repo ルート相対で実在するかを返す。"""
     clean = candidate.rstrip("/")
@@ -862,18 +875,28 @@ def _resolve_repo_candidate(candidate: str, doc_relpath: str, ctx: RepoContext) 
         # リポジトリ外（../ など）を意図的に参照するリンクは欠損ヒント対象外にする
         return True
 
+    has_disk_root = ctx.repo_root.is_dir()
     for rel in candidates_to_check:
+        if has_disk_root:
+            target_disk = ctx.repo_root / rel
+            if os.path.lexists(target_disk) and not is_reparse_or_symlink(target_disk):
+                try:
+                    target_disk.resolve().relative_to(ctx.repo_root)
+                except ValueError:
+                    pass
+                else:
+                    if target_disk.is_file():
+                        return True
+                    if target_disk.is_dir():
+                        try:
+                            if any(not is_reparse_or_symlink(p) for p in target_disk.iterdir()):
+                                return True
+                        except OSError:
+                            pass
+            continue
+
         if rel in ctx.repo_files_set:
             return True
-        target_disk = ctx.repo_root / rel
-        if os.path.lexists(target_disk) and not is_reparse_or_symlink(target_disk):
-            try:
-                target_disk.resolve().relative_to(ctx.repo_root)
-            except ValueError:
-                pass
-            else:
-                if target_disk.exists():
-                    return True
         dir_prefix = rel.rstrip("/") + "/"
         if any(f.startswith(dir_prefix) for f in ctx.repo_files):
             return True
@@ -959,14 +982,13 @@ def _extract_fenced_script_candidates(doc_text: str) -> list[str]:
                 continue
 
             norm_tok = _strip_line_suffix(script_tok.strip().replace("\\", "/"))
-            home_match = HOME_SKILL_SCRIPT_RE.match(norm_tok)
-            if home_match:
-                cand = home_match.group(1)
+            if HOME_SKILL_SCRIPT_RE.match(norm_tok):
+                cand = _normalize_repo_script_ref(norm_tok)
                 if not _has_disallowed_path_chars(cand) and ":" not in cand:
                     candidates.append(cand)
                 continue
 
-            if _is_external_or_anchor(norm_tok) or norm_tok.startswith(("$", "~")):
+            if _is_external_or_anchor(norm_tok) or norm_tok.startswith(("$", "~", "%")):
                 continue
             if _has_disallowed_path_chars(norm_tok) or ":" in norm_tok:
                 continue
@@ -1048,9 +1070,7 @@ def _resolve_referenced_py_scripts(
 
     resolved_rels: set[str] = set()
     for match in PY_SCRIPT_REF_RE.finditer(doc_text):
-        raw_ref = match.group(1).replace("\\", "/")
-        while raw_ref.startswith("./"):
-            raw_ref = raw_ref[2:]
+        raw_ref = _normalize_repo_script_ref(match.group(1))
         if not raw_ref:
             continue
 

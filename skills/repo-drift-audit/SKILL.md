@@ -79,7 +79,7 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scrip
 3. ワーカーから返った計画書を集約書 Artifact（`<Artifact Directory Path>/drift-audit-summary.md`）1 文書にまとめる。
    - 総表（`verdict` と `target_files` を含む）、推奨案つき要協議一覧、自律適用一覧、ワーカーの新規発見、仮採番一覧（`provisional_ids`）、実施順序と競合予測を含める。
 4. ユーザーに採択を仰ぎ、採択された項目だけを実装フェーズへ進める。
-   - 計画ワーカーの JSON 出力配列を `scripts/preflight_drift.py plan-tracks`（`--plans-json` または `--stdin`、`--format` は `json` か `markdown`）へ渡し、`verdict == "confirmed"` 項目の `target_files` 連結成分（Union-Find）から排他トラック境界と `provisional_ids` 衝突候補を機械算出する。
+   - 計画ワーカーの出力からユーザーが採択した項目（いずれも `verdict == "confirmed"`）だけを抽出した JSON 配列を `scripts/preflight_drift.py plan-tracks`（`--plans-json` または `--stdin`、`--format` は `json` か `markdown`）へ渡し、`target_files` 連結成分（Union-Find）から排他トラック境界と `provisional_ids` 衝突候補を機械算出する。
    - 大規模監査後に実装フェーズを別セッション（`/boost` や `/swarm`）へ切り離す場合は、`session-phase-split` と `session-handoff` に従って引き継ぐ。
 
 ```powershell
@@ -91,10 +91,11 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scrip
    - 他トラック所有のファイルを変更せずに済むか検討し、避けられない呼び出しは公開シグネチャを維持したファサード化（薄い委譲層の追加）で吸収する指定を計画へ入れる。
    - 並列実装の既定（モード A）は `run_workflow` の `parallel()` で `agent(..., workspace="branch")` を指定する。
      完全独立クローン上で専用ブランチ `audit/<slug>` を作成し、編集、テスト、コミット、必要に応じた PR 作成までワーカーが完結する。
-   - `workspace="share"`（`git worktree` 相当で下層 `.git` を共有）や同一ワークスペースで親が順次コミットする運用（モード B）を選ぶ場合は、ワーカーの責務を許可ファイルの編集とテスト実行結果の返却までに限定し、ブランチ切替、コミット、push を禁止する。
+   - 代替のモード B として `workspace="share"`（`git worktree` 相当で作業ツリーを分離し下層 `.git` を共有）を使う場合は、ワーカー専用のローカル作業ブランチへコミットさせ（push と PR 作成は禁止）、親がレビュー後に統合または `cherry-pick` する。
+     単一ワークスペースで親が順次統合する場合はブランチ切替、コミット、push を禁止し、未コミット編集とテスト結果を親へ返させる。
    - 計画書の絶対パスをプロンプトで渡し、`child-prompts.md` の該当モード定型に沿って lint、typecheck、test の全パス、および `finish` スキーマ（`{summary, branch_or_pr, test_status, notes, blockers}`）での報告を完了条件にする。
    - 各トラックのコミットや PR 作成前には、任意で `invariant-gate`（`check_invariants_decision1.py`）を併用して実装差分の規約違反を確認できる。
-6. 各ワーカーの出力を回収し、ブランチの統合（または PR 一覧、モード B では親による差分検証と順次コミット）と、見送った事項に先送り理由と再検討条件を添えた残課題をユーザーへ報告する。
+6. 各ワーカーの出力を回収し、ブランチの統合（または PR 一覧、モード B の `workspace="share"` はローカル専用ブランチの統合や `cherry-pick`、単一ワークスペースは差分検証と順次コミット）と、見送った事項に先送り理由と再検討条件を添えた残課題をユーザーへ報告する。
 
 ## 設計の要点
 
@@ -106,7 +107,7 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scrip
 - 複数トラックが同じファイルの別箇所を触る必要がある場合は `plan-tracks` で同一トラックへ統合され、集約書に共有ファイル衝突理由と統合順を添える。
 - PR やコード変更以外の作業（プラグイン設定の更新、外部サービスの設定変更、ユーザー確認が必要な作業）はワーカーに振らず親エージェントが直接行う。
 - 計画書は各計画ワーカー自身の `<Worker Artifact Directory>/scratch/plans/` へ、集約書は親の `<Artifact Directory Path>/` へそれぞれ置き、作業対象リポジトリに一時計画書を残さない。
-- `workspace="branch"` でワーカーが作成したブランチやコミットは親が差分とテスト結果を確認して統合または PR レビューへ進み、`workspace="share"`（モード B）では親が作業ツリーの変更を確認してコミットする。
+- `workspace="branch"` でワーカーが作成したブランチや PR、および `workspace="share"` で作成したローカル専用ブランチは、親が差分とテスト結果を確認して統合または `cherry-pick` へ進み、単一ワークスペースの順次実装では親が作業ツリーの変更を確認してコミットする。
 
 ## リファクタ系トラックの検証技法
 

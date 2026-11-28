@@ -108,6 +108,7 @@ load_doc_entries = drift_repo.load_doc_entries
 
 _aggregate_usage = drift_format._aggregate_usage
 _escape_md_cell = drift_format._escape_md_cell
+discard_broken_stdout = drift_format.discard_broken_stdout
 format_report_table = drift_format.format_report_table
 emit_report = drift_format.emit_report
 emit_error = drift_format.emit_error
@@ -119,6 +120,7 @@ MAX_CHUNK_MAX_ITEMS = 200
 DEFAULT_CANDIDATES_GIT_LOG_LIMIT = 30
 
 HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$")
+LIST_ITEM_START_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$")
 STATUS_HEADER_NAMES: frozenset[str] = frozenset({"状態", "ステータス", "status", "state"})
 COMPLETED_TABLE_MARKERS: frozenset[str] = frozenset(
@@ -685,7 +687,13 @@ def _parse_markdown_backlog(
                 continue
             while i < n:
                 row_line = lines[i]
-                if not row_line.strip() or FENCE_RE.match(row_line) or HEADING_RE.match(row_line):
+                if (
+                    not row_line.strip()
+                    or FENCE_RE.match(row_line)
+                    or HEADING_RE.match(row_line)
+                    or UNCHECKED_TASK_RE.match(row_line)
+                    or LIST_ITEM_START_RE.match(row_line)
+                ):
                     break
                 if "|" not in row_line or TABLE_SEP_RE.match(row_line):
                     break
@@ -1346,7 +1354,8 @@ def _require_api_key(api_key: str) -> None:
 
 
 def _validate_common_args(args: argparse.Namespace) -> None:
-    if getattr(args, "timeout", 1.0) <= 0:
+    raw_timeout = getattr(args, "timeout", None)
+    if raw_timeout is not None and (isinstance(raw_timeout, bool) or raw_timeout <= 0):
         raise DriftScreenError("invalid_timeout", "--timeout は 0 より大きい数を指定してください。", exit_code=2)
     if getattr(args, "max_chars", 1) < 1:
         raise DriftScreenError("invalid_max_chars", "--max-chars は 1 以上の整数を指定してください。", exit_code=2)
@@ -1374,6 +1383,12 @@ def _validate_common_args(args: argparse.Namespace) -> None:
             f"--backend は {sorted(run_decisions.VALID_BACKENDS)} のいずれかを指定してください。",
             exit_code=2,
         )
+    if raw_timeout is not None and backend == "sdk":
+        raise DriftScreenError(
+            "invalid_argument",
+            "--backend sdk では明示的な --timeout 指定に対応していません（--backend auto または rest を指定してください）。",
+            exit_code=2,
+        )
     if hasattr(args, "chunk_max_docs"):
         val = args.chunk_max_docs
         if isinstance(val, bool) or val < 1 or val > MAX_CHUNK_MAX_DOCS:
@@ -1390,6 +1405,15 @@ def _validate_common_args(args: argparse.Namespace) -> None:
                 f"--chunk-max-items は 1 から {MAX_CHUNK_MAX_ITEMS} の整数を指定してください。",
                 exit_code=2,
             )
+
+
+def _resolve_effective_timeout_and_backend(args: argparse.Namespace) -> tuple[float, str]:
+    raw_timeout = getattr(args, "timeout", None)
+    backend = getattr(args, "backend", "auto")
+    if raw_timeout is None:
+        return DEFAULT_TIMEOUT, backend
+    effective_backend = "rest" if backend == "auto" else backend
+    return float(raw_timeout), effective_backend
 
 
 def _unnamespace_answers(
@@ -1504,16 +1528,16 @@ def _run_docs_subcommand(
         return 0
 
     _require_api_key(api_key)
-    backend = getattr(args, "backend", "auto")
+    effective_timeout, effective_backend = _resolve_effective_timeout_and_backend(args)
 
     if batch_mode == "single":
         def _call_one(entry: DocEntry, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
             raw, used_backend = run_decisions.call_decisions_backend(
                 payload,
                 api_key=api_key,
-                backend=backend,
+                backend=effective_backend,
                 endpoint=args.endpoint,
-                timeout=args.timeout,
+                timeout=effective_timeout,
                 opener=opener,
             )
             enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
@@ -1534,9 +1558,9 @@ def _run_docs_subcommand(
             raw, used_backend = run_decisions.call_decisions_backend(
                 chunk["payload"],
                 api_key=api_key,
-                backend=backend,
+                backend=effective_backend,
                 endpoint=args.endpoint,
-                timeout=args.timeout,
+                timeout=effective_timeout,
                 opener=opener,
             )
             enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
@@ -1667,13 +1691,13 @@ def _run_backlog_subcommand(
         return 0
 
     _require_api_key(api_key)
-    backend = getattr(args, "backend", "auto")
+    effective_timeout, effective_backend = _resolve_effective_timeout_and_backend(args)
     raw, used_backend = run_decisions.call_decisions_backend(
         payload,
         api_key=api_key,
-        backend=backend,
+        backend=effective_backend,
         endpoint=args.endpoint,
-        timeout=args.timeout,
+        timeout=effective_timeout,
         opener=opener,
     )
     enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
@@ -1844,16 +1868,16 @@ def _run_candidates_subcommand(
         return 0
 
     _require_api_key(api_key)
-    backend = getattr(args, "backend", "auto")
+    effective_timeout, effective_backend = _resolve_effective_timeout_and_backend(args)
 
     if batch_mode == "single":
         def _call_one(candidate: AuditCandidate, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
             raw, used_backend = run_decisions.call_decisions_backend(
                 payload,
                 api_key=api_key,
-                backend=backend,
+                backend=effective_backend,
                 endpoint=args.endpoint,
-                timeout=args.timeout,
+                timeout=effective_timeout,
                 opener=opener,
             )
             enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
@@ -1880,9 +1904,9 @@ def _run_candidates_subcommand(
             raw, used_backend = run_decisions.call_decisions_backend(
                 chunk["payload"],
                 api_key=api_key,
-                backend=backend,
+                backend=effective_backend,
                 endpoint=args.endpoint,
-                timeout=args.timeout,
+                timeout=effective_timeout,
                 opener=opener,
             )
             enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
@@ -1947,7 +1971,12 @@ def _add_shared_api_options(parser: argparse.ArgumentParser, default_max_chars: 
         help="API 呼び出し経路（既定: auto、SDK 優先で REST フォールバック）",
     )
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Decisions API エンドポイント URL")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP タイムアウト秒（既定: 30）")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="HTTP タイムアウト秒（既定: 30、明示指定時は REST 経路を使用）",
+    )
     parser.add_argument(
         "--min-confidence",
         type=float,
@@ -2134,11 +2163,6 @@ def main(
                 stdin_text=stdin_text,
             )
         raise DriftScreenError("unknown_subcommand", f"不明なサブコマンドです: {args.subcommand}", exit_code=2)
-    except OSError as exc:
-        if decision_common.is_broken_pipe_error(exc):
-            return 0
-        _emit_error("unexpected_error", str(exc), 2, args.format, api_key)
-        return 2
     except DriftScreenError as exc:
         _emit_error(exc.code, exc.message, exc.exit_code, args.format, api_key)
         return exc.exit_code
@@ -2155,8 +2179,19 @@ def main(
         msg = exc.message if isinstance(exc, run_decisions.ApiRequestError) else str(exc)
         _emit_error("api_request_failed", f"API 呼び出しエラー: {msg}", 1, args.format, api_key)
         return 1
+    except OSError as exc:
+        if decision_common.is_broken_pipe_error(exc):
+            discard_fn = getattr(drift_format, "discard_broken_stdout", None)
+            if callable(discard_fn):
+                discard_fn()
+            return 0
+        _emit_error("unexpected_error", str(exc), 2, args.format, api_key)
+        return 2
     except Exception as exc:  # noqa: BLE001
         if decision_common.is_broken_pipe_error(exc):
+            discard_fn = getattr(drift_format, "discard_broken_stdout", None)
+            if callable(discard_fn):
+                discard_fn()
             return 0
         _emit_error("unexpected_error", str(exc), 2, args.format, api_key)
         return 2

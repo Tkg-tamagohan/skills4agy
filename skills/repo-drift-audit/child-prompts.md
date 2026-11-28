@@ -109,10 +109,10 @@ Confirm the target locations on the current branch before editing.
 - Return `{summary, branch_or_pr, test_status, notes, blockers}` via `finish` (all JSON summary strings in Japanese, following `japanese-tech-writing`)
 ```
 
-### モード B プロンプト定型（`workspace="share"` または親順次コミット：編集とテストのみ）
+### モード B プロンプト定型（`workspace="share"` のローカル専用ブランチ、または単一ワークスペースの未コミット返却）
 
 ```text
-You are an implementation worker (Mode B: edits and tests only) for track "<track_name>" in repository <repo_path>.
+You are an implementation worker (Mode B: <worktree-local-branch | single-workspace-uncommitted>) for track "<track_name>" in repository <repo_path>.
 Read the plan `<plan_path>` via `read_file` and treat it as authoritative.
 Confirm the target locations on the current branch before editing.
 
@@ -122,7 +122,8 @@ Confirm the target locations on the current branch before editing.
 - If a call into another track's file is unavoidable, keep its public signature intact and wrap it via a thin delegation facade
 
 ## Shared Rules
-- Do NOT switch branches, create branches, commit, or push (the parent agent handles git commits and integration)
+- If running in `workspace="share"` (isolated worktree sharing `.git`): commit verified edits to your worker-specific local branch `<worker_branch>` (e.g., `audit/<slug>`), and NEVER push, create a PR, touch other branches, use `--no-verify`, or force push (the parent reviews and integrates or cherry-picks)
+- If running sequentially in a single shared workspace: do NOT switch branches, create branches, commit, or push (leave verified edits uncommitted in the working tree for the parent)
 - Read the repository rules (`<AGENTS.md, authoritative spec docs>`) before editing
 - Follow `japanese-tech-writing` whenever writing or editing Japanese documentation
 - After code changes, run `<lint, typecheck, test commands>` and verify all pass
@@ -130,8 +131,8 @@ Confirm the target locations on the current branch before editing.
 - Do not fix real bugs outside your scope; report them to the parent in `notes`
 
 ## Completion Criteria
-- Leave all verified edits in the working tree without committing, and record the edited file paths and test results
-- Return `{summary, branch_or_pr, test_status, notes, blockers}` via `finish` (set `branch_or_pr` to `"working-tree (uncommitted)"` and list edited files in `summary` or `notes`; write all JSON strings in Japanese, following `japanese-tech-writing`)
+- In `workspace="share"`, commit on `<worker_branch>` without pushing and set `branch_or_pr` to `<worker_branch>`; in single-workspace sequential mode, leave edits uncommitted and set `branch_or_pr` to `"working-tree (uncommitted)"`
+- Return `{summary, branch_or_pr, test_status, notes, blockers}` via `finish` (list edited files and test results; write all JSON strings in Japanese, following `japanese-tech-writing`)
 ```
 
 ### `run_workflow` 用 JSON Schema 例
@@ -153,11 +154,11 @@ IMPL_SCHEMA = {
 ## `run_workflow` 呼び出しの注意
 
 - 計画フェーズは読み取り中心のため `workspace="inherit"`（または `invoke_subagent` の `TypeName="research"`）でよい。
-- 計画ワーカーの `finish` 出力配列は、実装フェーズ前に `preflight_drift.py plan-tracks` へ渡して `verdict == "confirmed"` 項目の `target_files` 連結成分から排他トラックを算出する。
+- 計画ワーカーの `finish` 出力からユーザーが採択した項目（いずれも `verdict == "confirmed"`）だけを抽出した JSON 配列を `preflight_drift.py plan-tracks` へ渡し、`target_files` 連結成分から排他トラックを算出する。
 - `workspace="branch"` はリポジトリの完全独立クローンをワーカーごとに作成するため、並列ブランチ作成（`audit/<slug>`）、コミット、PR 作成が他ワーカーの作業や `.git` と干渉しない。
   並列ブランチ運用は `workspace="branch"`（モード A）へ統一して既定とする。
-- `workspace="share"` は `git worktree` 相当で下層 `.git` を共有するため、並列でブランチ切替やコミットを行うと競合や HEAD 参照の不整合を招きやすい。
-  `workspace="share"` や親による順次コミットを選ぶ場合は必ずモード B（編集とテストのみ）を使い、親が差分確認後にコミットする。
+- `workspace="share"` は `git worktree` 相当で作業ツリーを分離しつつ下層 `.git` を共有するため、ワーカー同士が同一ブランチを更新したり push したりすると競合を招きやすい。
+  `workspace="share"` ではワーカー専用のローカル作業ブランチへコミットさせて push と PR 作成を禁止し（親がレビュー後に統合または `cherry-pick`）、単一ワークスペースで親が順次統合する場合は未コミット編集を親の作業ツリーへ残して返す（いずれもモード B）。
 - ワークフローのワーカーは親とコンテキストを共有しないため、対象リポジトリパス、共通規約、および実装フェーズでは計画ワーカーが返した確定済み `plan_path` を親がプロンプト本文へ展開して渡す（計画書の保存先は計画ワーカー自身が `<Worker Artifact Directory>/scratch/plans/<slug>.md` を解決し、保存した実在の絶対パスを `plan_path` で返す）。
 - 親は集約時に各計画ワーカーの `plan_path` を実際に読み取れることを確認し、`workspace="branch"` 等の環境制約により実装ワーカーが他ワーカーの Artifact ディレクトリを `read_file` で直接読めない場合は、確定済み計画書を親の `<Artifact Directory Path>/scratch/plans/` へ複製して渡すか、計画本文を実装ワーカーのプロンプトへ直接展開する。
-- 実装フェーズでワーカーが `workspace="branch"` で作成したブランチや PR は、ワークフロー終了後に親が差分とテスト結果を確認して統合する（または PR レビューへ進める）。
+- 実装フェーズで `workspace="branch"`（モード A）や `workspace="share"`（モード B）によりワーカーが作成したブランチや PR は、ワークフロー終了後に親が差分とテスト結果を確認して統合または `cherry-pick` する。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""preflight_drift.py のオフライン単体テスト（PFD-01〜PFD-08）。"""
+"""preflight_drift.py のオフライン単体テスト（PFD-01〜PFD-11）。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -380,10 +381,93 @@ class PlanTracksTests(unittest.TestCase):
                 if type(exc) is OSError and os.name != "nt":
                     continue
                 err_buf = io.StringIO()
-                with mock.patch.object(sys, "stdout", _BrokenStream(exc)), redirect_stderr(err_buf):
-                    code = pfd.main(["scan", "--repo", str(root), "--format", "json"])
+                broken_stream = _BrokenStream(exc)
+                with mock.patch.object(sys, "stdout", broken_stream), redirect_stderr(err_buf):
+                    try:
+                        code = pfd.main(["scan", "--repo", str(root), "--format", "json"])
+                    finally:
+                        if sys.stdout is not broken_stream and getattr(sys.stdout, "name", None) == os.devnull:
+                            sys.stdout.close()
                 self.assertEqual(code, 0)
                 self.assertEqual(err_buf.getvalue(), "")
+
+    def test_PFD_09_scan_masks_secret_tokens_in_hints_and_outputs(self) -> None:
+        """PFD-09: scan が文書内の擬似シークレットを含む不在パス等をマスクして出力する。"""
+        dummy_gh = "ghp_" + ("Z" * 30)
+        dummy_ai = "AIza" + ("Y" * 28)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            (root / "README.md").write_text(
+                f"# Guide\n\nSee `docs/{dummy_gh}.md` and `docs/{dummy_ai}.py`.\n",
+                encoding="utf-8",
+            )
+            for fmt in ("json", "markdown", "candidates-json"):
+                code, out, err = _run_preflight(["scan", "--repo", str(root), "--format", fmt])
+                self.assertEqual(code, 0, msg=err)
+                self.assertNotIn(dummy_gh, out)
+                self.assertNotIn(dummy_ai, out)
+                self.assertIn("[REDACTED]", out)
+
+    def test_PFD_10_test_file_classification_outside_test_dirs(self) -> None:
+        """PFD-10: pkg/api_test.go や src/App.test.tsx のようなディレクトリ外テストファイルをテストとして分類する。"""
+        self.assertTrue(pfd._is_test_file("pkg/api_test.go"))
+        self.assertTrue(pfd._is_test_file("src/App.test.tsx"))
+        self.assertTrue(pfd._is_test_file("src/auth.spec.ts"))
+        self.assertFalse(pfd._is_test_file("src/app.py"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pkg").mkdir()
+            (root / "src").mkdir()
+            (root / "pkg" / "api_test.go").write_text("// GO-10 test only\n", encoding="utf-8")
+            (root / "src" / "App.test.tsx").write_text("// TSX-20 test only\n", encoding="utf-8")
+            (root / "src" / "main.go").write_text("// GO-99 prod only\n", encoding="utf-8")
+
+            code, out, err = _run_preflight(["scan", "--repo", str(root), "--format", "json"])
+            self.assertEqual(code, 0, msg=err)
+            spec = json.loads(out)["spec_id_audit"]
+            by_id = {e["id"]: e for e in spec["code_only_ids"]}
+            self.assertTrue(by_id["GO-10"]["is_test_only"])
+            self.assertTrue(by_id["TSX-20"]["is_test_only"])
+            self.assertFalse(by_id["GO-99"]["is_test_only"])
+
+    def test_PFD_11_subprocess_broken_pipe_exits_zero(self) -> None:
+        """PFD-11: 実子プロセスでパイプ読み端を早期クローズしたとき preflight_drift.py が終了コード 0 を返す。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            for i in range(40):
+                (root / "docs" / f"doc_{i:02d}.md").write_text(
+                    f"# Doc {i}\n\nSee `docs/missing_{i:02d}.md` and REQ-{i + 10:02d}.\n",
+                    encoding="utf-8",
+                )
+            sub_env = os.environ.copy()
+            sub_env["PYTHONUTF8"] = "1"
+            sub_env["PYTHONIOENCODING"] = "utf-8"
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-B",
+                    str(_SCRIPT_DIR / "preflight_drift.py"),
+                    "scan",
+                    "--repo",
+                    str(root),
+                    "--format",
+                    "markdown",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=sub_env,
+            )
+            assert proc.stdout is not None and proc.stderr is not None
+            proc.stdout.read(1)
+            proc.stdout.close()
+            stderr_bytes = proc.stderr.read()
+            proc.stderr.close()
+            rc = proc.wait(timeout=10)
+            self.assertEqual(rc, 0, msg=stderr_bytes.decode("utf-8", errors="replace"))
+            self.assertEqual(stderr_bytes, b"")
 
 
 if __name__ == "__main__":

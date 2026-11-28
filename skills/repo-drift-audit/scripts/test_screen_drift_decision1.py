@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""screen_drift_decision1.py のオフライン単体テスト（SDD-01〜SDD-25）。
+"""screen_drift_decision1.py のオフライン単体テスト（SDD-01〜SDD-29）。
 
 外部通信を行わず、モック opener 注入と一時ディレクトリ（非 Git および Git）を用いて
 docs / backlog / candidates の 3 モード（chunk 既定および single 互換）、決定論的ヒント、
@@ -679,12 +679,12 @@ class SecurityAndErrorHandlingTests(unittest.TestCase):
     def test_SDD_13_secret_patterns_blocked_and_masked_before_api_call(self) -> None:
         """SDD-13: 秘密情報パターンを API 送信前に検出しマスクして遮断する。"""
         secrets = [
-            "-----BEGIN RSA PRIVATE KEY-----\nABC",
-            "AIzaSyDummyGoogleApiKey1234567890",
-            "ghp_DummyGitHubTokenValue1234567890",
-            "github_pat_DummyFineGrainedToken123456",
-            "sk-DummySecretKeyValue1234567890",
-            "AKIAIOSFODNN7EXAMPLE",
+            "-----BEGIN " + "RSA PRIVATE KEY-----\nABC",
+            "AIza" + "SyDummyGoogleApiKey1234567890",
+            "ghp_" + ("DummyGitHubTokenValue" + "1234567890"),
+            "github_pat_" + ("DummyFineGrainedToken" + "123456"),
+            "sk-" + ("DummySecretKeyValue" + "1234567890"),
+            "AKIA" + "IOSFODNN7EXAMPLE",
         ]
         for secret in secrets:
             payload = [
@@ -800,21 +800,23 @@ class SecurityAndErrorHandlingTests(unittest.TestCase):
 
     def test_SDD_18_multiline_pem_block_masking_and_utf8_reconfigure(self) -> None:
         """SDD-18: 複数行 PEM ブロック全体マスクと main() 先頭での UTF-8 再設定を検証する。"""
+        pem_begin = "-----BEGIN " + "RSA PRIVATE KEY-----"
+        pem_end = "-----END " + "RSA PRIVATE KEY-----"
         pem_block = (
-            "-----BEGIN RSA PRIVATE KEY-----\n"
+            f"{pem_begin}\n"
             "MIIEowIBAAKCAQEAsecretbodyline1\n"
             "secretbodyline2\n"
-            "-----END RSA PRIVATE KEY-----"
+            f"{pem_end}"
         )
         masked_block = sdd.mask_secret(f"leak: {pem_block}\ntail")
         self.assertIn("[REDACTED]", masked_block)
         self.assertNotIn("MIIEowIBAAKCAQEAsecretbodyline1", masked_block)
         self.assertNotIn("secretbodyline2", masked_block)
-        self.assertNotIn("BEGIN RSA PRIVATE KEY", masked_block)
-        self.assertNotIn("END RSA PRIVATE KEY", masked_block)
+        self.assertNotIn("BEGIN " + "RSA PRIVATE KEY", masked_block)
+        self.assertNotIn("END " + "RSA PRIVATE KEY", masked_block)
 
-        masked_header = sdd.mask_secret("-----BEGIN PRIVATE KEY-----\npartial_unclosed")
-        self.assertNotIn("BEGIN PRIVATE KEY", masked_header)
+        masked_header = sdd.mask_secret("-----BEGIN " + "PRIVATE KEY-----\npartial_unclosed")
+        self.assertNotIn("BEGIN " + "PRIVATE KEY", masked_header)
         self.assertIn("[REDACTED]", masked_header)
 
         def pem_error_opener(req: object, timeout: float = 30.0) -> _FakeHTTPResponse:
@@ -1232,8 +1234,13 @@ class UpgradeFeaturesTests(unittest.TestCase):
                 if type(exc) is OSError and os.name != "nt":
                     continue
                 err_buf = io.StringIO()
-                with mock.patch.object(sys, "stdout", _BrokenStream(exc)), redirect_stderr(err_buf):
-                    code = sdd.main(["docs", "--repo", str(root), "--dry-run"], env={})
+                broken_stream = _BrokenStream(exc)
+                with mock.patch.object(sys, "stdout", broken_stream), redirect_stderr(err_buf):
+                    try:
+                        code = sdd.main(["docs", "--repo", str(root), "--dry-run"], env={})
+                    finally:
+                        if sys.stdout is not broken_stream and getattr(sys.stdout, "name", None) == os.devnull:
+                            sys.stdout.close()
                 self.assertEqual(code, 0)
                 self.assertEqual(err_buf.getvalue(), "")
 
@@ -1261,6 +1268,173 @@ class UpgradeFeaturesTests(unittest.TestCase):
         )
         for sym in expected_symbols:
             self.assertTrue(hasattr(sdd, sym), msg=f"missing facade symbol: {sym}")
+
+    def test_SDD_26_subprocess_broken_pipe_exits_zero(self) -> None:
+        """SDD-26: 実子プロセスでパイプ読み端を早期クローズしたとき screen_drift_decision1.py が終了コード 0 を返す。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _create_sample_repo(Path(tmp))
+            # OS パイプバッファを超えるサイズにして書き込み中のパイプ切断を確実に発生させる
+            (root / "README.md").write_text(
+                "# Large\n\n" + ("word " * 25000) + "\n",
+                encoding="utf-8",
+            )
+            sub_env = os.environ.copy()
+            sub_env["PYTHONUTF8"] = "1"
+            sub_env["PYTHONIOENCODING"] = "utf-8"
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-B",
+                    str(_SCRIPT_DIR / "screen_drift_decision1.py"),
+                    "docs",
+                    "--repo",
+                    str(root),
+                    "--paths",
+                    "README.md",
+                    "--dry-run",
+                    "--format",
+                    "table",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=sub_env,
+            )
+            assert proc.stdout is not None and proc.stderr is not None
+            proc.stdout.read(1)
+            proc.stdout.close()
+            stderr_bytes = proc.stderr.read()
+            proc.stderr.close()
+            rc = proc.wait(timeout=10)
+            self.assertEqual(rc, 0, msg=stderr_bytes.decode("utf-8", errors="replace"))
+            self.assertEqual(stderr_bytes, b"")
+
+    def test_SDD_27_backlog_checkbox_immediately_after_table_preserved(self) -> None:
+        """SDD-27: 状態表の直後に空行なしで `- [ ] Document A | B` がある場合に取りこぼさない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _create_sample_repo(Path(tmp))
+            bl = root / "BACKLOG.md"
+            bl.write_text(
+                "# Ledger\n\n"
+                "| ID | Task | Status |\n"
+                "| --- | --- | --- |\n"
+                "| T-1 | Table pending item | 未着手 |\n"
+                "- [ ] Document A | B\n",
+                encoding="utf-8",
+            )
+            code, out, err = _run_cli(
+                [
+                    "backlog",
+                    "--backlog",
+                    str(bl),
+                    "--repo",
+                    str(root),
+                    "--include-tables",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ]
+            )
+            self.assertEqual(code, 0, msg=err)
+            items = json.loads(out)["items"]
+            self.assertEqual(len(items), 2)
+            self.assertIn("T-1 | Table pending item", items[0]["text"])
+            self.assertEqual(items[1]["text"], "Document A | B")
+
+    def test_SDD_28_explicit_timeout_forces_rest_on_auto_and_rejects_sdk(self) -> None:
+        """SDD-28: 明示 --timeout 指定時に auto は REST 経路を選び、sdk は終了コード 2 で拒否される。"""
+        cand = json.dumps(
+            [
+                {
+                    "id": "C-1",
+                    "category": "doc_drift",
+                    "title": "Check timeout backend",
+                    "evidence": "ev",
+                    "symptom": "sym",
+                }
+            ]
+        )
+
+        code_sdk, _, err_sdk = _run_cli(
+            ["candidates", "--stdin", "--backend", "sdk", "--timeout", "5"],
+            env={"GEMINI_API_KEY": "k"},
+            stdin_text=cand,
+        )
+        self.assertEqual(code_sdk, 2)
+        self.assertIn("invalid_argument", err_sdk)
+
+        captured: list[dict[str, object]] = []
+
+        def fake_backend(payload: dict[str, object], **kwargs: object) -> tuple[dict[str, object], str]:
+            captured.append(dict(kwargs))
+            resp = {
+                "answers": {
+                    f"cand_0001__{k}": v
+                    for k, v in _make_candidate_response()["answers"].items()  # type: ignore[union-attr]
+                },
+                "usage": {"total_input_tokens": 10, "total_output_tokens": 0, "total_tokens": 10},
+            }
+            return resp, str(kwargs["backend"])
+
+        with mock.patch.object(run_decisions, "call_decisions_backend", side_effect=fake_backend):
+            code_auto, out_auto, err_auto = _run_cli(
+                ["candidates", "--stdin", "--backend", "auto", "--timeout", "5"],
+                env={"GEMINI_API_KEY": "k"},
+                stdin_text=cand,
+            )
+        self.assertEqual(code_auto, 0, msg=err_auto)
+        self.assertEqual(captured[0]["backend"], "rest")
+        self.assertEqual(captured[0]["timeout"], 5.0)
+        self.assertEqual(json.loads(out_auto)["backend"], "rest")
+
+        captured.clear()
+        with mock.patch.object(run_decisions, "call_decisions_backend", side_effect=fake_backend):
+            code_def, _, err_def = _run_cli(
+                ["candidates", "--stdin", "--backend", "auto"],
+                env={"GEMINI_API_KEY": "k"},
+                stdin_text=cand,
+            )
+        self.assertEqual(code_def, 0, msg=err_def)
+        self.assertEqual(captured[0]["backend"], "auto")
+        self.assertEqual(captured[0]["timeout"], sdd.DEFAULT_TIMEOUT)
+
+    def test_SDD_29_rest_read_timeout_returns_exit_code_1(self) -> None:
+        """SDD-29: REST 応答読み取り中の TimeoutError が exit code 2 ではなく exit code 1 (api_request_failed) を返す。"""
+        cand = json.dumps(
+            [
+                {
+                    "id": "C-1",
+                    "category": "doc_drift",
+                    "title": "Check read timeout",
+                    "evidence": "ev",
+                    "symptom": "sym",
+                }
+            ]
+        )
+        secret_key = "SUPER_SECRET_TIMEOUT_KEY"
+
+        class _TimeoutResponse:
+            def read(self) -> bytes:
+                raise TimeoutError(f"timed out with key={secret_key}")
+
+            def __enter__(self) -> "_TimeoutResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+                return False
+
+        def timeout_opener(req: object, timeout: float = 30.0) -> _TimeoutResponse:
+            return _TimeoutResponse()
+
+        code, _, err = _run_cli(
+            ["candidates", "--stdin", "--backend", "rest", "--timeout", "2"],
+            opener=timeout_opener,
+            env={"GEMINI_API_KEY": secret_key},
+            stdin_text=cand,
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("api_request_failed", err)
+        self.assertNotIn(secret_key, err)
+        self.assertIn("[REDACTED]", err)
 
 
 if __name__ == "__main__":

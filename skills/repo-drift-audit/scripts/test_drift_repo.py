@@ -432,6 +432,91 @@ class DriftRepoTests(unittest.TestCase):
         self.assertNotIn(dummy_api_key, err_buf.getvalue())
         self.assertIn("[REDACTED]", err_buf.getvalue())
 
+    def test_DRR_10_home_skill_ref_detects_missing_flags(self) -> None:
+        """DRR-10: $HOME/.../skills/<name>/scripts/<file.py> 形式のみの文書でも不在フラグを検出する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdir = root / "skills" / "demo" / "scripts"
+            sdir.mkdir(parents=True)
+            (sdir / "script.py").write_text(
+                "import argparse\n"
+                "p = argparse.ArgumentParser()\n"
+                "subs = p.add_subparsers(dest='cmd')\n"
+                "d = subs.add_parser('docs')\n"
+                "d.add_argument('--repo')\n",
+                encoding="utf-8",
+            )
+            doc_text = (
+                "```bash\n"
+                'python "$HOME/.gemini/config/plugins/shared-skills/skills/demo/scripts/script.py" docs --bogus\n'
+                "```\n"
+            )
+            ctx = dr.collect_repo_context(root, 0)
+            self.assertEqual(
+                dr.extract_missing_flag_hints(doc_text, "skills/demo/SKILL.md", ctx),
+                ["script.py:--bogus"],
+            )
+
+    def test_DRR_11_unstaged_deleted_tracked_file_detected_as_missing(self) -> None:
+        """DRR-11: Git 追跡済みファイルの未ステージ削除後に _resolve_repo_candidate が False を返す。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            tracked = root / "src" / "tracked.py"
+            tracked.write_text("x = 1\n", encoding="utf-8")
+            (root / "sub").mkdir()
+            subfile = root / "sub" / "a.txt"
+            subfile.write_text("a\n", encoding="utf-8")
+            (root / "README.md").write_text("See `src/tracked.py` and `sub/`.\n", encoding="utf-8")
+
+            try:
+                _init_git_repo(root)
+                _git_commit_at(root, "initial", "2026-11-10T00:00:00Z")
+            except (OSError, subprocess.CalledProcessError) as exc:
+                self.skipTest(f"git unavailable for test: {exc}")
+
+            # ステージせずにディスク上から削除する
+            tracked.unlink()
+            subfile.unlink()
+
+            ctx = dr.collect_repo_context(root, 0)
+            self.assertIn("src/tracked.py", ctx.repo_files_set)
+            self.assertFalse(dr._resolve_repo_candidate("src/tracked.py", "README.md", ctx))
+            self.assertFalse(dr._resolve_repo_candidate("sub/", "README.md", ctx))
+            hints = dr.extract_missing_path_hints(
+                (root / "README.md").read_text(encoding="utf-8"),
+                "README.md",
+                ctx,
+            )
+            self.assertEqual(hints, ["src/tracked.py", "sub/"])
+
+    def test_DRR_12_real_subprocess_broken_pipe_exits_zero(self) -> None:
+        """DRR-12: 実子プロセスで出力パイプ読み端を先に閉じても exit 120 にならず終了コード 0 を返す。"""
+        script_code = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(_SCRIPT_DIR)!r})\n"
+            "import drift_format as df\n"
+            "report = {'status': 'completed', 'subcommand': 'docs', 'total': 1, 'summary': {}, "
+            "'results': [{'file': 'a.md', 'bucket': 'low_priority_clean', 'recommended_action': 'likely_clean', "
+            "'missing_path_hints': [], 'missing_flag_hints': [], 'note': 'X' * 500000}]}\n"
+            "df.emit_report(report, 'json')\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-B", "-c", script_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        # 先頭 1 バイトだけ読んでパイプ読み端を閉じ、子プロセス側の書き込み/終了時フラッシュで破損パイプを再現
+        proc.stdout.read(1)
+        proc.stdout.close()
+        stderr_data = proc.stderr.read().decode("utf-8", errors="replace")
+        proc.stderr.close()
+        rc = proc.wait(timeout=10)
+        self.assertEqual(rc, 0, msg=f"stderr={stderr_data!r}")
+        self.assertEqual(stderr_data, "")
+
 
 if __name__ == "__main__":
     unittest.main()
