@@ -701,7 +701,11 @@ def call_decisions_backend(
     timeout: float = DEFAULT_TIMEOUT,
     opener: Callable[..., Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
-    """SDK 優先または REST で Decisions API を呼び出し、(応答辞書, 使用バックエンド名) を返す。"""
+    """SDK 優先または REST で Decisions API を呼び出し、(応答辞書, 使用バックエンド名) を返す。
+
+    ``timeout`` 引数は REST 経路（``call_decisions_api``）の HTTP タイムアウトとして適用され、
+    SDK 経路（``google.genai.Client``）ではクライアント既定値を用いる。
+    """
     if backend not in VALID_BACKENDS:
         raise ValueError(
             f"不正な backend です: {backend!r}（'auto', 'sdk', 'rest' のいずれかを指定してください）"

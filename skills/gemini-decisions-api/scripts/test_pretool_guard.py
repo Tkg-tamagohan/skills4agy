@@ -2215,6 +2215,122 @@ class TestPretoolGuard(unittest.TestCase):
                     )
                 )
 
+    def test_p2_39_protected_option_abbreviations_rejected(self) -> None:
+        """P2-39: argparse オプション省略形による保護オプション検査回避を拒否し、正規非保護フラグ（--pr 等）は allow を維持する。"""
+        repo_root = Path(__file__).resolve().parents[3]
+        rejected_cmds = [
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --endp https://evil.example/ --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --endp=https://evil.example/ --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --end https://evil.example/ --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --facts .env --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --pat .env --dry-run",
+            "python skills/pr-review-triage/scripts/pr_ops.py status --cw /tmp --output ./evil.json",
+            "python skills/pr-review-triage/scripts/pr_ops.py status --pr-j .env",
+            "python skills/plugin-authoring/scripts/audit_skills_weekly.py --pr ../outside --no-git",
+        ]
+        for cmd in rejected_cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(pg.evaluate_stage1(cmd, cwd=str(repo_root)))
+
+        allowed_cmds = [
+            "python skills/pr-review-triage/scripts/pr_ops.py status --pr 15",
+            "python skills/pr-review-triage/scripts/pr_ops.py status --pr=15",
+        ]
+        for cmd in allowed_cmds:
+            with self.subTest(cmd=cmd):
+                res = pg.evaluate_stage1(cmd, cwd=str(repo_root))
+                self.assertIsNotNone(res)
+                self.assertEqual(res[0], "allow")
+
+    def test_p2_40_drift_paths_glob_symlink_and_secret_targets(self) -> None:
+        """P2-40: --paths グロブ一致先のシンボリックリンク（ファイル・ディレクトリ）および境界外・秘密ファイルを Stage 1 で拒否し、安全ファイルのみ allow する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wt = root / "wt"
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            docs_dir = wt / "docs"
+            docs_dir.mkdir()
+            (docs_dir / "safe.md").write_text("# safe guide\n", encoding="utf-8")
+            outside_file = root / "outside_secret.md"
+            outside_file.write_text("# outside\n", encoding="utf-8")
+            outside_dir = root / "outside_dir"
+            outside_dir.mkdir()
+            (outside_dir / "nested.md").write_text("# outside nested\n", encoding="utf-8")
+
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                ok_res = pg.evaluate_stage1(
+                    "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                    cwd=str(wt),
+                )
+                self.assertIsNotNone(ok_res)
+                self.assertEqual(ok_res[0], "allow")
+
+                # グロブ一致ファイルがリパース/シンボリックリンクの場合は拒否
+                sym_file = docs_dir / "link.md"
+                created_sym_file = False
+                try:
+                    sym_file.symlink_to(outside_file)
+                    created_sym_file = True
+                except OSError:
+                    sym_file.write_text("# mocked link\n", encoding="utf-8")
+
+                if created_sym_file:
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                            cwd=str(wt),
+                        )
+                    )
+                with mock.patch.object(
+                    pg,
+                    "_is_reparse_or_symlink",
+                    side_effect=lambda p: Path(p).name == "link.md",
+                ):
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                            cwd=str(wt),
+                        )
+                    )
+                sym_file.unlink()
+
+                # グロブ走査配下のディレクトリがリパース/シンボリックリンクの場合も拒否
+                sym_sub = docs_dir / "sym_sub"
+                created_sym_dir = False
+                try:
+                    sym_sub.symlink_to(outside_dir, target_is_directory=True)
+                    created_sym_dir = True
+                except OSError:
+                    sym_sub.mkdir()
+                    (sym_sub / "nested.md").write_text("# mocked nested\n", encoding="utf-8")
+
+                if created_sym_dir:
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                            cwd=str(wt),
+                        )
+                    )
+                with mock.patch.object(
+                    pg,
+                    "_is_reparse_or_symlink",
+                    side_effect=lambda p: Path(p).name == "sym_sub",
+                ):
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                            cwd=str(wt),
+                        )
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

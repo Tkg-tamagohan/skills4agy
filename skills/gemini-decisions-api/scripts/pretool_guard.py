@@ -21,6 +21,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+import decision_common as dc  # noqa: E402
 import decision_hygiene as dh  # noqa: E402
 import run_decisions as rd  # noqa: E402
 
@@ -105,10 +106,14 @@ TRUSTED_SCRIPT_DIR_OPTS: dict[str, frozenset[str]] = {
     ),
     "skills/session-context-audit/scripts/audit_context_metrics.py": frozenset({"--app-data-dir"}),
 }
+NON_PROTECTED_EXACT_PREFIX_OPTS: dict[str, frozenset[str]] = {
+    "skills/pr-review-triage/scripts/pr_ops.py": frozenset({"--pr"}),
+}
 TRUSTED_PLUGIN_TEST_SCRIPT_RE = re.compile(
     r"^skills/[a-z0-9-]+/scripts/test_[a-z0-9_]+\.py$"
 )
 MAX_SAFE_INSPECT_FILE_BYTES = 2 * 1024 * 1024
+MAX_DRIFT_GLOB_SCAN_ENTRIES = 5000
 
 SAFE_ENV_FILENAMES = dh.SAFE_ENV_BASENAMES
 
@@ -2769,6 +2774,24 @@ def _is_safe_trusted_dir_opt_value(dir_val: str, *, base_cwd: Path) -> Path | No
     return dir_cand
 
 
+def _glob_can_descend_into(rel_dir_posix: str, pattern: str) -> bool:
+    """glob パターンが指定された相対ディレクトリ配下へ到達し得るか判定する。"""
+    dir_parts = [p for p in dc.normalize_posix_rel_path(rel_dir_posix).split("/") if p]
+    pat_parts = [p for p in dc.normalize_posix_rel_path(pattern).split("/") if p]
+    if not dir_parts or not pat_parts:
+        return True
+    for idx, pat_seg in enumerate(pat_parts):
+        if "**" in pat_seg:
+            if idx >= len(dir_parts):
+                return True
+            return dc.glob_match(dir_parts[idx], pat_seg)
+        if idx >= len(dir_parts):
+            return True
+        if not dc.glob_match(dir_parts[idx], pat_seg):
+            return False
+    return False
+
+
 def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
     """screen_drift_decision1.py の --paths 引数（相対パスまたはグロブ）が境界内か検証する。"""
     if not path_val or not path_val.strip() or any(ord(ch) < 32 for ch in path_val):
@@ -2795,19 +2818,72 @@ def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
         return False
 
     if any(ch in raw for ch in "*?[]"):
-        prefix_parts: list[str] = []
-        for seg in segments:
-            if any(ch in seg for ch in "*?[]"):
-                break
-            prefix_parts.append(seg)
-        if prefix_parts:
-            try:
-                anchor = Path(base_cwd) if base_cwd else Path.cwd()
-                prefix_cand = anchor.joinpath(*prefix_parts)
-                if os.path.lexists(prefix_cand) and _has_reparse_in_tree(anchor, prefix_cand):
-                    return False
-            except OSError:
+        try:
+            anchor = Path(base_cwd) if base_cwd else Path.cwd()
+            if not os.path.lexists(anchor) or _is_reparse_or_symlink(anchor) or not anchor.is_dir():
                 return False
+            real_anchor = Path(os.path.realpath(anchor))
+            prefix_parts: list[str] = []
+            for seg in segments:
+                if any(ch in seg for ch in "*?[]"):
+                    break
+                prefix_parts.append(seg)
+            scan_root = anchor.joinpath(*prefix_parts) if prefix_parts else anchor
+            if prefix_parts and _has_reparse_in_tree(anchor, scan_root):
+                return False
+            if not os.path.lexists(scan_root) or not scan_root.is_dir():
+                return True
+
+            allow_dot_git = ".git" in segments
+            entries = 0
+            walk_error = False
+
+            def _on_walk_error(_exc: OSError) -> None:
+                nonlocal walk_error
+                walk_error = True
+
+            for dirpath, dirnames, filenames in os.walk(
+                scan_root, followlinks=False, onerror=_on_walk_error
+            ):
+                if walk_error:
+                    return False
+                if not allow_dot_git and ".git" in dirnames:
+                    dirnames.remove(".git")
+                kept_dirs: list[str] = []
+                for dname in dirnames:
+                    entries += 1
+                    if entries > MAX_DRIFT_GLOB_SCAN_ENTRIES:
+                        return False
+                    dpath = Path(dirpath) / dname
+                    rel_dir_posix = dpath.relative_to(anchor).as_posix()
+                    if _is_reparse_or_symlink(dpath):
+                        if _glob_can_descend_into(rel_dir_posix, raw):
+                            return False
+                        continue
+                    kept_dirs.append(dname)
+                dirnames[:] = kept_dirs
+
+                for fname in filenames:
+                    entries += 1
+                    if entries > MAX_DRIFT_GLOB_SCAN_ENTRIES:
+                        return False
+                    full = Path(dirpath) / fname
+                    rel_posix = full.relative_to(anchor).as_posix()
+                    if not dc.glob_match(rel_posix, raw):
+                        continue
+                    if _is_reparse_or_symlink(full):
+                        return False
+                    real_full = Path(os.path.realpath(full))
+                    if not real_full.is_relative_to(real_anchor):
+                        return False
+                    if _is_secret_file_path(rel_posix):
+                        return False
+                    if not _is_safe_non_secret_existing_file(rel_posix, cwd=str(anchor)):
+                        return False
+            if walk_error:
+                return False
+        except OSError:
+            return False
         return True
 
     return _is_safe_non_secret_existing_file(raw, cwd=base_cwd)
@@ -2879,6 +2955,47 @@ def _is_trusted_plugin_script(
     if _has_inline_secret_literal(raw_segment, strict_shell_quotes=True):
         return False
 
+    output_opts = {"--output"}
+    if rel_posix == "skills/pr-review-triage/scripts/pr_ops.py":
+        output_opts = {"--output", "--save-pr-json"}
+    input_opts = {
+        "--input",
+        "--items",
+        "--existing",
+        "--plan",
+        "--summary-file",
+        "--guardrails-items",
+        "--message-file",
+        "--pr-json",
+        "--rules",
+        "--facts-file",
+        "--backlog",
+        "--transcript",
+        "--plans-json",
+    }
+    dir_opts = TRUSTED_SCRIPT_DIR_OPTS.get(rel_posix, frozenset())
+    is_drift_screen = rel_posix == "skills/repo-drift-audit/scripts/screen_drift_decision1.py"
+    protected_long_opts = (
+        {"--endpoint", "--cwd", "--base"}
+        | output_opts
+        | input_opts
+        | dir_opts
+        | ({"--files"} if rel_posix == "skills/pr-review-triage/scripts/pr_ops.py" else set())
+        | ({"--paths"} if is_drift_screen else set())
+    )
+    allowed_exact_prefix_opts = NON_PROTECTED_EXACT_PREFIX_OPTS.get(rel_posix, frozenset())
+    for arg in script_args:
+        if not arg.startswith("--"):
+            continue
+        opt_tok = arg.split("=", 1)[0]
+        if (
+            len(opt_tok) >= 3
+            and opt_tok not in protected_long_opts
+            and opt_tok not in allowed_exact_prefix_opts
+            and any(p.startswith(opt_tok) for p in protected_long_opts)
+        ):
+            return False
+
     # 設計判断 3A: 稼働プラグイン自身および同一 origin を共有する作業クローン上の固定ホワイトリストのみ信頼する。
     # スクリプト引数で --cwd が指定された場合、相対 --output / 入力パスはその解決先基準で検証する。
     effective_script_cwd = cwd
@@ -2918,26 +3035,6 @@ def _is_trusted_plugin_script(
         effective_script_cwd = str(resolved_cwd)
 
     # 出力先および入力ファイル系オプションの境界検査
-    output_opts = {"--output"}
-    if rel_posix == "skills/pr-review-triage/scripts/pr_ops.py":
-        output_opts = {"--output", "--save-pr-json"}
-    input_opts = {
-        "--input",
-        "--items",
-        "--existing",
-        "--plan",
-        "--summary-file",
-        "--guardrails-items",
-        "--message-file",
-        "--pr-json",
-        "--rules",
-        "--facts-file",
-        "--backlog",
-        "--transcript",
-        "--plans-json",
-    }
-    dir_opts = TRUSTED_SCRIPT_DIR_OPTS.get(rel_posix, frozenset())
-    is_drift_screen = rel_posix == "skills/repo-drift-audit/scripts/screen_drift_decision1.py"
     drift_repo_dir: str | None = None
     drift_paths: list[str] = []
     base_dir_for_opts = Path(effective_script_cwd) if effective_script_cwd else Path.cwd()
