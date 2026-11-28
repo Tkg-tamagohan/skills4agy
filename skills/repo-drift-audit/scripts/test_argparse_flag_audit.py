@@ -468,6 +468,118 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 ["ext_cli.py:--alpha-only"],
             )
 
+    def test_AFA_17_raise_system_exit_main_and_sweep_param_isolation(self) -> None:
+        """AFA-17: configure(p) が main() より前に定義され raise SystemExit(main()) で起動しても alpha 専用フラグが beta へ漏れない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "entry_cli.py"
+            cli.write_text(
+                "import argparse\n\n"
+                "def configure(p: argparse.ArgumentParser) -> None:\n"
+                "    p.add_argument('--alpha-only')\n\n"
+                "def main() -> int:\n"
+                "    root_p = argparse.ArgumentParser()\n"
+                "    subs = root_p.add_subparsers(dest='cmd')\n"
+                "    alpha = subs.add_parser('alpha')\n"
+                "    configure(alpha)\n"
+                "    beta = subs.add_parser('beta')\n"
+                "    beta.add_argument('--beta-only')\n"
+                "    return 0\n\n"
+                "if __name__ == '__main__':\n"
+                "    raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text("`entry_cli.py alpha --alpha-only`", [cli]),
+                [],
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text("`entry_cli.py beta --alpha-only`", [cli]),
+                ["entry_cli.py:--alpha-only"],
+            )
+
+    def test_AFA_18_conditional_return_parent_parsers_all_branches_inherited(self) -> None:
+        """AFA-18: make_parent() が if/else で異なる親パーサーを返す場合、両分岐の親フラグが継承元にのみ許容される。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "cond_parent.py"
+            cli.write_text(
+                "import argparse\n"
+                "FLAG = True\n\n"
+                "def make_parent() -> argparse.ArgumentParser:\n"
+                "    if FLAG:\n"
+                "        p1 = argparse.ArgumentParser(add_help=False)\n"
+                "        p1.add_argument('--parent-a')\n"
+                "        return p1\n"
+                "    else:\n"
+                "        p2 = argparse.ArgumentParser(add_help=False)\n"
+                "        p2.add_argument('--parent-b')\n"
+                "        return p2\n\n"
+                "def build() -> argparse.ArgumentParser:\n"
+                "    root_p = argparse.ArgumentParser()\n"
+                "    subs = root_p.add_subparsers(dest='cmd')\n"
+                "    alpha = subs.add_parser('alpha', parents=[make_parent()])\n"
+                "    alpha.add_argument('--alpha-only')\n"
+                "    beta = subs.add_parser('beta')\n"
+                "    beta.add_argument('--beta-only')\n"
+                "    return root_p\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text(
+                    "`cond_parent.py alpha --parent-a --parent-b --alpha-only`", [cli]
+                ),
+                [],
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text(
+                    "`cond_parent.py beta --parent-a --parent-b`", [cli]
+                ),
+                ["cond_parent.py:--parent-a", "cond_parent.py:--parent-b"],
+            )
+
+    def test_AFA_19_shadowing_and_unconditional_redef_replace_outer_defs(self) -> None:
+        """AFA-19: 内側シャドウイングと同スコープ無条件再定義が外側フラグを内側呼び出しへ混入させない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "shadow_cli.py"
+            cli.write_text(
+                "import argparse\n\n"
+                "def redef(p: argparse.ArgumentParser) -> None:\n"
+                "    p.add_argument('--dead-old')\n\n"
+                "def redef(p: argparse.ArgumentParser) -> None:\n"
+                "    p.add_argument('--live-new')\n\n"
+                "def configure(p: argparse.ArgumentParser) -> None:\n"
+                "    p.add_argument('--outer-only')\n\n"
+                "def build() -> argparse.ArgumentParser:\n"
+                "    root_p = argparse.ArgumentParser()\n"
+                "    subs = root_p.add_subparsers(dest='cmd')\n"
+                "    beta = subs.add_parser('beta')\n"
+                "    configure(beta)\n"
+                "    redef(beta)\n"
+                "    alpha = subs.add_parser('alpha')\n"
+                "    def configure(p: argparse.ArgumentParser) -> None:\n"
+                "        p.add_argument('--inner-only')\n"
+                "    configure(alpha)\n"
+                "    return root_p\n",
+                encoding="utf-8",
+            )
+            self.assertNotIn("--dead-old", afa.extract_argparse_flags(cli))
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text(
+                    "`shadow_cli.py alpha --inner-only` `shadow_cli.py beta --outer-only --live-new`",
+                    [cli],
+                ),
+                [],
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text(
+                    "`shadow_cli.py alpha --outer-only --dead-old`",
+                    [cli],
+                ),
+                ["shadow_cli.py:--dead-old", "shadow_cli.py:--outer-only"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
