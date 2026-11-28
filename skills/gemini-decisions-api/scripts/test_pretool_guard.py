@@ -1975,6 +1975,673 @@ class TestPretoolGuard(unittest.TestCase):
                 self.assertIsNone(pg.evaluate_stage1("git add README.md", cwd=tmp))
                 self.assertIsNone(pg.evaluate_stage1("git commit -F msg.txt", cwd=tmp))
 
+    def test_p2_34_new_trusted_scripts_allow_stage1(self) -> None:
+        """P2-34: R-02 で追加した 7 本の信頼済みスクリプトの安全な --dry-run / 読み取りコマンドを Stage 1 で allow する。"""
+        repo_root = Path(__file__).resolve().parents[3]
+        existing_script_cmds = [
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --dry-run",
+            "python skills/test-suite-pruning/scripts/screen_tests_decision1.py --input candidates.json --dry-run",
+            "python skills/codebase-contract-extract/scripts/discover_contract_scope.py --root . --format json",
+            "python skills/session-handoff/scripts/triage_transcript_decision1.py --transcript transcript.jsonl --dry-run",
+            'python skills/session-log-search/scripts/search_session_logs.py --stats-only "keyword"',
+            "python skills/session-context-audit/scripts/audit_context_metrics.py --dry-run",
+        ]
+        for cmd in existing_script_cmds:
+            with self.subTest(cmd=cmd):
+                res = pg.evaluate_stage1(cmd, cwd=str(repo_root))
+                self.assertIsNotNone(res, f"Expected Stage 1 allow for: {cmd}")
+                self.assertEqual(res[0], "allow")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "wt"
+            (worktree / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (worktree / ".git").mkdir()
+            (worktree / ".git" / "config").write_text(
+                '[remote "origin"]\n\turl = https://github.com/Tkg-tamagohan/skills4agy.git\n',
+                encoding="utf-8",
+            )
+            preflight_path = worktree / "skills" / "repo-drift-audit" / "scripts" / "preflight_drift.py"
+            preflight_path.write_text("# preflight stub\n", encoding="utf-8")
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                res = pg.evaluate_stage1(
+                    "python skills/repo-drift-audit/scripts/preflight_drift.py --repo . --format json",
+                    cwd=str(worktree),
+                )
+                self.assertIsNotNone(res)
+                self.assertEqual(res[0], "allow")
+
+    def test_p2_35_expanded_input_opts_reject_secrets_and_empty(self) -> None:
+        """P2-35: --facts-file / --backlog / --transcript / --plans-json の機密ファイル・秘密混入・空値を Stage 1 で拒否する。"""
+        repo_root = Path(__file__).resolve().parents[3]
+        rejected_cmds = [
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --facts-file .env --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --facts-file=.env --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py backlog --backlog id_rsa --dry-run",
+            "python skills/session-handoff/scripts/triage_transcript_decision1.py --transcript .env --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --plans-json id_ed25519 --dry-run",
+            'python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --facts-file "" --dry-run',
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py backlog --backlog= --dry-run",
+            "python skills/test-suite-pruning/scripts/screen_tests_decision1.py --input= --dry-run",
+        ]
+        for cmd in rejected_cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(pg.evaluate_stage1(cmd, cwd=str(repo_root)))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            secret_facts = wt / "facts_secret.md"
+            secret_facts.write_text("token=" + ("ghp_" + "D" * 36) + "\n", encoding="utf-8")
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --facts-file facts_secret.md --dry-run",
+                        cwd=str(wt),
+                    )
+                )
+
+    def test_p2_36_trusted_script_dir_opts_boundary_and_symlink(self) -> None:
+        """P2-36: TRUSTED_SCRIPT_DIR_OPTS に定義されたディレクトリ引数（--repo / --root / --app-data-dir）の境界・symlink 拒否を検証する。"""
+        repo_root = Path(__file__).resolve().parents[3]
+        rejected_cmds = [
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --repo ../outside --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --repo=../outside --dry-run",
+            "python skills/codebase-contract-extract/scripts/discover_contract_scope.py --root ../outside --format json",
+            "python skills/codebase-contract-extract/scripts/discover_contract_scope.py --root=../outside --format json",
+            "python skills/session-handoff/scripts/triage_transcript_decision1.py --app-data-dir ../outside --dry-run",
+            "python skills/session-log-search/scripts/search_session_logs.py --app-data-dir ../outside --stats-only term",
+            "python skills/session-log-search/scripts/search_session_logs.py --repo ../outside --stats-only term",
+            "python skills/session-context-audit/scripts/audit_context_metrics.py --app-data-dir ../outside --dry-run",
+            'python skills/codebase-contract-extract/scripts/discover_contract_scope.py --root "" --format json',
+            "python skills/session-context-audit/scripts/audit_context_metrics.py --app-data-dir= --dry-run",
+            "python skills/session-log-search/scripts/search_session_logs.py --app-data-dir ~/.ssh --stats-only term",
+        ]
+        for cmd in rejected_cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(pg.evaluate_stage1(cmd, cwd=str(repo_root)))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "codebase-contract-extract" / "scripts").mkdir(parents=True)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "codebase-contract-extract" / "scripts" / "discover_contract_scope.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            real_target = wt / "real_target"
+            real_target.mkdir()
+            sym_target = wt / "sym_target"
+            created_real_symlink = False
+            try:
+                sym_target.symlink_to(real_target, target_is_directory=True)
+                created_real_symlink = True
+            except OSError:
+                sym_target.mkdir()
+
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                if created_real_symlink:
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            f'python skills/codebase-contract-extract/scripts/discover_contract_scope.py --root "{sym_target}" --format json',
+                            cwd=str(wt),
+                        )
+                    )
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --repo sym_target --dry-run",
+                            cwd=str(wt),
+                        )
+                    )
+                with mock.patch.object(
+                    pg,
+                    "_is_reparse_or_symlink",
+                    side_effect=lambda p: Path(p).name == "sym_target",
+                ):
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            f'python skills/codebase-contract-extract/scripts/discover_contract_scope.py --root "{sym_target}" --format json',
+                            cwd=str(wt),
+                        )
+                    )
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --repo sym_target --dry-run",
+                            cwd=str(wt),
+                        )
+                    )
+
+    def test_p2_37_trusted_script_endpoint_validation(self) -> None:
+        """P2-37: 全信頼済みスクリプトで非既定 --endpoint を Stage 1 拒否し、DEFAULT_ENDPOINT のみ allow する。"""
+        repo_root = Path(__file__).resolve().parents[3]
+        rejected_cmds = [
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --endpoint https://evil.example/ --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --endpoint=https://evil.example/ --dry-run",
+            "python skills/test-suite-pruning/scripts/screen_tests_decision1.py --input candidates.json --endpoint https://evil.example/ --dry-run",
+            "python skills/session-handoff/scripts/triage_transcript_decision1.py --transcript transcript.jsonl --endpoint=https://evil.example/ --dry-run",
+            "python skills/pr-review-triage/scripts/triage_decision1.py --input reviews.json --endpoint= --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --dry-run --endpoint",
+        ]
+        for cmd in rejected_cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(pg.evaluate_stage1(cmd, cwd=str(repo_root)))
+
+        allowed_cmds = [
+            f"python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --endpoint {pg.rd.DEFAULT_ENDPOINT} --dry-run",
+            f"python skills/test-suite-pruning/scripts/screen_tests_decision1.py --input candidates.json --endpoint={pg.rd.DEFAULT_ENDPOINT} --dry-run",
+            f"python skills/session-handoff/scripts/triage_transcript_decision1.py --transcript transcript.jsonl --endpoint {pg.rd.DEFAULT_ENDPOINT} --dry-run",
+        ]
+        for cmd in allowed_cmds:
+            with self.subTest(cmd=cmd):
+                res = pg.evaluate_stage1(cmd, cwd=str(repo_root))
+                self.assertIsNotNone(res)
+                self.assertEqual(res[0], "allow")
+
+    def test_p2_38_drift_screen_paths_boundary(self) -> None:
+        """P2-38: screen_drift_decision1.py の --paths 境界検査（機密・外縁・絶対・空値を拒否し安全グロブ/実在ファイルを allow）を検証する。"""
+        repo_root = Path(__file__).resolve().parents[3]
+        rejected_cmds = [
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths .env --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths=.env --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths .env* --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths id_rsa --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths ../outside.md --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths C:/outside.md --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths=/etc/passwd --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths ~/.ssh/config --dry-run",
+            'python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths "$HOME/secret.md" --dry-run',
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths= --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths --dry-run",
+        ]
+        for cmd in rejected_cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(pg.evaluate_stage1(cmd, cwd=str(repo_root)))
+
+        allowed_cmds = [
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths=docs/**/*.md --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths README.md --dry-run",
+        ]
+        for cmd in allowed_cmds:
+            with self.subTest(cmd=cmd):
+                res = pg.evaluate_stage1(cmd, cwd=str(repo_root))
+                self.assertIsNotNone(res)
+                self.assertEqual(res[0], "allow")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            sub_repo = wt / "sub_repo"
+            sub_repo.mkdir()
+            (sub_repo / "safe.md").write_text("# safe doc\n", encoding="utf-8")
+            (sub_repo / "leaky.md").write_text("key=" + ("sk-" + "E" * 24) + "\n", encoding="utf-8")
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                ok_res = pg.evaluate_stage1(
+                    "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths safe.md --repo sub_repo --dry-run",
+                    cwd=str(wt),
+                )
+                self.assertIsNotNone(ok_res)
+                self.assertEqual(ok_res[0], "allow")
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths leaky.md --repo sub_repo --dry-run",
+                        cwd=str(wt),
+                    )
+                )
+
+    def test_p2_39_protected_option_abbreviations_rejected(self) -> None:
+        """P2-39: argparse オプション省略形による保護オプション検査回避を拒否し、正規非保護フラグ（--pr 等）は allow を維持する。"""
+        repo_root = Path(__file__).resolve().parents[3]
+        rejected_cmds = [
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --endp https://evil.example/ --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --endp=https://evil.example/ --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --end https://evil.example/ --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --facts .env --dry-run",
+            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --pat .env --dry-run",
+            "python skills/pr-review-triage/scripts/pr_ops.py status --cw /tmp --output ./evil.json",
+            "python skills/pr-review-triage/scripts/pr_ops.py status --pr-j .env",
+            "python skills/plugin-authoring/scripts/audit_skills_weekly.py --pr ../outside --no-git",
+        ]
+        for cmd in rejected_cmds:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(pg.evaluate_stage1(cmd, cwd=str(repo_root)))
+
+        allowed_cmds = [
+            "python skills/pr-review-triage/scripts/pr_ops.py status --pr 15",
+            "python skills/pr-review-triage/scripts/pr_ops.py status --pr=15",
+        ]
+        for cmd in allowed_cmds:
+            with self.subTest(cmd=cmd):
+                res = pg.evaluate_stage1(cmd, cwd=str(repo_root))
+                self.assertIsNotNone(res)
+                self.assertEqual(res[0], "allow")
+
+    def test_p2_40_drift_paths_glob_symlink_and_secret_targets(self) -> None:
+        """P2-40: --paths グロブ一致先のシンボリックリンク（ファイル・ディレクトリ）および境界外・秘密ファイルを Stage 1 で拒否し、安全ファイルのみ allow する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wt = root / "wt"
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            docs_dir = wt / "docs"
+            docs_dir.mkdir()
+            (docs_dir / "safe.md").write_text("# safe guide\n", encoding="utf-8")
+            outside_file = root / "outside_secret.md"
+            outside_file.write_text("# outside\n", encoding="utf-8")
+            outside_dir = root / "outside_dir"
+            outside_dir.mkdir()
+            (outside_dir / "nested.md").write_text("# outside nested\n", encoding="utf-8")
+
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                ok_res = pg.evaluate_stage1(
+                    "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                    cwd=str(wt),
+                )
+                self.assertIsNotNone(ok_res)
+                self.assertEqual(ok_res[0], "allow")
+
+                # グロブ一致ファイルがリパース/シンボリックリンクの場合は拒否
+                sym_file = docs_dir / "link.md"
+                created_sym_file = False
+                try:
+                    sym_file.symlink_to(outside_file)
+                    created_sym_file = True
+                except OSError:
+                    sym_file.write_text("# mocked link\n", encoding="utf-8")
+
+                if created_sym_file:
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                            cwd=str(wt),
+                        )
+                    )
+                with mock.patch.object(
+                    pg,
+                    "_is_reparse_or_symlink",
+                    side_effect=lambda p: Path(p).name == "link.md",
+                ):
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                            cwd=str(wt),
+                        )
+                    )
+                sym_file.unlink()
+
+                # グロブ走査配下のディレクトリがリパース/シンボリックリンクの場合も拒否
+                sym_sub = docs_dir / "sym_sub"
+                created_sym_dir = False
+                try:
+                    sym_sub.symlink_to(outside_dir, target_is_directory=True)
+                    created_sym_dir = True
+                except OSError:
+                    sym_sub.mkdir()
+                    (sym_sub / "nested.md").write_text("# mocked nested\n", encoding="utf-8")
+
+                if created_sym_dir:
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                            cwd=str(wt),
+                        )
+                    )
+                with mock.patch.object(
+                    pg,
+                    "_is_reparse_or_symlink",
+                    side_effect=lambda p: Path(p).name == "sym_sub",
+                ):
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                            cwd=str(wt),
+                        )
+                    )
+
+    def test_p2_41_drift_glob_brackets_filename_and_input_separation(self) -> None:
+        """P2-41: グロブ一致先の角括弧ファイル名 [draft].md を allow し、秘密入り [secret].md と非グロブ --input [draft].md を拒否する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / "skills" / "test-suite-pruning" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            (wt / "skills" / "test-suite-pruning" / "scripts" / "screen_tests_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            docs_dir = wt / "docs"
+            docs_dir.mkdir()
+            (docs_dir / "[draft].md").write_text("# draft notes\n", encoding="utf-8")
+
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                ok_res = pg.evaluate_stage1(
+                    "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                    cwd=str(wt),
+                )
+                self.assertIsNotNone(ok_res)
+                self.assertEqual(ok_res[0], "allow")
+
+                # 非グロブ引数 (--input) は既存方針どおり角括弧をワイルドカード構文として拒否する
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        "python skills/test-suite-pruning/scripts/screen_tests_decision1.py --input docs/[draft].md --dry-run",
+                        cwd=str(wt),
+                    )
+                )
+
+                # 秘密情報を含む [secret].md は実ファイル検査で拒否する
+                (docs_dir / "[secret].md").write_text(
+                    "token=" + ("ghp_" + "F" * 36) + "\n", encoding="utf-8"
+                )
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/**/*.md --dry-run",
+                        cwd=str(wt),
+                    )
+                )
+
+    def test_p2_42_drift_glob_prunes_unreachable_dirs(self) -> None:
+        """P2-42: *.md 等で非到達のサブディレクトリを枝刈りし、大量ファイル配下でも MAX_DRIFT_GLOB_SCAN_ENTRIES を消費せず allow する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            (wt / "README.md").write_text("# root readme\n", encoding="utf-8")
+            heavy_dir = wt / "heavy_dir"
+            heavy_dir.mkdir()
+            for idx in range(15):
+                (heavy_dir / f"item_{idx:02d}.md").write_text("# heavy\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(
+                    pg,
+                    "_read_git_origin_url",
+                    return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+                ),
+                mock.patch.object(pg, "MAX_DRIFT_GLOB_SCAN_ENTRIES", 5),
+            ):
+                ok_res = pg.evaluate_stage1(
+                    "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths *.md --dry-run",
+                    cwd=str(wt),
+                )
+                self.assertIsNotNone(ok_res)
+                self.assertEqual(ok_res[0], "allow")
+
+                # 到達対象ディレクトリ内のエントリ数が上限を超える場合はフェイルクローズで拒否
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths heavy_dir/**/*.md --dry-run",
+                        cwd=str(wt),
+                    )
+                )
+
+    def test_p2_43_drift_glob_double_star_prefix_pruning(self) -> None:
+        """P2-43: docs/v**/guide.md に対し非一致ディレクトリ docs/latest のリンクは枝刈りして allow し、一致し得る docs/v2 のリンクは拒否する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wt = root / "wt"
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            docs_v1 = wt / "docs" / "v1"
+            docs_v1.mkdir(parents=True)
+            (docs_v1 / "guide.md").write_text("# v1 guide\n", encoding="utf-8")
+
+            outside_dir = root / "outside_dir"
+            outside_dir.mkdir()
+            (outside_dir / "guide.md").write_text("# external\n", encoding="utf-8")
+
+            latest_dir = wt / "docs" / "latest"
+            try:
+                latest_dir.symlink_to(outside_dir, target_is_directory=True)
+            except OSError:
+                latest_dir.mkdir()
+                (latest_dir / "guide.md").write_text("# latest\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(
+                    pg,
+                    "_read_git_origin_url",
+                    return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+                ),
+                mock.patch.object(
+                    pg,
+                    "_is_reparse_or_symlink",
+                    side_effect=lambda p: Path(p).name in {"latest", "v2"},
+                ),
+            ):
+                ok_res = pg.evaluate_stage1(
+                    "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/v**/guide.md --dry-run",
+                    cwd=str(wt),
+                )
+                self.assertIsNotNone(ok_res)
+                self.assertEqual(ok_res[0], "allow")
+
+                v2_dir = wt / "docs" / "v2"
+                v2_dir.mkdir()
+                (v2_dir / "guide.md").write_text("# v2\n", encoding="utf-8")
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/v**/guide.md --dry-run",
+                        cwd=str(wt),
+                    )
+                )
+
+    def test_p2_44_drift_glob_preserves_directory_whitespace(self) -> None:
+        """P2-44: 先頭/末尾空白を含むディレクトリ名（' docs' / 'docs '）で strip() による枝刈り漏れを起こさず秘密入りファイルを Stage 1 で拒否する。"""
+        self.assertTrue(pg._glob_segment_match("docs ", "docs *"))
+        self.assertTrue(pg._glob_can_descend_into("docs ", "docs */*.md"))
+        self.assertTrue(pg._glob_can_descend_into(" docs", " docs/*.md"))
+        self.assertFalse(pg._glob_can_descend_into("docs ", "docs/*.md"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            lead_dir = wt / " docs"
+            lead_dir.mkdir()
+            (lead_dir / "secret.md").write_text(
+                "token=" + ("ghp_" + "G" * 36) + "\n", encoding="utf-8"
+            )
+
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        'python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths "**/*.md" --dry-run',
+                        cwd=str(wt),
+                    )
+                )
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        'python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths "*/*.md" --dry-run',
+                        cwd=str(wt),
+                    )
+                )
+
+            # POSIX 環境の末尾空白ディレクトリ ('docs ') も dirnames 変更を追跡するジェネレーターで枝刈り漏れしないことを検証
+            def _walk_trailing_space(
+                _root: Any, *, followlinks: bool = False, onerror: Any = None
+            ) -> Any:
+                dirs = ["docs "]
+                yield (str(wt), dirs, [])
+                if "docs " in dirs:
+                    yield (str(wt / "docs "), [], ["secret.md"])
+
+            with (
+                mock.patch.object(
+                    pg,
+                    "_read_git_origin_url",
+                    return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+                ),
+                mock.patch.object(pg.os, "walk", side_effect=_walk_trailing_space),
+                mock.patch.object(
+                    pg,
+                    "_is_safe_resolved_non_secret_file",
+                    return_value=False,
+                ),
+                mock.patch.object(pg, "_is_reparse_or_symlink", return_value=False),
+            ):
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        'python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths "docs */*.md" --dry-run',
+                        cwd=str(wt),
+                    )
+                )
+
+    def test_p2_45_glob_matching_redos_resistant_and_equivalent(self) -> None:
+        """P2-45: _glob_segment_match / _glob_path_match が病的パターンで指数バックトラッキングせず、通常パターンで glob_to_regex と一致する。"""
+        import time
+        import decision_common as dc
+
+        start = time.monotonic()
+        self.assertFalse(pg._glob_segment_match("a" * 80, "*a" * 20 + "b"))
+        self.assertFalse(pg._glob_path_match("a" * 80, "**a" * 15 + "b"))
+        elapsed_unit = time.monotonic() - start
+        self.assertLess(elapsed_unit, 0.2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            (wt / ("a" * 60 + ".md")).write_text("# benign\n", encoding="utf-8")
+            evil_pat = "**a" * 15 + "b"
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                t0 = time.monotonic()
+                res = pg.evaluate_stage1(
+                    f"python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths {evil_pat} --dry-run",
+                    cwd=str(wt),
+                )
+                elapsed_stage1 = time.monotonic() - t0
+                self.assertLess(elapsed_stage1, 0.2)
+                self.assertIsNotNone(res)
+                self.assertEqual(res[0], "allow")
+
+        cases = [
+            ("docs/a.md", "docs/**/*.md"),
+            ("docs/sub/deep/a.md", "docs/**/*.md"),
+            ("docs/a.md", "./docs/**/*.md"),
+            ("a.md", "**/a.md"),
+            ("/a.md", "**/a.md"),
+            ("a/b/c.md", "a/**/c.md"),
+            ("a/c.md", "a/**/c.md"),
+            ("a/b/c.md", "**"),
+            ("a/b.md", "*.md"),
+            ("a.md", "*.md"),
+            ("ab.md", "a?.md"),
+            ("a/b.md", "a?.md"),
+            (" docs/a.md", "**/*.md"),
+            (" docs/a.md", "*/*.md"),
+            ("docs /b.md", "docs */*.md"),
+        ]
+        for rel_path, pat in cases:
+            with self.subTest(rel_path=rel_path, pat=pat):
+                expected = bool(dc.glob_to_regex(pat).match(rel_path))
+                self.assertEqual(pg._glob_path_match(rel_path, pat), expected)
+
+    def test_p2_46_drift_glob_rejects_control_chars_in_walk_entries(self) -> None:
+        """P2-46: os.walk 内のファイル名・ディレクトリ名に改行等の制御文字が含まれる場合は一致判定前に Stage 1 拒否する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            docs_dir = wt / "docs"
+            docs_dir.mkdir()
+
+            def _walk_newline_file(
+                _root: Any, *, followlinks: bool = False, onerror: Any = None
+            ) -> Any:
+                yield (str(docs_dir), [], ["guide.md\n"])
+
+            def _walk_newline_dir(
+                _root: Any, *, followlinks: bool = False, onerror: Any = None
+            ) -> Any:
+                dirs = ["sub\n"]
+                yield (str(docs_dir), dirs, [])
+                if "sub\n" in dirs:
+                    yield (str(docs_dir / "sub\n"), [], ["guide.md"])
+
+            for walk_fn in (_walk_newline_file, _walk_newline_dir):
+                with (
+                    self.subTest(walk_fn=walk_fn.__name__),
+                    mock.patch.object(
+                        pg,
+                        "_read_git_origin_url",
+                        return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+                    ),
+                    mock.patch.object(pg.os, "walk", side_effect=walk_fn),
+                    mock.patch.object(
+                        pg, "_is_safe_resolved_non_secret_file", return_value=True
+                    ),
+                    mock.patch.object(pg, "_is_reparse_or_symlink", return_value=False),
+                ):
+                    self.assertIsNone(
+                        pg.evaluate_stage1(
+                            'python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths "docs/**/*.md" --dry-run',
+                            cwd=str(wt),
+                        )
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import errno
 import json
+import os
 import re
 import sys
 from typing import Any
@@ -86,12 +88,19 @@ def emit_cli_error(
         print(f"ERROR [{code}]: {safe_msg}", file=target)
 
 
-def normalize_posix_rel_path(path_str: str) -> str:
+def _normalize_rel_separators(path_str: str, *, strip_whitespace: bool) -> str:
     """バックスラッシュをスラッシュへ揃え、先頭の ./ を除いた相対パス文字列を返す。"""
-    norm = path_str.replace("\\", "/").strip()
+    norm = path_str.replace("\\", "/")
+    if strip_whitespace:
+        norm = norm.strip()
     while norm.startswith("./"):
         norm = norm[2:]
     return norm
+
+
+def normalize_posix_rel_path(path_str: str) -> str:
+    """バックスラッシュをスラッシュへ揃え、前後の空白と先頭の ./ を除いた相対パス文字列を返す。"""
+    return _normalize_rel_separators(path_str, strip_whitespace=True)
 
 
 def glob_to_regex(pattern: str) -> re.Pattern[str]:
@@ -116,10 +125,41 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
         else:
             parts.append(re.escape(pat[i]))
             i += 1
-    parts.append("$")
+    parts.append(r"\Z")
     return re.compile("".join(parts))
 
 
 def glob_match(path_str: str, pattern: str) -> bool:
-    """正規化済み POSIX 相対パスに対して ** を含む glob 一致判定を行う。"""
-    return bool(glob_to_regex(pattern).match(normalize_posix_rel_path(path_str)))
+    """POSIX 相対パス（前後空白・改行を除去せず区切りのみ正規化）に対して ** を含む glob 一致判定を行う。"""
+    norm_path = _normalize_rel_separators(path_str, strip_whitespace=False)
+    return bool(glob_to_regex(pattern).match(norm_path))
+
+
+def is_broken_pipe_error(exc: BaseException) -> bool:
+    """パイプ切断（BrokenPipeError / EPIPE / Windows の EINVAL）を示す例外か判定する。"""
+    return (
+        isinstance(exc, BrokenPipeError)
+        or (isinstance(exc, OSError) and exc.errno == errno.EPIPE)
+        or (os.name == "nt" and type(exc) is OSError and exc.errno == errno.EINVAL)
+    )
+
+
+def safe_write_stdout(
+    text: str,
+    *,
+    stream: Any = None,
+    ensure_newline: bool = True,
+) -> bool:
+    """標準出力（または指定ストリーム）へ書き込み、パイプ切断時のみ False を返す。"""
+    target = sys.stdout if stream is None else stream
+    if target is None:
+        return False
+    output = text if (not ensure_newline or text.endswith("\n")) else f"{text}\n"
+    try:
+        target.write(output)
+        target.flush()
+    except OSError as exc:
+        if is_broken_pipe_error(exc):
+            return False
+        raise
+    return True

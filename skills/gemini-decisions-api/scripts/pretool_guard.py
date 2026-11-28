@@ -83,12 +83,36 @@ TRUSTED_PLUGIN_SCRIPTS = frozenset(
         "skills/pr-review-triage/scripts/pr_ops.py",
         "skills/japanese-tech-writing/scripts/slop_lint.py",
         "skills/japanese-tech-writing/scripts/slop_diff.py",
+        "skills/repo-drift-audit/scripts/screen_drift_decision1.py",
+        "skills/repo-drift-audit/scripts/preflight_drift.py",
+        "skills/test-suite-pruning/scripts/screen_tests_decision1.py",
+        "skills/codebase-contract-extract/scripts/discover_contract_scope.py",
+        "skills/session-handoff/scripts/triage_transcript_decision1.py",
+        "skills/session-log-search/scripts/search_session_logs.py",
+        "skills/session-context-audit/scripts/audit_context_metrics.py",
     }
 )
+TRUSTED_SCRIPT_DIR_OPTS: dict[str, frozenset[str]] = {
+    "skills/plugin-authoring/scripts/audit_skills_weekly.py": frozenset(
+        {"--repo", "--prod-root", "--app-data-dir"}
+    ),
+    "skills/repo-drift-audit/scripts/screen_drift_decision1.py": frozenset({"--repo"}),
+    "skills/repo-drift-audit/scripts/preflight_drift.py": frozenset({"--repo"}),
+    "skills/codebase-contract-extract/scripts/discover_contract_scope.py": frozenset({"--root"}),
+    "skills/session-handoff/scripts/triage_transcript_decision1.py": frozenset({"--app-data-dir"}),
+    "skills/session-log-search/scripts/search_session_logs.py": frozenset(
+        {"--app-data-dir", "--repo"}
+    ),
+    "skills/session-context-audit/scripts/audit_context_metrics.py": frozenset({"--app-data-dir"}),
+}
+NON_PROTECTED_EXACT_PREFIX_OPTS: dict[str, frozenset[str]] = {
+    "skills/pr-review-triage/scripts/pr_ops.py": frozenset({"--pr"}),
+}
 TRUSTED_PLUGIN_TEST_SCRIPT_RE = re.compile(
     r"^skills/[a-z0-9-]+/scripts/test_[a-z0-9_]+\.py$"
 )
 MAX_SAFE_INSPECT_FILE_BYTES = 2 * 1024 * 1024
+MAX_DRIFT_GLOB_SCAN_ENTRIES = 5000
 
 SAFE_ENV_FILENAMES = dh.SAFE_ENV_BASENAMES
 
@@ -2233,25 +2257,15 @@ def _has_reparse_in_tree(root: Path, target: Path) -> bool:
     return False
 
 
-def _is_safe_non_secret_existing_file(path_str: str, *, cwd: str = "") -> bool:
-    """--body-file / -F 等に渡されるファイルパスが安全で、実在時はリンク/秘密混入がないか検証する。"""
-    raw = (path_str or "").strip()
-    if not raw or raw == "-" or any(ord(ch) < 32 for ch in raw):
-        return False
-    if any(ch in raw for ch in "*?[]"):
-        return False
-    if _is_secret_file_path(raw):
-        return False
-    expanded = _expand_safe_path_vars(raw)
-    if expanded is None:
-        return False
-    base_cwd = Path(cwd) if cwd else Path.cwd()
-    cand = Path(expanded) if Path(expanded).is_absolute() else (base_cwd / expanded)
+def _is_safe_resolved_non_secret_file(
+    cand: Path, *, base_cwd: Path | None = None, is_relative: bool = False
+) -> bool:
+    """解決済みファイルが存在時にリンク・バイナリ・秘密混入なしの一時検査安全ファイルか検証する。"""
     if not os.path.lexists(cand):
         return True
     if _is_reparse_or_symlink(cand) or not cand.is_file():
         return False
-    if not Path(expanded).is_absolute() and _has_reparse_in_tree(base_cwd, cand):
+    if is_relative and base_cwd is not None and _has_reparse_in_tree(base_cwd, cand):
         return False
     try:
         if cand.stat().st_size > MAX_SAFE_INSPECT_FILE_BYTES:
@@ -2265,6 +2279,26 @@ def _is_safe_non_secret_existing_file(path_str: str, *, cwd: str = "") -> bool:
     if _has_inline_secret_literal(text, strict_shell_quotes=False):
         return False
     return True
+
+
+def _is_safe_non_secret_existing_file(path_str: str, *, cwd: str = "") -> bool:
+    """--body-file / -F 等に渡されるファイルパスが安全で、実在時はリンク/秘密混入がないか検証する。"""
+    raw = (path_str or "").strip()
+    if not raw or raw == "-" or any(ord(ch) < 32 for ch in raw):
+        return False
+    if any(ch in raw for ch in "*?[]"):
+        return False
+    if _is_secret_file_path(raw):
+        return False
+    expanded = _expand_safe_path_vars(raw)
+    if expanded is None:
+        return False
+    base_cwd = Path(cwd) if cwd else Path.cwd()
+    is_relative = not Path(expanded).is_absolute()
+    cand = (base_cwd / expanded) if is_relative else Path(expanded)
+    return _is_safe_resolved_non_secret_file(
+        cand, base_cwd=base_cwd, is_relative=is_relative
+    )
 
 
 def _is_safe_temp_output_path(target: str, *, cwd: str = "") -> bool:
@@ -2724,6 +2758,253 @@ def _classify_whitelisted_gh(
     return False, False
 
 
+def _is_safe_trusted_dir_opt_value(dir_val: str, *, base_cwd: Path) -> Path | None:
+    """信頼済みスクリプトのディレクトリ系引数値を検証し、安全なら解決候補 Path を返す。"""
+    if not dir_val or not dir_val.strip():
+        return None
+    expanded_dir = _expand_safe_path_vars(dir_val)
+    if expanded_dir is None or not _is_safe_filesystem_cd_target(expanded_dir):
+        return None
+    norm_dir = expanded_dir.replace("\\", "/")
+    if ".." in [seg for seg in norm_dir.split("/") if seg]:
+        return None
+    try:
+        dir_path = Path(expanded_dir)
+        is_abs = dir_path.is_absolute()
+        dir_cand = dir_path if is_abs else (base_cwd / expanded_dir)
+        if os.path.lexists(dir_cand) and (
+            _is_reparse_or_symlink(dir_cand) or not dir_cand.is_dir()
+        ):
+            return None
+        if not is_abs and _has_reparse_in_tree(base_cwd, dir_cand):
+            return None
+    except OSError:
+        return None
+    return dir_cand
+
+
+def _glob_segment_match(seg: str, pat_seg: str) -> bool:
+    """空白を保持したまま単一パスセグメント用の glob 一致判定を非正規表現 2 ポインタ法で行う。"""
+    si = 0
+    pi = 0
+    star_pi = -1
+    match_si = 0
+    sn = len(seg)
+    pn = len(pat_seg)
+    while si < sn:
+        if pi < pn and (
+            (pat_seg[pi] == seg[si] and pat_seg[pi] not in {"*", "?"})
+            or (pat_seg[pi] == "?" and seg[si] != "/")
+        ):
+            si += 1
+            pi += 1
+        elif pi < pn and pat_seg[pi] == "*":
+            star_pi = pi
+            match_si = si
+            pi += 1
+        elif star_pi != -1 and seg[match_si] != "/":
+            match_si += 1
+            si = match_si
+            pi = star_pi + 1
+        else:
+            return False
+    while pi < pn and pat_seg[pi] == "*":
+        pi += 1
+    return pi == pn
+
+
+def _glob_path_match(rel_posix: str, pattern: str) -> bool:
+    """POSIX 相対パスに対する ** 対応 glob 一致判定を非正規表現 Thompson NFA で行う（空白保持）。"""
+    pat = pattern.replace("\\", "/")
+    while pat.startswith("./"):
+        pat = pat[2:]
+
+    tokens: list[str] = []
+    i = 0
+    n = len(pat)
+    while i < n:
+        if pat[i : i + 3] == "**/":
+            tokens.append("**/")
+            i += 3
+        elif pat[i : i + 2] == "**":
+            tokens.append("**")
+            i += 2
+        else:
+            tokens.append(pat[i])
+            i += 1
+
+    k_len = len(tokens)
+    nullable = {"**/", "**", "*"}
+
+    def _eps_close(states: set[tuple[int, int]]) -> set[tuple[int, int]]:
+        stack = [st for st in states if st[1] == 0 and st[0] < k_len and tokens[st[0]] in nullable]
+        while stack:
+            k, _ = stack.pop()
+            nxt = (k + 1, 0)
+            if nxt not in states:
+                states.add(nxt)
+                if nxt[0] < k_len and tokens[nxt[0]] in nullable:
+                    stack.append(nxt)
+        return states
+
+    active = _eps_close({(0, 0)})
+    for ch in rel_posix:
+        if not active:
+            return False
+        next_states: set[tuple[int, int]] = set()
+        for k, sub in active:
+            if k >= k_len:
+                continue
+            tok = tokens[k]
+            if tok == "**/":
+                if sub == 0:
+                    next_states.add((k, 1))
+                else:
+                    next_states.add((k, 1))
+                    if ch == "/":
+                        next_states.add((k + 1, 0))
+            elif tok == "**":
+                next_states.add((k, 0))
+            elif tok == "*":
+                if ch != "/":
+                    next_states.add((k, 0))
+            elif tok == "?":
+                if ch != "/":
+                    next_states.add((k + 1, 0))
+            elif ch == tok:
+                next_states.add((k + 1, 0))
+        active = _eps_close(next_states)
+
+    return (k_len, 0) in active
+
+
+def _glob_can_descend_into(rel_dir_posix: str, pattern: str) -> bool:
+    """glob パターンが指定された相対ディレクトリ配下へ到達し得るか判定する（空白を保持）。"""
+    dir_parts = [p for p in rel_dir_posix.replace("\\", "/").split("/") if p]
+    pat_norm = pattern.replace("\\", "/")
+    while pat_norm.startswith("./"):
+        pat_norm = pat_norm[2:]
+    pat_parts = [p for p in pat_norm.split("/") if p]
+    if not dir_parts or not pat_parts:
+        return True
+    for idx, pat_seg in enumerate(pat_parts):
+        if pat_seg == "**":
+            return True
+        if "**" in pat_seg:
+            if idx >= len(dir_parts):
+                return True
+            prefix_pat = pat_seg.split("**", 1)[0] + "*"
+            return _glob_segment_match(dir_parts[idx], prefix_pat)
+        if idx >= len(dir_parts):
+            return True
+        if not _glob_segment_match(dir_parts[idx], pat_seg):
+            return False
+    return False
+
+
+def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
+    """screen_drift_decision1.py の --paths 引数（相対パスまたはグロブ）が境界内か検証する。"""
+    if not path_val or not path_val.strip() or any(ord(ch) < 32 for ch in path_val):
+        return False
+    raw = path_val.strip()
+    if raw == "-" or raw.startswith(("~", "/", "\\")) or "$" in raw or ":" in raw:
+        return False
+    try:
+        if Path(raw).is_absolute() or WINDOWS_DRIVE_PREFIX_RE.match(raw):
+            return False
+    except OSError:
+        return False
+
+    norm = raw.replace("\\", "/")
+    segments = [seg for seg in norm.split("/") if seg]
+    if not segments or ".." in segments:
+        return False
+    if _is_secret_file_path(raw):
+        return False
+    if any(seg.lower() in SENSITIVE_CD_DIR_NAMES for seg in segments):
+        return False
+    base_low = segments[-1].lower()
+    if (base_low.startswith(".env") and dh.is_blocked_env_path(base_low.rstrip("*?[]"))) or base_low.endswith(".env"):
+        return False
+
+    if any(ch in raw for ch in "*?[]"):
+        try:
+            anchor = Path(base_cwd) if base_cwd else Path.cwd()
+            if not os.path.lexists(anchor) or _is_reparse_or_symlink(anchor) or not anchor.is_dir():
+                return False
+            real_anchor = Path(os.path.realpath(anchor))
+            prefix_parts: list[str] = []
+            for seg in segments:
+                if any(ch in seg for ch in "*?[]"):
+                    break
+                prefix_parts.append(seg)
+            scan_root = anchor.joinpath(*prefix_parts) if prefix_parts else anchor
+            if prefix_parts and _has_reparse_in_tree(anchor, scan_root):
+                return False
+            if not os.path.lexists(scan_root) or not scan_root.is_dir():
+                return True
+
+            allow_dot_git = ".git" in segments
+            entries = 0
+            walk_error = False
+
+            def _on_walk_error(_exc: OSError) -> None:
+                nonlocal walk_error
+                walk_error = True
+
+            for dirpath, dirnames, filenames in os.walk(
+                scan_root, followlinks=False, onerror=_on_walk_error
+            ):
+                if walk_error:
+                    return False
+                if not allow_dot_git and ".git" in dirnames:
+                    dirnames.remove(".git")
+                kept_dirs: list[str] = []
+                for dname in dirnames:
+                    entries += 1
+                    if entries > MAX_DRIFT_GLOB_SCAN_ENTRIES:
+                        return False
+                    if any(ord(ch) < 32 for ch in dname):
+                        return False
+                    dpath = Path(dirpath) / dname
+                    rel_dir_posix = dpath.relative_to(anchor).as_posix()
+                    if not _glob_can_descend_into(rel_dir_posix, raw):
+                        continue
+                    if _is_reparse_or_symlink(dpath):
+                        return False
+                    kept_dirs.append(dname)
+                dirnames[:] = kept_dirs
+
+                for fname in filenames:
+                    entries += 1
+                    if entries > MAX_DRIFT_GLOB_SCAN_ENTRIES:
+                        return False
+                    if any(ord(ch) < 32 for ch in fname):
+                        return False
+                    full = Path(dirpath) / fname
+                    rel_posix = full.relative_to(anchor).as_posix()
+                    if not _glob_path_match(rel_posix, raw):
+                        continue
+                    if _is_reparse_or_symlink(full):
+                        return False
+                    real_full = Path(os.path.realpath(full))
+                    if not real_full.is_relative_to(real_anchor):
+                        return False
+                    if _is_secret_file_path(rel_posix):
+                        return False
+                    if not _is_safe_resolved_non_secret_file(
+                        full, base_cwd=anchor, is_relative=True
+                    ):
+                        return False
+            if walk_error:
+                return False
+        except OSError:
+            return False
+        return True
+
+    return _is_safe_non_secret_existing_file(raw, cwd=base_cwd)
+
+
 def _is_trusted_plugin_script(
     script_tok: str,
     script_args: list[str],
@@ -2790,6 +3071,47 @@ def _is_trusted_plugin_script(
     if _has_inline_secret_literal(raw_segment, strict_shell_quotes=True):
         return False
 
+    output_opts = {"--output"}
+    if rel_posix == "skills/pr-review-triage/scripts/pr_ops.py":
+        output_opts = {"--output", "--save-pr-json"}
+    input_opts = {
+        "--input",
+        "--items",
+        "--existing",
+        "--plan",
+        "--summary-file",
+        "--guardrails-items",
+        "--message-file",
+        "--pr-json",
+        "--rules",
+        "--facts-file",
+        "--backlog",
+        "--transcript",
+        "--plans-json",
+    }
+    dir_opts = TRUSTED_SCRIPT_DIR_OPTS.get(rel_posix, frozenset())
+    is_drift_screen = rel_posix == "skills/repo-drift-audit/scripts/screen_drift_decision1.py"
+    protected_long_opts = (
+        {"--endpoint", "--cwd", "--base"}
+        | output_opts
+        | input_opts
+        | dir_opts
+        | ({"--files"} if rel_posix == "skills/pr-review-triage/scripts/pr_ops.py" else set())
+        | ({"--paths"} if is_drift_screen else set())
+    )
+    allowed_exact_prefix_opts = NON_PROTECTED_EXACT_PREFIX_OPTS.get(rel_posix, frozenset())
+    for arg in script_args:
+        if not arg.startswith("--"):
+            continue
+        opt_tok = arg.split("=", 1)[0]
+        if (
+            len(opt_tok) >= 3
+            and opt_tok not in protected_long_opts
+            and opt_tok not in allowed_exact_prefix_opts
+            and any(p.startswith(opt_tok) for p in protected_long_opts)
+        ):
+            return False
+
     # 設計判断 3A: 稼働プラグイン自身および同一 origin を共有する作業クローン上の固定ホワイトリストのみ信頼する。
     # スクリプト引数で --cwd が指定された場合、相対 --output / 入力パスはその解決先基準で検証する。
     effective_script_cwd = cwd
@@ -2829,20 +3151,9 @@ def _is_trusted_plugin_script(
         effective_script_cwd = str(resolved_cwd)
 
     # 出力先および入力ファイル系オプションの境界検査
-    output_opts = {"--output"}
-    if rel_posix == "skills/pr-review-triage/scripts/pr_ops.py":
-        output_opts = {"--output", "--save-pr-json"}
-    input_opts = {
-        "--input",
-        "--items",
-        "--existing",
-        "--plan",
-        "--summary-file",
-        "--guardrails-items",
-        "--message-file",
-        "--pr-json",
-        "--rules",
-    }
+    drift_repo_dir: str | None = None
+    drift_paths: list[str] = []
+    base_dir_for_opts = Path(effective_script_cwd) if effective_script_cwd else Path.cwd()
 
     i = 0
     n = len(script_args)
@@ -2860,55 +3171,60 @@ def _is_trusted_plugin_script(
                 j += 1
             i = j
             continue
-        elif arg in output_opts or arg in input_opts:
+        elif arg == "--paths" and is_drift_screen:
+            j = i + 1
+            while j < n and not script_args[j].startswith("-"):
+                drift_paths.append(script_args[j])
+                j += 1
+            if j == i + 1:
+                return False
+            i = j
+            continue
+        elif (
+            arg in output_opts
+            or arg in input_opts
+            or arg in dir_opts
+            or arg in {"--base", "--endpoint"}
+        ):
             opt_name = arg
             if i + 1 >= n:
                 return False
             opt_val = script_args[i + 1]
             i += 1
-        if opt_name in output_opts:
+
+        if opt_name == "--paths" and is_drift_screen:
+            drift_paths.append(opt_val or "")
+        elif opt_name in output_opts:
             if not _is_safe_temp_output_path(opt_val or "", cwd=effective_script_cwd):
                 return False
         elif opt_name in input_opts:
-            if opt_val and opt_val != "-" and not _is_safe_non_secret_existing_file(opt_val, cwd=effective_script_cwd):
+            if opt_val is None or not opt_val.strip():
                 return False
-        elif arg == "--base" or arg.startswith("--base="):
-            if arg == "--base":
-                if i + 1 >= n:
-                    return False
-                base_val = script_args[i + 1]
-                i += 1
-            else:
-                base_val = arg.split("=", 1)[1]
-            if not base_val or base_val.startswith("-"):
-                return False
-        elif rel_posix == "skills/plugin-authoring/scripts/audit_skills_weekly.py" and (
-            arg in {"--repo", "--prod-root", "--app-data-dir"}
-            or arg.startswith(("--repo=", "--prod-root=", "--app-data-dir="))
-        ):
-            if "=" in arg:
-                dir_val = arg.split("=", 1)[1]
-            else:
-                if i + 1 >= n:
-                    return False
-                dir_val = script_args[i + 1]
-                i += 1
-            expanded_dir = _expand_safe_path_vars(dir_val)
-            if expanded_dir is None or not _is_safe_filesystem_cd_target(expanded_dir):
-                return False
-            norm_dir = expanded_dir.replace("\\", "/")
-            if ".." in [seg for seg in norm_dir.split("/") if seg]:
-                return False
-            dir_cand = (
-                Path(expanded_dir)
-                if Path(expanded_dir).is_absolute()
-                else (Path(effective_script_cwd or ".") / expanded_dir)
-            )
-            if os.path.lexists(dir_cand) and (
-                _is_reparse_or_symlink(dir_cand) or not dir_cand.is_dir()
+            if opt_val != "-" and not _is_safe_non_secret_existing_file(
+                opt_val, cwd=effective_script_cwd
             ):
                 return False
+        elif opt_name == "--base":
+            if not opt_val or opt_val.startswith("-"):
+                return False
+        elif opt_name == "--endpoint":
+            if opt_val != rd.DEFAULT_ENDPOINT:
+                return False
+        elif opt_name in dir_opts:
+            dir_cand = _is_safe_trusted_dir_opt_value(
+                opt_val or "", base_cwd=base_dir_for_opts
+            )
+            if dir_cand is None:
+                return False
+            if is_drift_screen and opt_name == "--repo":
+                drift_repo_dir = str(dir_cand)
         i += 1
+
+    if drift_paths:
+        paths_cwd = drift_repo_dir if drift_repo_dir is not None else effective_script_cwd
+        for p in drift_paths:
+            if not _is_safe_drift_paths_arg(p, base_cwd=paths_cwd):
+                return False
 
     return True
 
