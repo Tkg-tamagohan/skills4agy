@@ -2509,23 +2509,22 @@ class TestPretoolGuard(unittest.TestCase):
                     )
                 )
 
-            # POSIX 環境の末尾空白ディレクトリ ('docs ') も仮想 walk で枝刈り漏れしないことを検証
-            secret_dummy = wt / "secret_dummy.md"
-            secret_dummy.write_text("token=" + ("ghp_" + "H" * 36) + "\n", encoding="utf-8")
+            # POSIX 環境の末尾空白ディレクトリ ('docs ') も dirnames 変更を追跡するジェネレーターで枝刈り漏れしないことを検証
+            def _walk_trailing_space(
+                _root: Any, *, followlinks: bool = False, onerror: Any = None
+            ) -> Any:
+                dirs = ["docs "]
+                yield (str(wt), dirs, [])
+                if "docs " in dirs:
+                    yield (str(wt / "docs "), [], ["secret.md"])
+
             with (
                 mock.patch.object(
                     pg,
                     "_read_git_origin_url",
                     return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
                 ),
-                mock.patch.object(
-                    pg.os,
-                    "walk",
-                    return_value=[
-                        (str(wt), ["docs "], []),
-                        (str(wt / "docs "), [], ["secret.md"]),
-                    ],
-                ),
+                mock.patch.object(pg.os, "walk", side_effect=_walk_trailing_space),
                 mock.patch.object(
                     pg,
                     "_is_safe_resolved_non_secret_file",
@@ -2539,6 +2538,63 @@ class TestPretoolGuard(unittest.TestCase):
                         cwd=str(wt),
                     )
                 )
+
+    def test_p2_45_glob_matching_redos_resistant_and_equivalent(self) -> None:
+        """P2-45: _glob_segment_match / _glob_path_match が病的パターンで指数バックトラッキングせず、通常パターンで glob_to_regex と一致する。"""
+        import time
+        import decision_common as dc
+
+        start = time.monotonic()
+        self.assertFalse(pg._glob_segment_match("a" * 80, "*a" * 20 + "b"))
+        self.assertFalse(pg._glob_path_match("a" * 80, "**a" * 15 + "b"))
+        elapsed_unit = time.monotonic() - start
+        self.assertLess(elapsed_unit, 0.2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            (wt / ("a" * 60 + ".md")).write_text("# benign\n", encoding="utf-8")
+            evil_pat = "**a" * 15 + "b"
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                t0 = time.monotonic()
+                res = pg.evaluate_stage1(
+                    f"python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths {evil_pat} --dry-run",
+                    cwd=str(wt),
+                )
+                elapsed_stage1 = time.monotonic() - t0
+                self.assertLess(elapsed_stage1, 0.2)
+                self.assertIsNotNone(res)
+                self.assertEqual(res[0], "allow")
+
+        cases = [
+            ("docs/a.md", "docs/**/*.md"),
+            ("docs/sub/deep/a.md", "docs/**/*.md"),
+            ("docs/a.md", "./docs/**/*.md"),
+            ("a.md", "**/a.md"),
+            ("/a.md", "**/a.md"),
+            ("a/b/c.md", "a/**/c.md"),
+            ("a/c.md", "a/**/c.md"),
+            ("a/b/c.md", "**"),
+            ("a/b.md", "*.md"),
+            ("a.md", "*.md"),
+            ("ab.md", "a?.md"),
+            ("a/b.md", "a?.md"),
+            (" docs/a.md", "**/*.md"),
+            (" docs/a.md", "*/*.md"),
+            ("docs /b.md", "docs */*.md"),
+        ]
+        for rel_path, pat in cases:
+            with self.subTest(rel_path=rel_path, pat=pat):
+                expected = bool(dc.glob_to_regex(pat).match(rel_path))
+                self.assertEqual(pg._glob_path_match(rel_path, pat), expected)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,6 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-import decision_common as dc  # noqa: E402
 import decision_hygiene as dh  # noqa: E402
 import run_decisions as rd  # noqa: E402
 
@@ -2785,17 +2784,98 @@ def _is_safe_trusted_dir_opt_value(dir_val: str, *, base_cwd: Path) -> Path | No
 
 
 def _glob_segment_match(seg: str, pat_seg: str) -> bool:
-    """空白を保持したまま単一パスセグメント用の glob 一致判定を行う。"""
-    parts: list[str] = ["^"]
-    for ch in pat_seg:
-        if ch == "*":
-            parts.append("[^/]*")
-        elif ch == "?":
-            parts.append("[^/]")
+    """空白を保持したまま単一パスセグメント用の glob 一致判定を非正規表現 2 ポインタ法で行う。"""
+    si = 0
+    pi = 0
+    star_pi = -1
+    match_si = 0
+    sn = len(seg)
+    pn = len(pat_seg)
+    while si < sn:
+        if pi < pn and (
+            (pat_seg[pi] == seg[si] and pat_seg[pi] not in {"*", "?"})
+            or (pat_seg[pi] == "?" and seg[si] != "/")
+        ):
+            si += 1
+            pi += 1
+        elif pi < pn and pat_seg[pi] == "*":
+            star_pi = pi
+            match_si = si
+            pi += 1
+        elif star_pi != -1 and seg[match_si] != "/":
+            match_si += 1
+            si = match_si
+            pi = star_pi + 1
         else:
-            parts.append(re.escape(ch))
-    parts.append("$")
-    return re.compile("".join(parts)).match(seg) is not None
+            return False
+    while pi < pn and pat_seg[pi] == "*":
+        pi += 1
+    return pi == pn
+
+
+def _glob_path_match(rel_posix: str, pattern: str) -> bool:
+    """POSIX 相対パスに対する ** 対応 glob 一致判定を非正規表現 Thompson NFA で行う（空白保持）。"""
+    pat = pattern.replace("\\", "/")
+    while pat.startswith("./"):
+        pat = pat[2:]
+
+    tokens: list[str] = []
+    i = 0
+    n = len(pat)
+    while i < n:
+        if pat[i : i + 3] == "**/":
+            tokens.append("**/")
+            i += 3
+        elif pat[i : i + 2] == "**":
+            tokens.append("**")
+            i += 2
+        else:
+            tokens.append(pat[i])
+            i += 1
+
+    k_len = len(tokens)
+    nullable = {"**/", "**", "*"}
+
+    def _eps_close(states: set[tuple[int, int]]) -> set[tuple[int, int]]:
+        stack = [st for st in states if st[1] == 0 and st[0] < k_len and tokens[st[0]] in nullable]
+        while stack:
+            k, _ = stack.pop()
+            nxt = (k + 1, 0)
+            if nxt not in states:
+                states.add(nxt)
+                if nxt[0] < k_len and tokens[nxt[0]] in nullable:
+                    stack.append(nxt)
+        return states
+
+    active = _eps_close({(0, 0)})
+    for ch in rel_posix:
+        if not active:
+            return False
+        next_states: set[tuple[int, int]] = set()
+        for k, sub in active:
+            if k >= k_len:
+                continue
+            tok = tokens[k]
+            if tok == "**/":
+                if sub == 0:
+                    next_states.add((k, 1))
+                else:
+                    next_states.add((k, 1))
+                    if ch == "/":
+                        next_states.add((k + 1, 0))
+            elif tok == "**":
+                next_states.add((k, 0))
+            elif tok == "*":
+                if ch != "/":
+                    next_states.add((k, 0))
+            elif tok == "?":
+                if ch != "/":
+                    next_states.add((k + 1, 0))
+            elif ch == tok:
+                next_states.add((k + 1, 0))
+        active = _eps_close(next_states)
+
+    return (k_len, 0) in active
 
 
 def _glob_can_descend_into(rel_dir_posix: str, pattern: str) -> bool:
@@ -2865,7 +2945,6 @@ def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
                 return True
 
             allow_dot_git = ".git" in segments
-            glob_rx = dc.glob_to_regex(raw)
             entries = 0
             walk_error = False
 
@@ -2900,7 +2979,7 @@ def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
                         return False
                     full = Path(dirpath) / fname
                     rel_posix = full.relative_to(anchor).as_posix()
-                    if not glob_rx.match(rel_posix):
+                    if not _glob_path_match(rel_posix, raw):
                         continue
                     if _is_reparse_or_symlink(full):
                         return False
