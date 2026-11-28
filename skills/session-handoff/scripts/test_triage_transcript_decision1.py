@@ -893,7 +893,10 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
         self.assertNotIn("...[省略]...", recent_sec)
 
     def test_SH_24_render_markdown_exact_length_boundaries(self) -> None:
-        """SH-24: 各区分の抜粋文字数上限（400 / 1,200）ちょうどと +1 文字の境界を検証する。"""
+        """SH-24: 各区分の抜粋文字数上限（仕様値 400 / 1,200 を固定）ちょうどと +1 文字の境界を検証する。"""
+        SPEC_EXCERPT_LIMIT = 1200
+        SPEC_COMPACT_LIMIT = 400
+
         def make_step(text: str) -> mod.TranscriptStep:
             return mod.TranscriptStep(
                 step_index=0,
@@ -907,10 +910,10 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             )
 
         classified_cases = (
-            ("keep_decision", False, mod.DEFAULT_RENDER_EXCERPT_CHARS),
-            ("keep_gotcha", False, mod.DEFAULT_RENDER_EXCERPT_CHARS),
-            ("keep_state", False, mod.DEFAULT_RENDER_COMPACT_CHARS),
-            ("drop_noise", True, mod.DEFAULT_RENDER_COMPACT_CHARS),
+            ("keep_decision", False, SPEC_EXCERPT_LIMIT),
+            ("keep_gotcha", False, SPEC_EXCERPT_LIMIT),
+            ("keep_state", False, SPEC_COMPACT_LIMIT),
+            ("drop_noise", True, SPEC_COMPACT_LIMIT),
         )
         for choice, is_borderline, limit in classified_cases:
             with self.subTest(kind=choice, is_borderline=is_borderline, limit=limit):
@@ -955,8 +958,8 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
                 )
                 self.assertIn("...[省略]...", md_over)
 
-        with self.subTest(kind="recent_steps", limit=mod.DEFAULT_RENDER_EXCERPT_CHARS):
-            limit = mod.DEFAULT_RENDER_EXCERPT_CHARS
+        with self.subTest(kind="recent_steps", limit=SPEC_EXCERPT_LIMIT):
+            limit = SPEC_EXCERPT_LIMIT
             exact_body = "x" * limit
             over_body = "x" * (limit + 1)
             md_exact = mod.render_markdown(
