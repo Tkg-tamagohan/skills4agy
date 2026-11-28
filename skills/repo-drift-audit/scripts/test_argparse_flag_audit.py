@@ -392,6 +392,82 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 ["tool.py:--typo", "tool.py:--typo-inline"],
             )
 
+    def test_AFA_15_conditional_branch_function_and_method_defs_preserved(self) -> None:
+        """AFA-15: if/else 条件分岐内の同名関数・同名メソッドの両分岐フラグが上書き消失しない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "branch_cli.py"
+            cli.write_text(
+                "import argparse\n"
+                "COND = True\n\n"
+                "if COND:\n"
+                "    def configure(p: argparse.ArgumentParser) -> None:\n"
+                "        p.add_argument('--branch-a')\n"
+                "else:\n"
+                "    def configure(p: argparse.ArgumentParser) -> None:\n"
+                "        p.add_argument('--branch-b')\n\n"
+                "class Helper:\n"
+                "    if COND:\n"
+                "        def add(self, p: argparse.ArgumentParser) -> None:\n"
+                "            p.add_argument('--cls-a')\n"
+                "    else:\n"
+                "        def add(self, p: argparse.ArgumentParser) -> None:\n"
+                "            p.add_argument('--cls-b')\n\n"
+                "def build() -> argparse.ArgumentParser:\n"
+                "    p = argparse.ArgumentParser()\n"
+                "    configure(p)\n"
+                "    Helper().add(p)\n"
+                "    return p\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                afa.extract_argparse_flags(cli),
+                {"--branch-a", "--branch-b", "--cls-a", "--cls-b"},
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text(
+                    "`branch_cli.py --branch-a --branch-b --cls-a --cls-b`", [cli]
+                ),
+                [],
+            )
+
+    def test_AFA_16_method_with_unresolved_external_parser_preserves_flags(self) -> None:
+        """AFA-16: self のみ解決され外部パーサー引数が未解決でも --ext-flag が脱落せず、具体呼び出しの分離も維持する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "ext_cli.py"
+            cli.write_text(
+                "import argparse\n\n"
+                "class App:\n"
+                "    def configure_ext(self, p: argparse.ArgumentParser) -> None:\n"
+                "        p.add_argument('--ext-flag')\n\n"
+                "def configure_sub(p: argparse.ArgumentParser) -> None:\n"
+                "    p.add_argument('--alpha-only')\n\n"
+                "def build(external_p: argparse.ArgumentParser) -> argparse.ArgumentParser:\n"
+                "    App().configure_ext(external_p)\n"
+                "    root_p = argparse.ArgumentParser()\n"
+                "    subs = root_p.add_subparsers(dest='cmd')\n"
+                "    alpha = subs.add_parser('alpha')\n"
+                "    configure_sub(alpha)\n"
+                "    beta = subs.add_parser('beta')\n"
+                "    beta.add_argument('--beta-only')\n"
+                "    return root_p\n",
+                encoding="utf-8",
+            )
+            self.assertIn("--ext-flag", afa.extract_argparse_flags(cli))
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text(
+                    "`ext_cli.py alpha --ext-flag --alpha-only`", [cli]
+                ),
+                [],
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text(
+                    "`ext_cli.py beta --alpha-only`", [cli]
+                ),
+                ["ext_cli.py:--alpha-only"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -78,8 +78,10 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
     except (OSError, SyntaxError):
         return set(), {}
 
-    module_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
-    class_methods: dict[str, dict[str, ast.FunctionDef | ast.AsyncFunctionDef]] = defaultdict(dict)
+    module_funcs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = defaultdict(list)
+    class_methods: dict[
+        str, dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]
+    ] = defaultdict(lambda: defaultdict(list))
     all_nested_funcs: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
 
     def _collect_nested_only(stmts: list[ast.stmt]) -> None:
@@ -107,7 +109,7 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
     def _collect_class_methods(cls_name: str, stmts: list[ast.stmt]) -> None:
         for stmt in stmts:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                class_methods[cls_name][stmt.name] = stmt
+                class_methods[cls_name][stmt.name].append(stmt)
                 _collect_nested_only(stmt.body)
             elif isinstance(stmt, ast.ClassDef):
                 _collect_class_methods(stmt.name, stmt.body)
@@ -129,7 +131,7 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
     def _collect_module_callables(stmts: list[ast.stmt]) -> None:
         for stmt in stmts:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                module_funcs[stmt.name] = stmt
+                module_funcs[stmt.name].append(stmt)
                 _collect_nested_only(stmt.body)
             elif isinstance(stmt, ast.ClassDef):
                 _collect_class_methods(stmt.name, stmt.body)
@@ -149,18 +151,12 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
                     _collect_module_callables(handler.body)
 
     _collect_module_callables(tree.body)
-    all_functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = [
-        *module_funcs.values(),
-        *(m for methods in class_methods.values() for m in methods.values()),
-        *all_nested_funcs,
-    ]
 
     flags_by_tag: dict[str, set[str]] = defaultdict(set)
     subcommand_names: set[str] = set()
     subparser_roots: set[str] = set()
     parent_edges: dict[str, set[str]] = defaultdict(set)
     parent_sources: set[str] = set()
-    resolved_func_ids: set[int] = set()
     directly_called_func_ids: set[int] = set()
     parser_counter = 0
     active_calls: set[
@@ -180,7 +176,9 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
         target_tag: str,
         call: ast.Call,
         env: dict[str, str],
-        lexical_funcs: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]],
+        lexical_funcs: dict[
+            str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]]
+        ],
     ) -> None:
         for kw in call.keywords:
             if kw.arg == "parents" and isinstance(kw.value, (ast.List, ast.Tuple)):
@@ -194,7 +192,9 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
         callee: ast.FunctionDef | ast.AsyncFunctionDef,
         expr: ast.Call,
         env: dict[str, str],
-        lexical_funcs: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]],
+        lexical_funcs: dict[
+            str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]]
+        ],
         *,
         closure_env: dict[str, str] | None = None,
         skip_self_cls: bool = False,
@@ -218,16 +218,14 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
                     bound[kw.arg] = arg_tag
         closure_snap = dict(closure_env) if closure_env else {}
         directly_called_func_ids.add(id(callee))
-        if any(not v.startswith("param:") for v in bound.values()) or any(
-            not v.startswith("param:") for v in closure_snap.values()
-        ):
-            resolved_func_ids.add(id(callee))
         return run_function(callee, bound, closure_snap, lexical_funcs)
 
     def eval_expr(
         expr: ast.AST | None,
         env: dict[str, str],
-        lexical_funcs: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]],
+        lexical_funcs: dict[
+            str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]]
+        ],
     ) -> str | None:
         if expr is None:
             return None
@@ -270,15 +268,21 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
             elif owner_tag is not None and owner_tag.startswith("instance:"):
                 cls_name = owner_tag[len("instance:") :]
 
-            if cls_name is not None and attr in class_methods.get(cls_name, {}):
-                return _bind_and_call(
-                    class_methods[cls_name][attr],
-                    expr,
-                    env,
-                    lexical_funcs,
-                    skip_self_cls=True,
-                    self_instance_tag=f"instance:{cls_name}",
-                )
+            method_cands = class_methods.get(cls_name, {}).get(attr, []) if cls_name else []
+            if method_cands:
+                first_ret: str | None = None
+                for m_fn in method_cands:
+                    ret = _bind_and_call(
+                        m_fn,
+                        expr,
+                        env,
+                        lexical_funcs,
+                        skip_self_cls=True,
+                        self_instance_tag=f"instance:{cls_name}",
+                    )
+                    if first_ret is None and ret is not None:
+                        first_ret = ret
+                return first_ret
             for arg_node in expr.args:
                 eval_expr(arg_node, env, lexical_funcs)
             for kw in expr.keywords:
@@ -290,23 +294,32 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
                 flags_by_tag["unknown:root"].update(_extract_long_flags_from_call(expr))
                 return None
             if func.id in lexical_funcs:
-                callee, closure_env_ref = lexical_funcs[func.id]
-                return _bind_and_call(
-                    callee,
-                    expr,
-                    env,
-                    lexical_funcs,
-                    closure_env=closure_env_ref,
-                    skip_self_cls=False,
-                )
+                first_ret = None
+                for callee, closure_env_ref in list(lexical_funcs[func.id]):
+                    ret = _bind_and_call(
+                        callee,
+                        expr,
+                        env,
+                        lexical_funcs,
+                        closure_env=closure_env_ref,
+                        skip_self_cls=False,
+                    )
+                    if first_ret is None and ret is not None:
+                        first_ret = ret
+                return first_ret
             if func.id in module_funcs:
-                return _bind_and_call(
-                    module_funcs[func.id],
-                    expr,
-                    env,
-                    lexical_funcs,
-                    skip_self_cls=False,
-                )
+                first_ret = None
+                for callee in module_funcs[func.id]:
+                    ret = _bind_and_call(
+                        callee,
+                        expr,
+                        env,
+                        lexical_funcs,
+                        skip_self_cls=False,
+                    )
+                    if first_ret is None and ret is not None:
+                        first_ret = ret
+                return first_ret
             if func.id in class_methods:
                 for arg_node in expr.args:
                     eval_expr(arg_node, env, lexical_funcs)
@@ -328,12 +341,16 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
     def walk_stmts(
         stmts: list[ast.stmt],
         env: dict[str, str],
-        lexical_funcs: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]],
+        lexical_funcs: dict[
+            str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]]
+        ],
     ) -> str | None:
         ret_tag: str | None = None
         for stmt in stmts:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                lexical_funcs[stmt.name] = (stmt, env)
+                entries = lexical_funcs.setdefault(stmt.name, [])
+                if not any(id(fn_item) == id(stmt) for fn_item, _ in entries):
+                    entries.append((stmt, env))
             elif isinstance(stmt, ast.Assign):
                 val_tag = eval_expr(stmt.value, env, lexical_funcs)
                 if val_tag is not None:
@@ -379,7 +396,9 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
         fn: ast.FunctionDef | ast.AsyncFunctionDef,
         bound: dict[str, str],
         closure_env: dict[str, str],
-        parent_lexical: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]],
+        parent_lexical: dict[
+            str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]]
+        ],
     ) -> str | None:
         key = (
             id(fn),
@@ -393,7 +412,9 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
         active_calls.add(key)
         try:
             local_env: dict[str, str] = dict(closure_env)
-            local_lexical = dict(parent_lexical)
+            local_lexical: dict[
+                str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]]
+            ] = {k: list(v) for k, v in parent_lexical.items()}
             all_params = (
                 [a.arg for a in fn.args.posonlyargs]
                 + [a.arg for a in fn.args.args]
@@ -410,8 +431,18 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
         completed_returns[key] = ret
         return ret
 
+    static_callee_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                static_callee_names.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                static_callee_names.add(node.func.attr)
+
     top_env: dict[str, str] = {}
-    top_lexical: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]] = {}
+    top_lexical: dict[
+        str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]]
+    ] = {}
     top_stmts = [
         n
         for n in tree.body
@@ -419,18 +450,30 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
     ]
     walk_stmts(top_stmts, top_env, top_lexical)
 
-    for fn in module_funcs.values():
-        if id(fn) not in directly_called_func_ids:
-            run_function(fn, {}, {}, {})
+    def _run_uncalled_sweep(only_entry_roots: bool) -> None:
+        for fn_name, fn_list in module_funcs.items():
+            if only_entry_roots and fn_name in static_callee_names:
+                continue
+            for fn in fn_list:
+                if id(fn) not in directly_called_func_ids:
+                    run_function(fn, {}, {}, {})
 
-    for cls_name, methods in class_methods.items():
-        for m_fn in methods.values():
-            if id(m_fn) not in directly_called_func_ids:
-                pos_names = [a.arg for a in m_fn.args.posonlyargs] + [a.arg for a in m_fn.args.args]
-                m_bound: dict[str, str] = {}
-                if pos_names and pos_names[0] in ("self", "cls"):
-                    m_bound[pos_names[0]] = f"instance:{cls_name}"
-                run_function(m_fn, m_bound, {}, {})
+        for cls_name, methods in class_methods.items():
+            for m_name, m_list in methods.items():
+                if only_entry_roots and m_name in static_callee_names:
+                    continue
+                for m_fn in m_list:
+                    if id(m_fn) not in directly_called_func_ids:
+                        pos_names = [a.arg for a in m_fn.args.posonlyargs] + [
+                            a.arg for a in m_fn.args.args
+                        ]
+                        m_bound: dict[str, str] = {}
+                        if pos_names and pos_names[0] in ("self", "cls"):
+                            m_bound[pos_names[0]] = f"instance:{cls_name}"
+                        run_function(m_fn, m_bound, {}, {})
+
+    _run_uncalled_sweep(only_entry_roots=True)
+    _run_uncalled_sweep(only_entry_roots=False)
 
     for n_fn in all_nested_funcs:
         if id(n_fn) not in directly_called_func_ids:
@@ -450,12 +493,9 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
     for sub_name in sorted(subcommand_names):
         subcommand_flags[sub_name] = collect_inherited(f"sub:{sub_name}")
 
-    unresolved_param_prefixes = tuple(
-        f"param:{id(fn)}:" for fn in all_functions if id(fn) not in resolved_func_ids
-    )
     root_flags: set[str] = set(flags_by_tag.get("unknown:root", set()))
     for tag, fls in flags_by_tag.items():
-        if tag.startswith("param:") and tag.startswith(unresolved_param_prefixes):
+        if tag.startswith("param:"):
             root_flags.update(fls)
 
     if subcommand_names:
