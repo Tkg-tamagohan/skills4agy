@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""screen_drift_decision1.py のオフライン単体テスト（SDD-01〜SDD-18）。
+"""screen_drift_decision1.py のオフライン単体テスト（SDD-01〜SDD-25）。
 
 外部通信を行わず、モック opener 注入と一時ディレクトリ（非 Git および Git）を用いて
-docs / backlog / candidates の 3 モード、決定論的ヒント、安全側分類、秘密情報遮断、
-上限ガード、安全フィルタ遮断（HTTP 400 / HTTP 200）、並列順序保持を検証する。
+docs / backlog / candidates の 3 モード（chunk 既定および single 互換）、決定論的ヒント、
+見出しパンくず、表形式バックログ、--backend 切替、安全側分類、秘密情報遮断、
+上限ガード、安全フィルタ遮断（HTTP 400 / HTTP 200）、パイプ切断終了を検証する。
 """
 
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import errno
 import io
 import json
 import os
@@ -235,11 +237,32 @@ class DocsModeTests(unittest.TestCase):
             self.assertEqual(hints, ["src/deleted.py", "src/missing.py"])
 
     def test_SDD_03_docs_dry_run_and_table_non_git_fallback(self) -> None:
-        """SDD-03: 非 Git リポジトリでの docs --dry-run が json / table 形式で動作する。"""
+        """SDD-03: 非 Git リポジトリでの docs --dry-run が既定 chunk と single 互換の双方で json / table 動作する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = _create_sample_repo(Path(tmp))
-            code, out, err = _run_cli(
+            # 既定 chunk モード
+            code_c, out_c, err_c = _run_cli(
                 ["docs", "--repo", str(root), "--dry-run", "--format", "json"],
+            )
+            self.assertEqual(code_c, 0, msg=err_c)
+            report_c = json.loads(out_c)
+            self.assertEqual(report_c["status"], "dry_run")
+            self.assertEqual(report_c["batch_mode"], "chunk")
+            self.assertFalse(report_c["is_git"])
+            self.assertEqual(report_c["total"], 3)
+            self.assertEqual(report_c["chunk_count"], 1)
+            self.assertEqual(report_c["chunks"][0]["files"], ["README.md", "docs/broken.md", "docs/clean.md"])
+
+            code_ct, out_ct, err_ct = _run_cli(
+                ["docs", "--repo", str(root), "--dry-run", "--format", "table"],
+            )
+            self.assertEqual(code_ct, 0, msg=err_ct)
+            self.assertIn("docs/broken.md", out_ct)
+            self.assertIn("Summary: dry_run subcommand=docs total=3, batch_mode=chunk, chunk_count=1", out_ct)
+
+            # single 互換モード
+            code, out, err = _run_cli(
+                ["docs", "--repo", str(root), "--batch-mode", "single", "--dry-run", "--format", "json"],
             )
             self.assertEqual(code, 0, msg=err)
             report = json.loads(out)
@@ -250,7 +273,7 @@ class DocsModeTests(unittest.TestCase):
             self.assertEqual(files, ["README.md", "docs/broken.md", "docs/clean.md"])
 
             code_t, out_t, err_t = _run_cli(
-                ["docs", "--repo", str(root), "--dry-run", "--format", "table"],
+                ["docs", "--repo", str(root), "--batch-mode", "single", "--dry-run", "--format", "table"],
             )
             self.assertEqual(code_t, 0, msg=err_t)
             self.assertIn("docs/broken.md", out_t)
@@ -303,6 +326,8 @@ class DocsModeTests(unittest.TestCase):
                     "docs",
                     "--repo",
                     str(root),
+                    "--batch-mode",
+                    "single",
                     "--max-workers",
                     "4",
                     "--format",
@@ -344,7 +369,7 @@ class DocsModeTests(unittest.TestCase):
                 self.skipTest(f"git unavailable for test: {exc}")
 
             code, out, err = _run_cli(
-                ["docs", "--repo", str(root), "--paths", "README.md", "--dry-run"],
+                ["docs", "--repo", str(root), "--paths", "README.md", "--batch-mode", "single", "--dry-run"],
             )
             self.assertEqual(code, 0, msg=err)
             report = json.loads(out)
@@ -383,7 +408,7 @@ class DocsModeTests(unittest.TestCase):
                 path.write_text(f"# {rel}\n", encoding="utf-8")
 
             code, out, err = _run_cli(
-                ["docs", "--repo", str(root), "--dry-run", "--format", "json"],
+                ["docs", "--repo", str(root), "--batch-mode", "single", "--dry-run", "--format", "json"],
             )
             self.assertEqual(code, 0, msg=err)
             report = json.loads(out)
@@ -420,7 +445,7 @@ class DocsModeTests(unittest.TestCase):
             (root / "README.md").write_text("# Readme\n", encoding="utf-8")
 
             code_default, out_default, err_default = _run_cli(
-                ["docs", "--repo", str(root), "--dry-run", "--format", "json"],
+                ["docs", "--repo", str(root), "--batch-mode", "single", "--dry-run", "--format", "json"],
             )
             self.assertEqual(code_default, 0, msg=err_default)
             default_files = [item["file"] for item in json.loads(out_default)["items"]]
@@ -433,6 +458,8 @@ class DocsModeTests(unittest.TestCase):
                     str(root),
                     "--paths",
                     "skills/japanese-tech-writing/references/slop-catalog.md",
+                    "--batch-mode",
+                    "single",
                     "--dry-run",
                     "--format",
                     "json",
@@ -612,7 +639,7 @@ class CandidatesModeTests(unittest.TestCase):
             )
 
         code, out, err = _run_cli(
-            ["candidates", "--stdin", "--max-workers", "3", "--format", "json"],
+            ["candidates", "--stdin", "--batch-mode", "single", "--max-workers", "3", "--format", "json"],
             opener=mock_opener,
             env={"GEMINI_API_KEY": "test-dummy-key"},
             stdin_text=json.dumps(items, ensure_ascii=False),
@@ -847,6 +874,393 @@ class SecurityAndErrorHandlingTests(unittest.TestCase):
             )
             stdout_text = proc.stdout.decode("utf-8")
             self.assertIn("チェック ✓ 日本語 — テスト", stdout_text)
+
+
+class UpgradeFeaturesTests(unittest.TestCase):
+    def test_SDD_19_docs_chunk_packing_usage_non_duplication_and_flag_hints(self) -> None:
+        """SDD-19: docs チャンク既定がスナップショット 1 回共有・名前空間付きキー・usage 非重複加算・missing_flag_hints を満たす。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _create_sample_repo(Path(tmp))
+            (root / "scripts").mkdir()
+            (root / "scripts" / "tool.py").write_text(
+                "import argparse\np = argparse.ArgumentParser()\np.add_argument('--repo')\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "cli_guide.md").write_text(
+                "# CLI Guide\n\n```bash\npython scripts/tool.py --repo . --nonexistent\n```\n",
+                encoding="utf-8",
+            )
+
+            # 無効な --chunk-max-docs を拒否
+            for bad_val in ("0", "167"):
+                c_bad, _, e_bad = _run_cli(
+                    ["docs", "--repo", str(root), "--chunk-max-docs", bad_val, "--dry-run"]
+                )
+                self.assertEqual(c_bad, 2)
+                self.assertIn("invalid_chunk_max_docs", e_bad)
+
+            # --chunk-max-docs 2 で 4 文書が 2 チャンクへ分割されること
+            c_dry, o_dry, e_dry = _run_cli(
+                ["docs", "--repo", str(root), "--chunk-max-docs", "2", "--dry-run", "--format", "json"]
+            )
+            self.assertEqual(c_dry, 0, msg=e_dry)
+            dry_report = json.loads(o_dry)
+            self.assertEqual(dry_report["batch_mode"], "chunk")
+            self.assertEqual(dry_report["total"], 4)
+            self.assertEqual(dry_report["chunk_count"], 2)
+            ch0_payload = dry_report["chunks"][0]["payload"]
+            self.assertEqual(len(ch0_payload["input"]), 3)  # snapshot 1 + docs 2
+            self.assertIn("Repository Root:", ch0_payload["input"][0]["text"])
+            self.assertIn("Target document [doc_0001]: README.md", ch0_payload["questions"]["doc_0001__stale_status_or_facts"]["instructions"])
+
+            captured_requests: list[dict[str, object]] = []
+
+            def chunk_opener(req: object, timeout: float = 30.0) -> _FakeHTTPResponse:
+                body = json.loads(req.data.decode("utf-8"))  # type: ignore[attr-defined]
+                captured_requests.append(body)
+                q_keys = list(body["questions"].keys())
+                namespaces = sorted({k.split("__", 1)[0] for k in q_keys})
+                answers: dict[str, object] = {}
+                for ns in namespaces:
+                    base = _make_docs_response(action="likely_clean", action_conf=0.95)
+                    for qk, qv in base["answers"].items():  # type: ignore[union-attr]
+                        answers[f"{ns}__{qk}"] = qv
+                return _FakeHTTPResponse(
+                    {
+                        "answers": answers,
+                        "usage": {
+                            "total_input_tokens": 500,
+                            "total_output_tokens": 0,
+                            "total_tokens": 500,
+                        },
+                    }
+                )
+
+            code, out, err = _run_cli(
+                ["docs", "--repo", str(root), "--chunk-max-docs", "4", "--format", "json"],
+                opener=chunk_opener,
+                env={"GEMINI_API_KEY": "test-dummy-key"},
+            )
+            self.assertEqual(code, 0, msg=err)
+            self.assertEqual(len(captured_requests), 1)
+            report = json.loads(out)
+            self.assertEqual(report["total"], 4)
+            # 1 チャンク = 500 トークンであり、4 文書倍の 2000 になってはならない
+            self.assertEqual(report["usage"]["total_input_tokens"], 500)
+            self.assertEqual(report["usage"]["total_tokens"], 500)
+
+            by_file = {r["file"]: r for r in report["results"]}
+            self.assertEqual(by_file["docs/cli_guide.md"]["missing_flag_hints"], ["tool.py:--nonexistent"])
+            self.assertEqual(by_file["docs/cli_guide.md"]["bucket"], "prioritize_for_audit")
+            self.assertIn("missing_flag_hints(1)", by_file["docs/cli_guide.md"]["reasons"])
+            self.assertEqual(by_file["docs/clean.md"]["bucket"], "low_priority_clean")
+
+    def test_SDD_20_backlog_heading_breadcrumbs_in_items_instructions_and_table(self) -> None:
+        """SDD-20: backlog が見出しパンくずを section・instructions・table 出力へ反映する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _create_sample_repo(Path(tmp))
+            bl = root / "BACKLOG.md"
+            bl.write_text(
+                "# Phase 1\n"
+                "## Backend\n"
+                "### Auth\n"
+                "- [ ] Fix token refresh\n"
+                "## Frontend\n"
+                "- [ ] Align button spacing\n",
+                encoding="utf-8",
+            )
+            code, out, err = _run_cli(
+                ["backlog", "--backlog", str(bl), "--repo", str(root), "--dry-run", "--format", "json"]
+            )
+            self.assertEqual(code, 0, msg=err)
+            report = json.loads(out)
+            items = report["items"]
+            self.assertEqual(items[0]["section"], "Phase 1 > Backend > Auth")
+            self.assertEqual(items[1]["section"], "Phase 1 > Frontend")
+            q1_inst = report["payload"]["questions"][items[0]["question_key"]]["instructions"]
+            self.assertIn("Section: Phase 1 > Backend > Auth", q1_inst)
+
+            code_t, out_t, err_t = _run_cli(
+                ["backlog", "--backlog", str(bl), "--repo", str(root), "--dry-run", "--format", "table"]
+            )
+            self.assertEqual(code_t, 0, msg=err_t)
+            self.assertIn("| section |", out_t)
+            self.assertIn("Phase 1 > Backend > Auth", out_t)
+
+    def test_SDD_21_backlog_table_parser_auto_fallback_and_include_tables(self) -> None:
+        """SDD-21: backlog 表パーサが状態列の未完了行のみ抽出し、auto フォールバックと --include-tables を制御する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _create_sample_repo(Path(tmp))
+            table_only = root / "TABLE_ONLY.md"
+            table_only.write_text(
+                "# Release Ledger\n\n"
+                "| ID | Task | Status |\n"
+                "| --- | --- | --- |\n"
+                "| T-1 | Migrate auth | 未着手 |\n"
+                "| T-2 | Old fix | 完了 |\n"
+                "| T-3 | Update docs | In Progress |\n"
+                "| T-4 | Archived | done |\n"
+                "| T-5 | Stalled | blocked |\n\n"
+                "## Non-status table\n\n"
+                "| Name | Owner |\n"
+                "| --- | --- |\n"
+                "| Alpha | Alice |\n",
+                encoding="utf-8",
+            )
+            code, out, err = _run_cli(
+                ["backlog", "--backlog", str(table_only), "--repo", str(root), "--dry-run", "--format", "json"]
+            )
+            self.assertEqual(code, 0, msg=err)
+            items = json.loads(out)["items"]
+            self.assertEqual(len(items), 3)
+            self.assertIn("T-1 | Migrate auth", items[0]["text"])
+            self.assertIn("T-3 | Update docs", items[1]["text"])
+            self.assertIn("T-5 | Stalled", items[2]["text"])
+            self.assertEqual(items[0]["section"], "Release Ledger")
+
+            mixed = root / "MIXED.md"
+            mixed.write_text(
+                "# Mixed\n\n"
+                "- [ ] Checkbox task\n\n"
+                "| Item | 状態 |\n"
+                "| --- | --- |\n"
+                "| Table task | 進行中 |\n"
+                "| Done task | 済み |\n",
+                encoding="utf-8",
+            )
+            # auto ではチェックボックス優先（1 件）
+            c_auto, o_auto, e_auto = _run_cli(
+                ["backlog", "--backlog", str(mixed), "--repo", str(root), "--dry-run", "--format", "json"]
+            )
+            self.assertEqual(c_auto, 0, msg=e_auto)
+            self.assertEqual(json.loads(o_auto)["total"], 1)
+
+            # --include-tables で両方抽出（2 件）
+            c_inc, o_inc, e_inc = _run_cli(
+                [
+                    "backlog",
+                    "--backlog",
+                    str(mixed),
+                    "--repo",
+                    str(root),
+                    "--include-tables",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ]
+            )
+            self.assertEqual(c_inc, 0, msg=e_inc)
+            inc_items = json.loads(o_inc)["items"]
+            self.assertEqual(len(inc_items), 2)
+            self.assertIn("Checkbox task", inc_items[0]["text"])
+            self.assertIn("Table task", inc_items[1]["text"])
+
+            # --backlog-format table で表のみ抽出（1 件）
+            c_tbl, o_tbl, e_tbl = _run_cli(
+                [
+                    "backlog",
+                    "--backlog",
+                    str(mixed),
+                    "--backlog-format",
+                    "table",
+                    "--repo",
+                    str(root),
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ]
+            )
+            self.assertEqual(c_tbl, 0, msg=e_tbl)
+            tbl_items = json.loads(o_tbl)["items"]
+            self.assertEqual(len(tbl_items), 1)
+            self.assertIn("Table task", tbl_items[0]["text"])
+
+    def test_SDD_22_candidates_chunk_mode_with_repo_and_usage_non_duplication(self) -> None:
+        """SDD-22: candidates チャンクモードが --repo 共有スナップショット・chunk 分割・usage 非重複加算を満たす。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _create_sample_repo(Path(tmp))
+            cands = [
+                {
+                    "id": f"C-{i}",
+                    "category": "doc_drift",
+                    "title": f"Item {i}",
+                    "files": ["README.md"],
+                    "evidence": f"ev {i}",
+                    "symptom": f"sym {i}",
+                }
+                for i in range(1, 4)
+            ]
+
+            c_bad, _, e_bad = _run_cli(
+                ["candidates", "--stdin", "--chunk-max-items", "201", "--dry-run"],
+                stdin_text=json.dumps(cands),
+            )
+            self.assertEqual(c_bad, 2)
+            self.assertIn("invalid_chunk_max_items", e_bad)
+
+            c_dry, o_dry, e_dry = _run_cli(
+                [
+                    "candidates",
+                    "--stdin",
+                    "--repo",
+                    str(root),
+                    "--chunk-max-items",
+                    "2",
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+                stdin_text=json.dumps(cands),
+            )
+            self.assertEqual(c_dry, 0, msg=e_dry)
+            dry_report = json.loads(o_dry)
+            self.assertEqual(dry_report["batch_mode"], "chunk")
+            self.assertEqual(dry_report["chunk_count"], 2)
+            self.assertEqual(dry_report["chunks"][0]["ids"], ["C-1", "C-2"])
+            self.assertIn("Repository Root:", dry_report["chunks"][0]["payload"]["input"][0]["text"])
+            self.assertIn("cand_0001__fits_single_track", dry_report["chunks"][0]["payload"]["questions"])
+
+            calls = 0
+
+            def cand_chunk_opener(req: object, timeout: float = 30.0) -> _FakeHTTPResponse:
+                nonlocal calls
+                calls += 1
+                body = json.loads(req.data.decode("utf-8"))  # type: ignore[attr-defined]
+                namespaces = sorted({k.split("__", 1)[0] for k in body["questions"]})
+                answers: dict[str, object] = {}
+                for ns in namespaces:
+                    base = _make_candidate_response(
+                        discuss=0.10,
+                        route="plan_worker_autonomous",
+                        route_conf=0.92,
+                    )
+                    for qk, qv in base["answers"].items():  # type: ignore[union-attr]
+                        answers[f"{ns}__{qk}"] = qv
+                return _FakeHTTPResponse(
+                    {
+                        "answers": answers,
+                        "usage": {
+                            "total_input_tokens": 600,
+                            "total_output_tokens": 0,
+                            "total_tokens": 600,
+                        },
+                    }
+                )
+
+            c_ok, o_ok, e_ok = _run_cli(
+                ["candidates", "--stdin", "--repo", str(root), "--chunk-max-items", "10", "--format", "json"],
+                opener=cand_chunk_opener,
+                env={"GEMINI_API_KEY": "test-dummy-key"},
+                stdin_text=json.dumps(cands),
+            )
+            self.assertEqual(c_ok, 0, msg=e_ok)
+            self.assertEqual(calls, 1)
+            report = json.loads(o_ok)
+            self.assertEqual(report["total"], 3)
+            self.assertEqual(report["usage"]["total_input_tokens"], 600)
+            self.assertEqual(report["usage"]["total_tokens"], 600)
+
+    def test_SDD_23_backend_routing_auto_sdk_and_rest(self) -> None:
+        """SDD-23: --backend {auto,sdk,rest} が call_decisions_backend 経由で正しく振り分けられる。"""
+        cand = [
+            {
+                "id": "C-1",
+                "category": "doc_drift",
+                "title": "Check backend",
+                "evidence": "ev",
+                "symptom": "sym",
+            }
+        ]
+        # opener 指定時の auto -> rest
+        def rest_opener(req: object, timeout: float = 30.0) -> _FakeHTTPResponse:
+            return _FakeHTTPResponse(
+                {
+                    "answers": {
+                        f"cand_0001__{k}": v
+                        for k, v in _make_candidate_response()["answers"].items()  # type: ignore[union-attr]
+                    },
+                    "usage": {"total_input_tokens": 10, "total_output_tokens": 0, "total_tokens": 10},
+                }
+            )
+
+        code_rest, out_rest, err_rest = _run_cli(
+            ["candidates", "--stdin", "--backend", "auto"],
+            opener=rest_opener,
+            env={"GEMINI_API_KEY": "k"},
+            stdin_text=json.dumps(cand),
+        )
+        self.assertEqual(code_rest, 0, msg=err_rest)
+        self.assertEqual(json.loads(out_rest)["backend"], "rest")
+
+        # --backend sdk でモックされた call_decisions_backend 経由 SDK 応答を返す
+        sdk_resp = {
+            "answers": {
+                f"cand_0001__{k}": v
+                for k, v in _make_candidate_response()["answers"].items()  # type: ignore[union-attr]
+            },
+            "usage": {"total_input_tokens": 20, "total_output_tokens": 0, "total_tokens": 20},
+        }
+        with mock.patch.object(
+            run_decisions,
+            "call_decisions_backend",
+            return_value=(sdk_resp, "sdk"),
+        ) as patched_backend:
+            code_sdk, out_sdk, err_sdk = _run_cli(
+                ["candidates", "--stdin", "--backend", "sdk"],
+                env={"GEMINI_API_KEY": "k"},
+                stdin_text=json.dumps(cand),
+            )
+        self.assertEqual(code_sdk, 0, msg=err_sdk)
+        self.assertEqual(json.loads(out_sdk)["backend"], "sdk")
+        self.assertEqual(patched_backend.call_args.kwargs["backend"], "sdk")
+
+    def test_SDD_24_broken_pipe_exits_zero_without_error_json(self) -> None:
+        """SDD-24: screen_drift_decision1.py のパイプ切断（BrokenPipeError / Windows EINVAL）がエラー JSON なしで終了コード 0 になる。"""
+        class _BrokenStream:
+            def __init__(self, exc: BaseException) -> None:
+                self._exc = exc
+
+            def write(self, _text: str) -> int:
+                raise self._exc
+
+            def flush(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _create_sample_repo(Path(tmp))
+            for exc in (BrokenPipeError(errno.EPIPE, "broken"), OSError(errno.EINVAL, "einval")):
+                if type(exc) is OSError and os.name != "nt":
+                    continue
+                err_buf = io.StringIO()
+                with mock.patch.object(sys, "stdout", _BrokenStream(exc)), redirect_stderr(err_buf):
+                    code = sdd.main(["docs", "--repo", str(root), "--dry-run"], env={})
+                self.assertEqual(code, 0)
+                self.assertEqual(err_buf.getvalue(), "")
+
+    def test_SDD_25_facade_reexports_drift_repo_and_drift_format(self) -> None:
+        """SDD-25: screen_drift_decision1.py が drift_repo と drift_format の公開シンボルを再エクスポートする。"""
+        expected_symbols = (
+            "DEFAULT_MODEL",
+            "DEFAULT_ENDPOINT",
+            "DRIFT_SEVERITY_CRITERIA",
+            "CANDIDATES_IMPACT_CRITERIA",
+            "DriftScreenError",
+            "RepoContext",
+            "DocEntry",
+            "BacklogItem",
+            "AuditCandidate",
+            "collect_repo_context",
+            "compute_staleness_days",
+            "compute_staleness_days_bulk",
+            "extract_missing_path_hints",
+            "extract_missing_flag_hints",
+            "mask_secret",
+            "format_report_table",
+            "emit_report",
+            "emit_error",
+        )
+        for sym in expected_symbols:
+            self.assertTrue(hasattr(sdd, sym), msg=f"missing facade symbol: {sym}")
 
 
 if __name__ == "__main__":
