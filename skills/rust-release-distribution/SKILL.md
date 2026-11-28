@@ -1,6 +1,6 @@
 ---
 name: rust-release-distribution
-description: Rust アプリの安全なリリース配布、Ed25519 署名検証、コンパイル時公開鍵埋め込み、2 段階鍵ローテーション、フェイルクローズ自己更新、Windows 向け Rust パッケージング罠、リリースランブックの設計手順。Rust の配布基盤やアップデータを設計、実装、レビューするときに使用する。一般的な GitHub Actions CI 設計は github-actions-ci に、リリース以外の実装計画手作業手順書化は user-work-runbook に委ねる。
+description: Rust アプリの安全なリリース配布、Ed25519 署名検証、コンパイル時公開鍵埋め込み、2 段階鍵ローテーション、フェイルクローズ自己更新、Windows 向けパッケージング罠、リリースランブックの設計手順。Rust の配布基盤やアップデータを設計、実装、レビューするときに使用する。一般的な CI 設計は github-actions-ci、リリース以外の手作業手順書化は user-work-runbook に委ねる。
 ---
 
 # Rust アプリの安全なリリース配布と自己更新設計

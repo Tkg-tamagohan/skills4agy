@@ -1,6 +1,6 @@
 ---
 name: concise-ui-copy
-description: UI の見出し、説明文、フォーム補助、空状態、確認ダイアログから冗長なガイド文を取り除き、操作や制約が自明な箇所の文言を削る基準と書き換え例を扱う。不要なセカンダリラベル（サブタイトル、補足キャプション、自明な項目名）を削り、グループ化や配置などのレイアウトで関係を示す方法も扱う。Web アプリ、管理画面、ツール、インタラクティブ HTML などの UI を設計、実装、レビューするときに使用する。HTML ウィジェットの実装手順は builtin の generative_ui、出力形式の選択は output-format-escalation、技術文書の文体は japanese-tech-writing に委ねる。
+description: UI の見出し、説明文、フォーム補助、確認画面から冗長なガイド文や不要なセカンダリラベルを削り、配置で関係を示す基準。Web アプリや管理画面等の UI を設計、実装、レビューするときに使用する。HTML 実装は builtin の generative_ui、出力形式は output-format-escalation、文体は japanese-tech-writing に委ねる。
 ---
 
 # UI における冗長なガイド文の排除
