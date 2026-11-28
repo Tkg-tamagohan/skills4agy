@@ -996,46 +996,67 @@ def score_windows_bm25(
 def _make_window_excerpt(
     best_win: WindowCandidate, terms_cf: Sequence[str], radius: int = EXCERPT_RADIUS
 ) -> str:
-    """一致窓内で検索語の位置（または中央）の前後 radius 文字を切り出す（マスク済みテキスト前提）。"""
+    """一致窓内で検索語の範囲全体（または中央）の前後 radius 文字を切り出す（マスク済みテキスト前提）。"""
     line_text = best_win.line_text
     win_text = best_win.window_text
     win_start = best_win.window_idx * WINDOW_STRIDE
-    win_cf = win_text.casefold()
 
-    hit_offset: int | None = None
+    hit_span: tuple[int, int] | None = None
     for term in terms_cf:
-        idx = win_cf.find(term)
-        if idx >= 0 and (hit_offset is None or idx < hit_offset):
-            hit_offset = idx
+        if not term:
+            continue
+        m = re.search(re.escape(term), win_text, re.IGNORECASE)
+        if m is not None:
+            span = (m.start(), m.end())
+            if hit_span is None or span[0] < hit_span[0]:
+                hit_span = span
 
-    if hit_offset is None:
+    if hit_span is None:
         center = win_start + len(win_text) // 2
+        match_start = center
+        match_end = center
     else:
-        center = win_start + hit_offset
+        match_start = win_start + hit_span[0]
+        match_end = win_start + hit_span[1]
 
-    start = max(0, center - radius)
-    end = min(len(line_text), center + radius)
+    start = max(0, match_start - radius)
+    end = min(len(line_text), match_end + radius)
     excerpt = line_text[start:end]
     prefix = "..." if start > 0 else ""
     suffix = "..." if end < len(line_text) else ""
     return f"{prefix}{excerpt}{suffix}"
 
 
+def _next_smaller_radius(radius: int, floor_radius: int) -> int:
+    if radius <= floor_radius:
+        return floor_radius
+    if radius <= 10 and floor_radius == 0:
+        return 0
+    nxt = int(radius * 0.8)
+    if nxt >= radius:
+        nxt = radius - 1
+    return max(floor_radius, nxt)
+
+
 def _shrink_excerpt_to_budget(
-    win: WindowCandidate, terms_cf: Sequence[str], target_tokens: float
-) -> tuple[str, int]:
-    """一致位置を保ったまま割当トークン予算内に収まるまで抜粋半径を縮小する。"""
+    win: WindowCandidate,
+    terms_cf: Sequence[str],
+    target_tokens: float,
+    *,
+    floor_radius: int = MIN_EXCERPT_RADIUS,
+) -> tuple[str, int, int]:
+    """一致範囲を保ったまま割当トークン予算内に収まるまで外側余白を縮小する。"""
     radius = EXCERPT_RADIUS
     ex = _make_window_excerpt(win, terms_cf, radius)
     tok = estimate_tokens(ex)
-    while tok > target_tokens and radius > MIN_EXCERPT_RADIUS:
-        next_radius = max(MIN_EXCERPT_RADIUS, int(radius * 0.8))
+    while tok > target_tokens and radius > floor_radius:
+        next_radius = _next_smaller_radius(radius, floor_radius)
         if next_radius == radius:
             break
         radius = next_radius
         ex = _make_window_excerpt(win, terms_cf, radius)
         tok = estimate_tokens(ex)
-    return ex, tok
+    return ex, tok, radius
 
 
 def _truncate_head_tail(text: str, max_chars: int) -> str:
@@ -1117,37 +1138,61 @@ def select_and_restore_turns(
     else:
         fallback = True
         per_cap = budget_tokens / len(primary_entries)
-        rendered_list: list[tuple[str, bool, int]] = []
+        # state: [text, is_excerpt, tokens, radius]
+        rendered_states: list[list[Any]] = []
         for (turn, ex_win, _), txt, tok in zip(primary_entries, full_texts, full_tokens):
             if tok > per_cap:
-                ex, ex_tok = _shrink_excerpt_to_budget(ex_win, terms_cf, per_cap)
-                rendered_list.append((ex, True, ex_tok))
+                ex, ex_tok, rad = _shrink_excerpt_to_budget(ex_win, terms_cf, per_cap)
+                rendered_states.append([ex, True, ex_tok, rad])
             else:
-                rendered_list.append((txt, False, tok))
+                rendered_states.append([txt, False, tok, EXCERPT_RADIUS])
 
-        if sum(item[2] for item in rendered_list) > budget_tokens:
-            rendered_list = []
+        if sum(st[2] for st in rendered_states) > budget_tokens:
+            rendered_states = []
             for _, ex_win, _ in primary_entries:
-                ex, ex_tok = _shrink_excerpt_to_budget(ex_win, terms_cf, per_cap)
-                rendered_list.append((ex, True, ex_tok))
+                ex, ex_tok, rad = _shrink_excerpt_to_budget(ex_win, terms_cf, per_cap)
+                rendered_states.append([ex, True, ex_tok, rad])
+
+        # 均等割当後も超過する場合は、第1段として MIN_EXCERPT_RADIUS まで、
+        # なお超過する場合は第2段として外側余白 0 まで最大トークン抜粋から順に縮小する
+        for floor_rad in (MIN_EXCERPT_RADIUS, 0):
+            while sum(st[2] for st in rendered_states) > budget_tokens:
+                shrinkable = [
+                    idx
+                    for idx, st in enumerate(rendered_states)
+                    if st[3] > floor_rad
+                ]
+                if not shrinkable:
+                    break
+                target_idx = max(shrinkable, key=lambda idx: (rendered_states[idx][2], rendered_states[idx][3]))
+                cur_rad = rendered_states[target_idx][3]
+                new_rad = _next_smaller_radius(cur_rad, floor_rad)
+                if new_rad == cur_rad:
+                    break
+                _, ex_win, _ = primary_entries[target_idx]
+                new_ex = _make_window_excerpt(ex_win, terms_cf, new_rad)
+                rendered_states[target_idx] = [
+                    new_ex,
+                    True,
+                    estimate_tokens(new_ex),
+                    new_rad,
+                ]
 
         selected = [
             SelectedTurn(
                 turn=turn,
                 role="primary",
-                rendered_text=r_txt,
-                excerpted=is_ex,
-                tokens=r_tok,
+                rendered_text=st[0],
+                excerpted=st[1],
+                tokens=st[2],
                 best_score=b_score,
                 match_line_idx=ex_win.line_idx,
             )
-            for (turn, ex_win, b_score), (r_txt, is_ex, r_tok) in zip(
-                primary_entries, rendered_list
-            )
+            for (turn, ex_win, b_score), st in zip(primary_entries, rendered_states)
         ]
         if sum(s.tokens for s in selected) > budget_tokens:
             warnings.append(
-                f"主ヒット件数を優先したため予算 {budget_tokens} トークンを超過しました（最小抜粋 {MIN_EXCERPT_RADIUS} 文字）"
+                f"主ヒット件数と一致範囲の保持を優先したため予算 {budget_tokens} トークンを超過しました"
             )
 
     used_tokens = sum(s.tokens for s in selected)

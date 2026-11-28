@@ -950,6 +950,94 @@ class SearchSessionLogsTests(unittest.TestCase):
             self.assertNotIn("pass123", json.dumps(data_json, ensure_ascii=False))
             self.assertIn("[REDACTED]", data_json["terms"][0])
 
+    def test_sl28_budget_reclaims_margin_from_shrinkable_excerpt(self) -> None:
+        """SL-28: 一方の抜粋が最小半径でも他方を縮めれば予算内に収まる場合は警告なしで収める。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            tp1 = app_dir / "brain" / "conv-jp-tight" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_jsonl(
+                tp1,
+                [_make_planner(0, ("あ" * 300) + "RECLAIM_KEY" + ("い" * 300), "2026-11-20T10:00:00Z")],
+            )
+            tp2 = app_dir / "brain" / "conv-en-shrink" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_jsonl(
+                tp2,
+                [_make_planner(0, ("A" * 180) + "RECLAIM_KEY" + ("B" * 180), "2026-11-20T10:01:00Z")],
+            )
+
+            rc, data = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--budget-tokens",
+                    "105",
+                    "--format",
+                    "json",
+                    "--",
+                    "RECLAIM_KEY",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(data["restored_turns"], 2)
+            self.assertLessEqual(data["estimated_tokens"], 105)
+            self.assertEqual(data["warnings"], [])
+
+    def test_sl29_excerpt_preserves_full_matched_path_and_warns_when_match_exceeds_budget(self) -> None:
+        """SL-29: 一致範囲を外側から縮めて長いパス全体を保持し、一致自体が予算超のときは警告する。"""
+        long_path = "C:/workspace/" + ("segment_dir/" * 6) + "target_file_name.py"
+        self.assertGreaterEqual(len(long_path), 95)
+
+        # (a) 一致全体を残せる場合: 99 文字級パス 2 件を budget 155 で検索しても両方パス全体が残る
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            for idx in range(2):
+                tp = app_dir / "brain" / f"conv-path-{idx}" / ".system_generated" / "logs" / "transcript.jsonl"
+                body = ("診断メッセージの文脈" * 12) + " " + long_path + " " + ("後続の補足説明" * 12)
+                _write_jsonl(tp, [_make_planner(0, body, f"2026-11-20T10:0{idx}:00Z")])
+
+            rc, data = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--budget-tokens",
+                    "155",
+                    "--format",
+                    "json",
+                    "--",
+                    long_path,
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(data["restored_turns"], 2)
+            self.assertLessEqual(data["estimated_tokens"], 155)
+            for res in data["results"]:
+                self.assertIn(long_path, res["text"])
+
+        # (b) 一致自体が予算より長い場合: 一致を途中で切らず警告付きで出力する
+        huge_token = "VERY_LONG_IDENTIFIER_" + ("X" * 500)
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            tp = app_dir / "brain" / "conv-huge" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_jsonl(
+                tp,
+                [_make_planner(0, ("前置き" * 30) + " " + huge_token + " " + ("後書き" * 30), "2026-11-20T10:00:00Z")],
+            )
+            rc2, data2 = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--budget-tokens",
+                    "100",
+                    "--format",
+                    "json",
+                    "--",
+                    huge_token,
+                ]
+            )
+            self.assertEqual(rc2, 0)
+            self.assertIn(huge_token, data2["results"][0]["text"])
+            self.assertTrue(data2["warnings"])
+
 
 if __name__ == "__main__":
     unittest.main()
