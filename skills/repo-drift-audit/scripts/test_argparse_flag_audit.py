@@ -255,8 +255,8 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 ["preflight_drift.py:--plans-json", "preflight_drift.py:--repo"],
             )
 
-    def test_AFA_10_class_method_and_nested_func_add_argument_collected(self) -> None:
-        """AFA-10: ClassDef 内のメソッドやネスト関数で定義された add_argument が漏れない。"""
+    def test_AFA_10_class_method_and_nested_func_safe_fallback(self) -> None:
+        """AFA-10: ClassDef やネスト関数内の add_argument は安全フォールバックで保持し --bogus を検知する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cli = root / "cls_cli.py"
@@ -277,11 +277,14 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 afa.extract_argparse_flags(cli),
                 {"--nested-opt", "--output-dir"},
             )
+            root_flags, sub_flags = afa.extract_argparse_flag_spec(cli)
+            self.assertEqual(sub_flags, {})
+            self.assertEqual(root_flags, {"--nested-opt", "--output-dir"})
             self.assertEqual(
                 afa.find_doc_only_flags_in_text(
-                    "`cls_cli.py --output-dir out --nested-opt 1`", [cli]
+                    "`cls_cli.py --output-dir out --nested-opt 1 --bogus`", [cli]
                 ),
-                [],
+                ["cls_cli.py:--bogus"],
             )
 
     def test_AFA_11_repeated_parent_factory_calls_inherit_for_all_subcommands(self) -> None:
@@ -342,8 +345,8 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 ["scoped.py:--alpha-only"],
             )
 
-    def test_AFA_13_nested_closure_preserves_outer_subparser_binding(self) -> None:
-        """AFA-13: ネスト関数が外側のサブパーサー変数 alpha をクロージャ参照しても他サブコマンドへ漏れない。"""
+    def test_AFA_13_nested_closure_safe_fallback_avoids_false_positives(self) -> None:
+        """AFA-13: ネスト関数のクロージャ参照を含む動的構文は安全フォールバックで誤検出せず --bogus を検知する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cli = root / "closure_cli.py"
@@ -361,13 +364,14 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 "    return root_p\n",
                 encoding="utf-8",
             )
+            root_flags, sub_flags = afa.extract_argparse_flag_spec(cli)
+            self.assertEqual(sub_flags, {})
+            self.assertEqual(root_flags, {"--alpha-only", "--beta-only"})
             self.assertEqual(
-                afa.find_doc_only_flags_in_text("`closure_cli.py alpha --alpha-only`", [cli]),
-                [],
-            )
-            self.assertEqual(
-                afa.find_doc_only_flags_in_text("`closure_cli.py beta --alpha-only`", [cli]),
-                ["closure_cli.py:--alpha-only"],
+                afa.find_doc_only_flags_in_text(
+                    "`closure_cli.py alpha --alpha-only --bogus`", [cli]
+                ),
+                ["closure_cli.py:--bogus"],
             )
 
     def test_AFA_14_escaped_pipe_and_semicolon_do_not_split_flags(self) -> None:
@@ -392,8 +396,8 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 ["tool.py:--typo", "tool.py:--typo-inline"],
             )
 
-    def test_AFA_15_conditional_branch_function_and_method_defs_preserved(self) -> None:
-        """AFA-15: if/else 条件分岐内の同名関数・同名メソッドの両分岐フラグが上書き消失しない。"""
+    def test_AFA_15_conditional_branch_function_and_method_defs_safe_fallback(self) -> None:
+        """AFA-15: if/else 条件分岐内の同名関数・メソッドは安全フォールバックにより両分岐フラグを保持する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cli = root / "branch_cli.py"
@@ -424,15 +428,18 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 afa.extract_argparse_flags(cli),
                 {"--branch-a", "--branch-b", "--cls-a", "--cls-b"},
             )
+            root_flags, sub_flags = afa.extract_argparse_flag_spec(cli)
+            self.assertEqual(sub_flags, {})
+            self.assertEqual(root_flags, {"--branch-a", "--branch-b", "--cls-a", "--cls-b"})
             self.assertEqual(
                 afa.find_doc_only_flags_in_text(
-                    "`branch_cli.py --branch-a --branch-b --cls-a --cls-b`", [cli]
+                    "`branch_cli.py --branch-a --branch-b --cls-a --cls-b --bogus`", [cli]
                 ),
-                [],
+                ["branch_cli.py:--bogus"],
             )
 
-    def test_AFA_16_method_with_unresolved_external_parser_preserves_flags(self) -> None:
-        """AFA-16: self のみ解決され外部パーサー引数が未解決でも --ext-flag が脱落せず、具体呼び出しの分離も維持する。"""
+    def test_AFA_16_external_parser_method_triggers_safe_fallback(self) -> None:
+        """AFA-16: クラスメソッドと外部パーサー引数が混在する場合は安全フォールバックで誤検出を防ぎ --bogus を検知する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cli = root / "ext_cli.py"
@@ -455,17 +462,14 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertIn("--ext-flag", afa.extract_argparse_flags(cli))
+            root_flags, sub_flags = afa.extract_argparse_flag_spec(cli)
+            self.assertEqual(sub_flags, {})
+            self.assertEqual(root_flags, {"--alpha-only", "--beta-only", "--ext-flag"})
             self.assertEqual(
                 afa.find_doc_only_flags_in_text(
-                    "`ext_cli.py alpha --ext-flag --alpha-only`", [cli]
+                    "`ext_cli.py alpha --ext-flag --alpha-only --bogus`", [cli]
                 ),
-                [],
-            )
-            self.assertEqual(
-                afa.find_doc_only_flags_in_text(
-                    "`ext_cli.py beta --alpha-only`", [cli]
-                ),
-                ["ext_cli.py:--alpha-only"],
+                ["ext_cli.py:--bogus"],
             )
 
     def test_AFA_17_raise_system_exit_main_and_sweep_param_isolation(self) -> None:
@@ -498,8 +502,8 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 ["entry_cli.py:--alpha-only"],
             )
 
-    def test_AFA_18_conditional_return_parent_parsers_all_branches_inherited(self) -> None:
-        """AFA-18: make_parent() が if/else で異なる親パーサーを返す場合、両分岐の親フラグが継承元にのみ許容される。"""
+    def test_AFA_18_conditional_parent_factory_safe_fallback(self) -> None:
+        """AFA-18: 条件分岐を含む parents=[make_parent()] は安全フォールバックし、有効フラグを誤検出せず --bogus を検知する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cli = root / "cond_parent.py"
@@ -525,38 +529,40 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 "    return root_p\n",
                 encoding="utf-8",
             )
+            root_flags, sub_flags = afa.extract_argparse_flag_spec(cli)
+            self.assertEqual(sub_flags, {})
             self.assertEqual(
-                afa.find_doc_only_flags_in_text(
-                    "`cond_parent.py alpha --parent-a --parent-b --alpha-only`", [cli]
-                ),
-                [],
+                root_flags,
+                {"--alpha-only", "--beta-only", "--parent-a", "--parent-b"},
             )
             self.assertEqual(
                 afa.find_doc_only_flags_in_text(
-                    "`cond_parent.py beta --parent-a --parent-b`", [cli]
+                    "`cond_parent.py alpha --parent-a --parent-b --alpha-only --bogus`", [cli]
                 ),
-                ["cond_parent.py:--parent-a", "cond_parent.py:--parent-b"],
+                ["cond_parent.py:--bogus"],
             )
 
-    def test_AFA_19_shadowing_and_unconditional_redef_replace_outer_defs(self) -> None:
-        """AFA-19: 内側シャドウイングと同スコープ無条件再定義が外側フラグを内側呼び出しへ混入させない。"""
+    def test_AFA_19_shadowing_and_redefinition_safe_fallback_valid_python(self) -> None:
+        """AFA-19: 実実行可能なシャドウイングと同名関数再定義が安全フォールバックで誤検出せず --bogus を検知する。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cli = root / "shadow_cli.py"
             cli.write_text(
                 "import argparse\n\n"
                 "def redef(p: argparse.ArgumentParser) -> None:\n"
-                "    p.add_argument('--dead-old')\n\n"
+                "    p.add_argument('--old-opt')\n\n"
                 "def redef(p: argparse.ArgumentParser) -> None:\n"
                 "    p.add_argument('--live-new')\n\n"
                 "def configure(p: argparse.ArgumentParser) -> None:\n"
                 "    p.add_argument('--outer-only')\n\n"
+                "def configure_beta(subs: argparse._SubParsersAction) -> None:\n"
+                "    beta = subs.add_parser('beta')\n"
+                "    configure(beta)\n"
+                "    redef(beta)\n\n"
                 "def build() -> argparse.ArgumentParser:\n"
                 "    root_p = argparse.ArgumentParser()\n"
                 "    subs = root_p.add_subparsers(dest='cmd')\n"
-                "    beta = subs.add_parser('beta')\n"
-                "    configure(beta)\n"
-                "    redef(beta)\n"
+                "    configure_beta(subs)\n"
                 "    alpha = subs.add_parser('alpha')\n"
                 "    def configure(p: argparse.ArgumentParser) -> None:\n"
                 "        p.add_argument('--inner-only')\n"
@@ -564,20 +570,20 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 "    return root_p\n",
                 encoding="utf-8",
             )
-            self.assertNotIn("--dead-old", afa.extract_argparse_flags(cli))
+            compile(cli.read_text(encoding="utf-8"), str(cli), "exec")
+            root_flags, sub_flags = afa.extract_argparse_flag_spec(cli)
+            self.assertEqual(sub_flags, {})
             self.assertEqual(
-                afa.find_doc_only_flags_in_text(
-                    "`shadow_cli.py alpha --inner-only` `shadow_cli.py beta --outer-only --live-new`",
-                    [cli],
-                ),
-                [],
+                root_flags,
+                {"--inner-only", "--live-new", "--old-opt", "--outer-only"},
             )
             self.assertEqual(
                 afa.find_doc_only_flags_in_text(
-                    "`shadow_cli.py alpha --outer-only --dead-old`",
+                    "`shadow_cli.py alpha --inner-only` "
+                    "`shadow_cli.py beta --outer-only --live-new --bogus`",
                     [cli],
                 ),
-                ["shadow_cli.py:--dead-old", "shadow_cli.py:--outer-only"],
+                ["shadow_cli.py:--bogus"],
             )
 
 

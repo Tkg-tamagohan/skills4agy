@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import re
 import stat
-from typing import Any
 
 FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 LONG_FLAG_RE = re.compile(r"(?<![A-Za-z0-9_-])(--[a-z][a-z0-9-]{1,})")
@@ -37,6 +36,46 @@ def _is_reparse_or_symlink(path: Path) -> bool:
     attrs = getattr(st, "st_file_attributes", 0)
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return bool(attrs & reparse_flag)
+
+
+def _parse_python_ast(py_path: Path) -> ast.Module | None:
+    if _is_reparse_or_symlink(py_path):
+        return None
+    try:
+        source = py_path.read_text(encoding="utf-8", errors="replace")
+        return ast.parse(source, filename=str(py_path))
+    except (OSError, SyntaxError):
+        return None
+
+
+def _is_add_argument_call(call: ast.Call) -> bool:
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        return func.attr == "add_argument"
+    if isinstance(func, ast.Name):
+        return func.id == "add_argument"
+    return False
+
+
+def _extract_long_flags_from_call(call: ast.Call) -> set[str]:
+    flags: set[str] = set()
+    for arg in call.args:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            if arg.value.startswith("--") and len(arg.value) > 2:
+                flags.add(arg.value)
+    return flags
+
+
+def _collect_all_add_argument_calls(tree: ast.AST) -> tuple[set[str], set[int]]:
+    flat_flags: set[str] = set()
+    add_arg_ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _is_add_argument_call(node):
+            flags = _extract_long_flags_from_call(node)
+            if flags:
+                flat_flags.update(flags)
+                add_arg_ids.add(id(node))
+    return flat_flags, add_arg_ids
 
 
 def _is_add_parser_call(call: ast.Call) -> str | None:
@@ -60,629 +99,273 @@ def _is_argument_parser_init(call: ast.Call) -> bool:
     return False
 
 
-def _extract_long_flags_from_call(call: ast.Call) -> set[str]:
-    flags: set[str] = set()
-    for arg in call.args:
-        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-            if arg.value.startswith("--") and len(arg.value) > 2:
-                flags.add(arg.value)
-    return flags
+def _is_main_guard(stmt: ast.If) -> bool:
+    test = stmt.test
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
+        return False
+    if not isinstance(test.ops[0], ast.Eq):
+        return False
+    left, right = test.left, test.comparators[0]
+    if isinstance(left, ast.Name) and left.id == "__name__":
+        return isinstance(right, ast.Constant) and right.value == "__main__"
+    if isinstance(right, ast.Name) and right.id == "__name__":
+        return isinstance(left, ast.Constant) and left.value == "__main__"
+    return False
 
 
-def _merge_tags(*seqs: Iterable[str]) -> tuple[str, ...]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for seq in seqs:
-        for item in seq:
-            if item and item not in seen:
-                seen.add(item)
-                out.append(item)
-    return tuple(out)
+def _has_argparse_construct(node: ast.AST) -> bool:
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            if _is_argument_parser_init(sub) or _is_add_argument_call(sub):
+                return True
+            if isinstance(sub.func, ast.Attribute) and sub.func.attr in (
+                "add_subparsers",
+                "add_parser",
+            ):
+                return True
+    return False
 
 
-def _dedup_func_nodes(
-    items: Iterable[ast.FunctionDef | ast.AsyncFunctionDef],
-) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
-    seen: set[int] = set()
-    out: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
-    for item in items:
-        fid = id(item)
-        if fid not in seen:
-            seen.add(fid)
-            out.append(item)
-    return out
+def _fn_creates_argument_parser(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    return any(
+        isinstance(sub, ast.Call) and _is_argument_parser_init(sub)
+        for sub in ast.walk(fn)
+    )
 
 
-def _dedup_lexical_entries(
-    items: Iterable[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, tuple[str, ...]]]],
-) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, tuple[str, ...]]]]:
-    seen: set[int] = set()
-    out: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, tuple[str, ...]]]] = []
-    for fn_node, c_env in items:
-        fid = id(fn_node)
-        if fid not in seen:
-            seen.add(fid)
-            out.append((fn_node, c_env))
-    return out
-
-
-def _merge_if_maps(
-    pre_map: dict[str, list[Any]],
-    then_map: dict[str, list[Any]],
-    else_map: dict[str, list[Any]] | None,
-    dedup_fn: Any,
-) -> dict[str, list[Any]]:
-    merged: dict[str, list[Any]] = {k: list(v) for k, v in pre_map.items()}
-    if else_map is None:
-        for k, then_val in then_map.items():
-            if then_val != pre_map.get(k):
-                merged[k] = dedup_fn([*pre_map.get(k, []), *then_val])
-        return merged
-
-    all_keys = set(pre_map.keys()) | set(then_map.keys()) | set(else_map.keys())
-    for k in all_keys:
-        pre_val = pre_map.get(k)
-        then_val = then_map.get(k)
-        else_val = else_map.get(k)
-        redef_then = then_val is not None and then_val != pre_val
-        redef_else = else_val is not None and else_val != pre_val
-        if redef_then and redef_else:
-            merged[k] = dedup_fn([*(then_val or []), *(else_val or [])])
-        elif redef_then:
-            merged[k] = dedup_fn([*(pre_val or []), *(then_val or [])])
-        elif redef_else:
-            merged[k] = dedup_fn([*(pre_val or []), *(else_val or [])])
-    return merged
-
-
-def _merge_env_branches(
-    pre_env: dict[str, tuple[str, ...]],
-    then_env: dict[str, tuple[str, ...]],
-    else_env: dict[str, tuple[str, ...]] | None,
-) -> dict[str, tuple[str, ...]]:
-    merged: dict[str, tuple[str, ...]] = dict(pre_env)
-    if else_env is None:
-        for k, then_val in then_env.items():
-            if then_val != pre_env.get(k):
-                merged[k] = _merge_tags(pre_env.get(k, ()), then_val)
-        return merged
-
-    for k in set(pre_env.keys()) | set(then_env.keys()) | set(else_env.keys()):
-        pre_val = pre_env.get(k)
-        then_val = then_env.get(k)
-        else_val = else_env.get(k)
-        redef_then = then_val is not None and then_val != pre_val
-        redef_else = else_val is not None and else_val != pre_val
-        if redef_then and redef_else:
-            merged[k] = _merge_tags(then_val or (), else_val or ())
-        elif redef_then:
-            merged[k] = _merge_tags(pre_val or (), then_val or ())
-        elif redef_else:
-            merged[k] = _merge_tags(pre_val or (), else_val or ())
-    return merged
+def extract_argparse_flags(py_path: Path) -> set[str]:
+    """Python スクリプトの AST から add_argument で定義された --flag を抽出する。"""
+    tree = _parse_python_ast(py_path)
+    if tree is None:
+        return set()
+    flat_flags, _ = _collect_all_add_argument_calls(tree)
+    return flat_flags
 
 
 def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[str]]]:
-    """Python スクリプトの AST から (root_flags, subcommand_flags) を抽出する。"""
-    if _is_reparse_or_symlink(py_path):
+    """Python スクリプトの AST から (root_flags, subcommand_flags) を抽出する。
+
+    単純な静的構造のすべてで 100% 帰属確定できる場合のみサブコマンド単位へ分離し、
+    動的・複雑構文や未帰属フラグが残る場合は安全側フォールバック (flat_flags, {}) を返す。
+    """
+    tree = _parse_python_ast(py_path)
+    if tree is None:
         return set(), {}
-    try:
-        source = py_path.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(source, filename=str(py_path))
-    except (OSError, SyntaxError):
-        return set(), {}
 
-    module_funcs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
-    class_methods: dict[str, dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]] = defaultdict(
-        dict
-    )
-    all_nested_funcs: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    flat_flags, all_add_arg_ids = _collect_all_add_argument_calls(tree)
+    if not all_add_arg_ids:
+        return flat_flags, {}
 
-    def _collect_nested_only(stmts: list[ast.stmt]) -> None:
-        for stmt in stmts:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                all_nested_funcs.append(stmt)
-                _collect_nested_only(stmt.body)
-            elif isinstance(stmt, ast.ClassDef):
-                _collect_nested_only(stmt.body)
-            elif isinstance(stmt, ast.If):
-                _collect_nested_only(stmt.body)
-                _collect_nested_only(stmt.orelse)
-            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-                _collect_nested_only(stmt.body)
-                _collect_nested_only(stmt.orelse)
-            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-                _collect_nested_only(stmt.body)
-            elif isinstance(stmt, ast.Try):
-                _collect_nested_only(stmt.body)
-                _collect_nested_only(stmt.orelse)
-                _collect_nested_only(stmt.finalbody)
-                for handler in stmt.handlers:
-                    _collect_nested_only(handler.body)
+    has_literal_subparser = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "add_parser":
+                if _is_add_parser_call(node) is None:
+                    return flat_flags, {}
+                has_literal_subparser = True
+    if not has_literal_subparser:
+        return flat_flags, {}
 
-    def _collect_defs_in_block(
-        stmts: list[ast.stmt],
-        defs_map: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]],
-        *,
-        is_module_scope: bool,
-    ) -> None:
-        for stmt in stmts:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                defs_map[stmt.name] = [stmt]
-                _collect_nested_only(stmt.body)
-            elif isinstance(stmt, ast.ClassDef):
-                if is_module_scope:
-                    cls_map: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
-                    _collect_defs_in_block(stmt.body, cls_map, is_module_scope=False)
-                    class_methods[stmt.name] = cls_map
-                else:
-                    _collect_nested_only(stmt.body)
-            elif isinstance(stmt, ast.If):
-                pre = {k: list(v) for k, v in defs_map.items()}
-                then_map = {k: list(v) for k, v in pre.items()}
-                _collect_defs_in_block(stmt.body, then_map, is_module_scope=is_module_scope)
-                else_map: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] | None = None
-                if stmt.orelse:
-                    else_map = {k: list(v) for k, v in pre.items()}
-                    _collect_defs_in_block(stmt.orelse, else_map, is_module_scope=is_module_scope)
-                merged = _merge_if_maps(pre, then_map, else_map, _dedup_func_nodes)
-                defs_map.clear()
-                defs_map.update(merged)
-            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-                pre = {k: list(v) for k, v in defs_map.items()}
-                body_map = {k: list(v) for k, v in pre.items()}
-                _collect_defs_in_block(stmt.body, body_map, is_module_scope=is_module_scope)
-                else_map = {k: list(v) for k, v in pre.items()}
-                if stmt.orelse:
-                    _collect_defs_in_block(stmt.orelse, else_map, is_module_scope=is_module_scope)
-                for k in set(body_map.keys()) | set(else_map.keys()):
-                    if body_map.get(k) != pre.get(k) or else_map.get(k) != pre.get(k):
-                        defs_map[k] = _dedup_func_nodes(
-                            [*pre.get(k, []), *body_map.get(k, []), *else_map.get(k, [])]
-                        )
-            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-                _collect_defs_in_block(stmt.body, defs_map, is_module_scope=is_module_scope)
-            elif isinstance(stmt, ast.Try):
-                pre = {k: list(v) for k, v in defs_map.items()}
-                try_map = {k: list(v) for k, v in pre.items()}
-                _collect_defs_in_block(stmt.body, try_map, is_module_scope=is_module_scope)
-                if stmt.orelse:
-                    _collect_defs_in_block(stmt.orelse, try_map, is_module_scope=is_module_scope)
-                merged_try = {k: list(v) for k, v in try_map.items()}
-                for handler in stmt.handlers:
-                    h_map = {k: list(v) for k, v in pre.items()}
-                    _collect_defs_in_block(handler.body, h_map, is_module_scope=is_module_scope)
-                    for k, h_val in h_map.items():
-                        if h_val != pre.get(k):
-                            merged_try[k] = _dedup_func_nodes(
-                                [*merged_try.get(k, []), *h_val]
-                            )
-                defs_map.clear()
-                defs_map.update(merged_try)
-                if stmt.finalbody:
-                    _collect_defs_in_block(stmt.finalbody, defs_map, is_module_scope=is_module_scope)
-
-    _collect_defs_in_block(tree.body, module_funcs, is_module_scope=True)
-    all_nested_funcs = _dedup_func_nodes(all_nested_funcs)
+    top_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if stmt.name in top_funcs:
+                return flat_flags, {}
+            top_funcs[stmt.name] = stmt
 
     flags_by_tag: dict[str, set[str]] = defaultdict(set)
     subcommand_names: set[str] = set()
     subparser_roots: set[str] = set()
     parent_edges: dict[str, set[str]] = defaultdict(set)
     parent_sources: set[str] = set()
-    directly_called_func_ids: set[int] = set()
+    attributed_add_arg_ids: set[int] = set()
+    called_top_funcs: set[str] = set()
     parser_counter = 0
-    active_calls: set[
-        tuple[
-            int,
-            tuple[tuple[str, tuple[str, ...]], ...],
-            tuple[tuple[str, tuple[str, ...]], ...],
-            bool,
-        ]
-    ] = set()
-    completed_returns: dict[
-        tuple[
-            int,
-            tuple[tuple[str, tuple[str, ...]], ...],
-            tuple[tuple[str, tuple[str, ...]], ...],
-            bool,
-        ],
-        tuple[str, ...],
-    ] = {}
+    ambiguous = False
+    call_stack: set[str] = set()
 
     def new_parser_tag() -> str:
         nonlocal parser_counter
         parser_counter += 1
         return f"parser:{parser_counter}"
 
-    def _record_parents(
-        target_tags: tuple[str, ...],
-        call: ast.Call,
-        env: dict[str, tuple[str, ...]],
-        lexical_funcs: dict[
-            str,
-            list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, tuple[str, ...]]]],
-        ],
-    ) -> None:
+    def bind_var(env: dict[str, str], name: str, tag: str) -> None:
+        nonlocal ambiguous
+        if name in env and env[name] != tag:
+            ambiguous = True
+            return
+        env[name] = tag
+
+    def record_parents(target_tag: str, call: ast.Call, env: dict[str, str]) -> None:
+        nonlocal ambiguous
         for kw in call.keywords:
-            if kw.arg == "parents" and isinstance(kw.value, (ast.List, ast.Tuple)):
+            if kw.arg == "parents":
+                if not isinstance(kw.value, (ast.List, ast.Tuple)):
+                    ambiguous = True
+                    return
                 for elem in kw.value.elts:
-                    ptags = eval_expr(elem, env, lexical_funcs)
-                    for ptag in ptags:
-                        parent_sources.add(ptag)
-                        for ttag in target_tags:
-                            parent_edges[ttag].add(ptag)
+                    ptag = eval_expr(elem, env)
+                    if ptag is None or not ptag.startswith(("parser:", "sub:")):
+                        ambiguous = True
+                        return
+                    parent_edges[target_tag].add(ptag)
+                    parent_sources.add(ptag)
 
-    def _bind_and_call(
-        callee: ast.FunctionDef | ast.AsyncFunctionDef,
-        expr: ast.Call,
-        env: dict[str, tuple[str, ...]],
-        lexical_funcs: dict[
-            str,
-            list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, tuple[str, ...]]]],
-        ],
-        *,
-        closure_env: dict[str, tuple[str, ...]] | None = None,
-        skip_self_cls: bool = False,
-        self_instance_tags: tuple[str, ...] = (),
-    ) -> tuple[str, ...]:
-        bound: dict[str, tuple[str, ...]] = {}
-        pos_names = [a.arg for a in callee.args.posonlyargs] + [a.arg for a in callee.args.args]
-        if skip_self_cls and pos_names and pos_names[0] in ("self", "cls"):
-            if self_instance_tags:
-                bound[pos_names[0]] = self_instance_tags
-            pos_names = pos_names[1:]
-        for idx, arg_node in enumerate(expr.args):
-            if idx < len(pos_names):
-                arg_tags = eval_expr(arg_node, env, lexical_funcs)
-                if arg_tags:
-                    bound[pos_names[idx]] = arg_tags
-        for kw in expr.keywords:
-            if kw.arg is not None:
-                arg_tags = eval_expr(kw.value, env, lexical_funcs)
-                if arg_tags:
-                    bound[kw.arg] = arg_tags
-        closure_snap = dict(closure_env) if closure_env else {}
-        directly_called_func_ids.add(id(callee))
-        return run_function(callee, bound, closure_snap, lexical_funcs, is_uncalled_sweep=False)
-
-    def eval_expr(
-        expr: ast.AST | None,
-        env: dict[str, tuple[str, ...]],
-        lexical_funcs: dict[
-            str,
-            list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, tuple[str, ...]]]],
-        ],
-    ) -> tuple[str, ...]:
-        if expr is None:
-            return ()
+    def eval_expr(expr: ast.AST | None, env: dict[str, str]) -> str | None:
+        nonlocal ambiguous
+        if expr is None or ambiguous:
+            return None
         if isinstance(expr, ast.Name):
-            return env.get(expr.id, ())
-        if isinstance(expr, ast.IfExp):
-            return _merge_tags(
-                eval_expr(expr.body, env, lexical_funcs),
-                eval_expr(expr.orelse, env, lexical_funcs),
-            )
+            return env.get(expr.id)
         if not isinstance(expr, ast.Call):
-            return ()
+            return None
 
         if _is_argument_parser_init(expr):
             tag = new_parser_tag()
-            _record_parents((tag,), expr, env, lexical_funcs)
-            return (tag,)
+            record_parents(tag, expr, env)
+            return tag
 
         func = expr.func
         if isinstance(func, ast.Attribute):
-            owner_tags = eval_expr(func.value, env, lexical_funcs)
+            owner_tag = eval_expr(func.value, env)
             attr = func.attr
             if attr == "add_subparsers":
-                if owner_tags:
-                    for ot in owner_tags:
-                        subparser_roots.add(ot)
-                    return tuple(f"subparsers:{ot}" for ot in owner_tags)
-                return ("subparsers:unknown",)
+                if owner_tag is None or not owner_tag.startswith("parser:"):
+                    ambiguous = True
+                    return None
+                subparser_roots.add(owner_tag)
+                return f"subparsers:{owner_tag}"
             if attr == "add_parser":
                 sub_name = _is_add_parser_call(expr)
-                if sub_name:
-                    subcommand_names.add(sub_name)
-                    tag = f"sub:{sub_name}"
-                    _record_parents((tag,), expr, env, lexical_funcs)
-                    return (tag,)
-                return ()
+                if not sub_name or owner_tag is None or not owner_tag.startswith("subparsers:"):
+                    ambiguous = True
+                    return None
+                subcommand_names.add(sub_name)
+                tag = f"sub:{sub_name}"
+                record_parents(tag, expr, env)
+                return tag
             if attr in ("add_argument_group", "add_mutually_exclusive_group"):
-                return owner_tags
+                if owner_tag is None or not owner_tag.startswith(("parser:", "sub:")):
+                    ambiguous = True
+                    return None
+                return owner_tag
             if attr == "add_argument":
-                targets = owner_tags if owner_tags else ("unknown:root",)
                 fls = _extract_long_flags_from_call(expr)
-                for target in targets:
-                    flags_by_tag[target].update(fls)
-                return ()
-
-            cls_names: list[str] = []
-            if isinstance(func.value, ast.Name) and func.value.id in class_methods:
-                cls_names.append(func.value.id)
-            for ot in owner_tags:
-                if ot.startswith("instance:"):
-                    cn = ot[len("instance:") :]
-                    if cn in class_methods and cn not in cls_names:
-                        cls_names.append(cn)
-
-            all_method_rets: list[str] = []
-            matched_any = False
-            for cls_name in cls_names:
-                method_cands = class_methods.get(cls_name, {}).get(attr, [])
-                if method_cands:
-                    matched_any = True
-                    for m_fn in method_cands:
-                        rets = _bind_and_call(
-                            m_fn,
-                            expr,
-                            env,
-                            lexical_funcs,
-                            skip_self_cls=True,
-                            self_instance_tags=(f"instance:{cls_name}",),
-                        )
-                        all_method_rets.extend(rets)
-            if matched_any:
-                return _merge_tags(all_method_rets)
-
-            for arg_node in expr.args:
-                eval_expr(arg_node, env, lexical_funcs)
-            for kw in expr.keywords:
-                eval_expr(kw.value, env, lexical_funcs)
-            return ()
+                if not fls:
+                    return None
+                if owner_tag is None or not owner_tag.startswith(("parser:", "sub:")):
+                    ambiguous = True
+                    return None
+                flags_by_tag[owner_tag].update(fls)
+                attributed_add_arg_ids.add(id(expr))
+                return None
 
         if isinstance(func, ast.Name):
             if func.id == "add_argument":
-                flags_by_tag["unknown:root"].update(_extract_long_flags_from_call(expr))
-                return ()
-            if func.id in lexical_funcs:
-                all_rets: list[str] = []
-                for callee, closure_env_ref in list(lexical_funcs[func.id]):
-                    rets = _bind_and_call(
-                        callee,
-                        expr,
-                        env,
-                        lexical_funcs,
-                        closure_env=closure_env_ref,
-                        skip_self_cls=False,
-                    )
-                    all_rets.extend(rets)
-                return _merge_tags(all_rets)
-            if func.id in module_funcs:
-                all_rets = []
-                for callee in module_funcs[func.id]:
-                    rets = _bind_and_call(
-                        callee,
-                        expr,
-                        env,
-                        lexical_funcs,
-                        skip_self_cls=False,
-                    )
-                    all_rets.extend(rets)
-                return _merge_tags(all_rets)
-            if func.id in class_methods:
-                for arg_node in expr.args:
-                    eval_expr(arg_node, env, lexical_funcs)
+                if _extract_long_flags_from_call(expr):
+                    ambiguous = True
+                return None
+            callee = top_funcs.get(func.id)
+            if callee is not None:
+                if callee.name in call_stack:
+                    ambiguous = True
+                    return None
+                bound: dict[str, str] = {}
+                pos_names = [a.arg for a in callee.args.posonlyargs] + [
+                    a.arg for a in callee.args.args
+                ]
+                for idx, arg_node in enumerate(expr.args):
+                    arg_tag = eval_expr(arg_node, env)
+                    if idx < len(pos_names) and arg_tag is not None:
+                        bound[pos_names[idx]] = arg_tag
                 for kw in expr.keywords:
-                    eval_expr(kw.value, env, lexical_funcs)
-                return (f"instance:{func.id}",)
-            for arg_node in expr.args:
-                eval_expr(arg_node, env, lexical_funcs)
-            for kw in expr.keywords:
-                eval_expr(kw.value, env, lexical_funcs)
-            return ()
+                    kw_tag = eval_expr(kw.value, env)
+                    if kw.arg is not None and kw_tag is not None:
+                        bound[kw.arg] = kw_tag
+                return run_top_func(callee, bound)
 
         for arg_node in expr.args:
-            eval_expr(arg_node, env, lexical_funcs)
+            eval_expr(arg_node, env)
         for kw in expr.keywords:
-            eval_expr(kw.value, env, lexical_funcs)
-        return ()
+            eval_expr(kw.value, env)
+        return None
 
-    def walk_stmts(
-        stmts: list[ast.stmt],
-        env: dict[str, tuple[str, ...]],
-        lexical_funcs: dict[
-            str,
-            list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, tuple[str, ...]]]],
-        ],
-    ) -> tuple[str, ...]:
-        ret_tags: list[str] = []
+    def walk_linear(stmts: list[ast.stmt], env: dict[str, str], *, allow_main_if: bool) -> str | None:
+        nonlocal ambiguous
+        ret_tag: str | None = None
         for stmt in stmts:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # 同一スコープの再定義および内側シャドウイングは外側候補を置換する
-                lexical_funcs[stmt.name] = [(stmt, env)]
-            elif isinstance(stmt, ast.Assign):
-                val_tags = eval_expr(stmt.value, env, lexical_funcs)
-                if val_tags:
+            if ambiguous:
+                return None
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if not allow_main_if:
+                    if _has_argparse_construct(stmt):
+                        ambiguous = True
+                        return None
+                continue
+            if isinstance(stmt, ast.Assign):
+                val_tag = eval_expr(stmt.value, env)
+                if val_tag is not None:
                     for tgt in stmt.targets:
                         if isinstance(tgt, ast.Name):
-                            env[tgt.id] = val_tags
+                            bind_var(env, tgt.id, val_tag)
             elif isinstance(stmt, ast.AnnAssign):
-                val_tags = eval_expr(stmt.value, env, lexical_funcs)
-                if val_tags and isinstance(stmt.target, ast.Name):
-                    env[stmt.target.id] = val_tags
+                val_tag = eval_expr(stmt.value, env)
+                if val_tag is not None and isinstance(stmt.target, ast.Name):
+                    bind_var(env, stmt.target.id, val_tag)
             elif isinstance(stmt, ast.Expr):
-                eval_expr(stmt.value, env, lexical_funcs)
+                eval_expr(stmt.value, env)
             elif isinstance(stmt, ast.Raise):
-                eval_expr(stmt.exc, env, lexical_funcs)
-                eval_expr(stmt.cause, env, lexical_funcs)
+                eval_expr(stmt.exc, env)
+                eval_expr(stmt.cause, env)
             elif isinstance(stmt, ast.Return):
-                ret_tags.extend(eval_expr(stmt.value, env, lexical_funcs))
-            elif isinstance(stmt, ast.If):
-                pre_env = dict(env)
-                pre_lex = {k: list(v) for k, v in lexical_funcs.items()}
+                rtag = eval_expr(stmt.value, env)
+                if rtag is not None:
+                    if ret_tag is not None and ret_tag != rtag:
+                        ambiguous = True
+                        return None
+                    ret_tag = rtag
+            elif isinstance(stmt, ast.If) and allow_main_if and _is_main_guard(stmt):
+                if stmt.orelse and _has_argparse_construct(ast.Module(body=stmt.orelse, type_ignores=[])):
+                    ambiguous = True
+                    return None
+                walk_linear(stmt.body, env, allow_main_if=False)
+            elif isinstance(stmt, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With, ast.AsyncWith)):
+                if _has_argparse_construct(stmt):
+                    ambiguous = True
+                    return None
+        return ret_tag
 
-                then_env = dict(pre_env)
-                then_lex = {k: list(v) for k, v in pre_lex.items()}
-                ret_tags.extend(walk_stmts(stmt.body, then_env, then_lex))
-
-                else_env: dict[str, tuple[str, ...]] | None = None
-                else_lex: (
-                    dict[
-                        str,
-                        list[
-                            tuple[
-                                ast.FunctionDef | ast.AsyncFunctionDef,
-                                dict[str, tuple[str, ...]],
-                            ]
-                        ],
-                    ]
-                    | None
-                ) = None
-                if stmt.orelse:
-                    else_env = dict(pre_env)
-                    else_lex = {k: list(v) for k, v in pre_lex.items()}
-                    ret_tags.extend(walk_stmts(stmt.orelse, else_env, else_lex))
-
-                merged_env = _merge_env_branches(pre_env, then_env, else_env)
-                env.clear()
-                env.update(merged_env)
-
-                merged_lex = _merge_if_maps(pre_lex, then_lex, else_lex, _dedup_lexical_entries)
-                lexical_funcs.clear()
-                lexical_funcs.update(merged_lex)
-            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-                pre_env = dict(env)
-                pre_lex = {k: list(v) for k, v in lexical_funcs.items()}
-                body_env = dict(pre_env)
-                body_lex = {k: list(v) for k, v in pre_lex.items()}
-                ret_tags.extend(walk_stmts(stmt.body, body_env, body_lex))
-                else_env = dict(pre_env)
-                else_lex = {k: list(v) for k, v in pre_lex.items()}
-                if stmt.orelse:
-                    ret_tags.extend(walk_stmts(stmt.orelse, else_env, else_lex))
-                for k in set(body_env.keys()) | set(else_env.keys()):
-                    if body_env.get(k) != pre_env.get(k) or else_env.get(k) != pre_env.get(k):
-                        env[k] = _merge_tags(
-                            pre_env.get(k, ()), body_env.get(k, ()), else_env.get(k, ())
-                        )
-                for k in set(body_lex.keys()) | set(else_lex.keys()):
-                    if body_lex.get(k) != pre_lex.get(k) or else_lex.get(k) != pre_lex.get(k):
-                        lexical_funcs[k] = _dedup_lexical_entries(
-                            [*pre_lex.get(k, []), *body_lex.get(k, []), *else_lex.get(k, [])]
-                        )
-            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-                ret_tags.extend(walk_stmts(stmt.body, env, lexical_funcs))
-            elif isinstance(stmt, ast.Try):
-                pre_env = dict(env)
-                pre_lex = {k: list(v) for k, v in lexical_funcs.items()}
-                try_env = dict(pre_env)
-                try_lex = {k: list(v) for k, v in pre_lex.items()}
-                ret_tags.extend(walk_stmts(stmt.body, try_env, try_lex))
-                if stmt.orelse:
-                    ret_tags.extend(walk_stmts(stmt.orelse, try_env, try_lex))
-                merged_try_env = dict(try_env)
-                merged_try_lex = {k: list(v) for k, v in try_lex.items()}
-                for handler in stmt.handlers:
-                    h_env = dict(pre_env)
-                    h_lex = {k: list(v) for k, v in pre_lex.items()}
-                    ret_tags.extend(walk_stmts(handler.body, h_env, h_lex))
-                    for k, h_val in h_env.items():
-                        if h_val != pre_env.get(k):
-                            merged_try_env[k] = _merge_tags(merged_try_env.get(k, ()), h_val)
-                    for k, h_fval in h_lex.items():
-                        if h_fval != pre_lex.get(k):
-                            merged_try_lex[k] = _dedup_lexical_entries(
-                                [*merged_try_lex.get(k, []), *h_fval]
-                            )
-                env.clear()
-                env.update(merged_try_env)
-                lexical_funcs.clear()
-                lexical_funcs.update(merged_try_lex)
-                if stmt.finalbody:
-                    ret_tags.extend(walk_stmts(stmt.finalbody, env, lexical_funcs))
-        return _merge_tags(ret_tags)
-
-    def run_function(
+    def run_top_func(
         fn: ast.FunctionDef | ast.AsyncFunctionDef,
-        bound: dict[str, tuple[str, ...]],
-        closure_env: dict[str, tuple[str, ...]],
-        parent_lexical: dict[
-            str,
-            list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, tuple[str, ...]]]],
-        ],
-        *,
-        is_uncalled_sweep: bool = False,
-    ) -> tuple[str, ...]:
-        key = (
-            id(fn),
-            tuple(sorted(bound.items())),
-            tuple(sorted(closure_env.items())),
-            is_uncalled_sweep,
-        )
-        if key in completed_returns:
-            return completed_returns[key]
-        if key in active_calls:
-            return ()
-        active_calls.add(key)
+        bound: dict[str, str],
+    ) -> str | None:
+        called_top_funcs.add(fn.name)
+        call_stack.add(fn.name)
         try:
-            local_env: dict[str, tuple[str, ...]] = dict(closure_env)
-            local_lexical: dict[
-                str,
-                list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, tuple[str, ...]]]],
-            ] = {k: list(v) for k, v in parent_lexical.items()}
-            all_params = (
-                [a.arg for a in fn.args.posonlyargs]
-                + [a.arg for a in fn.args.args]
-                + [a.arg for a in fn.args.kwonlyargs]
-            )
-            param_prefix = "sweep_param" if is_uncalled_sweep else "param"
-            for p in all_params:
-                if p in bound:
-                    local_env[p] = bound[p]
-                elif p not in local_env:
-                    local_env[p] = (f"{param_prefix}:{id(fn)}:{p}",)
-            ret = walk_stmts(fn.body, local_env, local_lexical)
+            return walk_linear(fn.body, dict(bound), allow_main_if=False)
         finally:
-            active_calls.discard(key)
-        completed_returns[key] = ret
-        return ret
+            call_stack.discard(fn.name)
 
-    static_callee_names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name):
-                static_callee_names.add(node.func.id)
-            elif isinstance(node.func, ast.Attribute):
-                static_callee_names.add(node.func.attr)
+    module_env: dict[str, str] = {}
+    walk_linear(tree.body, module_env, allow_main_if=True)
 
-    top_env: dict[str, tuple[str, ...]] = {}
-    top_lexical: dict[
-        str,
-        list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, tuple[str, ...]]]],
-    ] = {}
-    top_stmts = [n for n in tree.body if not isinstance(n, ast.ClassDef)]
-    walk_stmts(top_stmts, top_env, top_lexical)
-
-    def _run_uncalled_sweep(only_entry_roots: bool) -> None:
-        for fn_name, fn_list in module_funcs.items():
-            if only_entry_roots and fn_name in static_callee_names:
-                continue
-            for fn in fn_list:
-                if id(fn) not in directly_called_func_ids:
-                    run_function(fn, {}, top_env, top_lexical, is_uncalled_sweep=True)
-
-        for cls_name, methods in class_methods.items():
-            for m_name, m_list in methods.items():
-                if only_entry_roots and m_name in static_callee_names:
+    if not ambiguous and attributed_add_arg_ids != all_add_arg_ids:
+        callee_names = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        for only_roots in (True, False):
+            for fn_name, fn in top_funcs.items():
+                if ambiguous or attributed_add_arg_ids == all_add_arg_ids:
+                    break
+                if only_roots and fn_name in callee_names:
                     continue
-                for m_fn in m_list:
-                    if id(m_fn) not in directly_called_func_ids:
-                        pos_names = [a.arg for a in m_fn.args.posonlyargs] + [
-                            a.arg for a in m_fn.args.args
-                        ]
-                        m_bound: dict[str, tuple[str, ...]] = {}
-                        if pos_names and pos_names[0] in ("self", "cls"):
-                            m_bound[pos_names[0]] = (f"instance:{cls_name}",)
-                        run_function(m_fn, m_bound, top_env, top_lexical, is_uncalled_sweep=True)
+                if fn_name not in called_top_funcs and _fn_creates_argument_parser(fn):
+                    run_top_func(fn, {})
 
-    _run_uncalled_sweep(only_entry_roots=True)
-    _run_uncalled_sweep(only_entry_roots=False)
-
-    for n_fn in all_nested_funcs:
-        if id(n_fn) not in directly_called_func_ids:
-            run_function(n_fn, {}, {}, {}, is_uncalled_sweep=True)
+    if ambiguous or attributed_add_arg_ids != all_add_arg_ids or not subcommand_names:
+        return flat_flags, {}
 
     def collect_inherited(tag: str, seen: set[str] | None = None) -> set[str]:
         visited = set() if seen is None else seen
@@ -694,41 +377,18 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
             collected.update(collect_inherited(ptag, visited))
         return collected
 
-    subcommand_flags: dict[str, set[str]] = {}
-    for sub_name in sorted(subcommand_names):
-        subcommand_flags[sub_name] = collect_inherited(f"sub:{sub_name}")
-
-    root_flags: set[str] = set(flags_by_tag.get("unknown:root", set()))
-    for tag, fls in flags_by_tag.items():
-        if tag.startswith("param:"):
-            root_flags.update(fls)
-        elif tag.startswith("sweep_param:"):
-            parts = tag.split(":", 2)
-            if len(parts) >= 2 and parts[1].isdigit():
-                if int(parts[1]) not in directly_called_func_ids:
-                    root_flags.update(fls)
-
-    if subcommand_names:
-        for rtag in subparser_roots:
-            root_flags.update(collect_inherited(rtag))
-        for tag, fls in flags_by_tag.items():
-            if tag.startswith("parser:") and tag not in parent_sources and tag not in subparser_roots:
-                root_flags.update(fls)
-    else:
-        for tag, fls in flags_by_tag.items():
-            if not tag.startswith(("sub:", "param:", "sweep_param:")):
-                root_flags.update(fls)
+    subcommand_flags: dict[str, set[str]] = {
+        sub_name: collect_inherited(f"sub:{sub_name}")
+        for sub_name in sorted(subcommand_names)
+    }
+    root_flags: set[str] = set()
+    for rtag in subparser_roots:
+        root_flags.update(collect_inherited(rtag))
+    for tag in flags_by_tag:
+        if tag.startswith("parser:") and tag not in parent_sources and tag not in subparser_roots:
+            root_flags.update(collect_inherited(tag))
 
     return root_flags, subcommand_flags
-
-
-def extract_argparse_flags(py_path: Path) -> set[str]:
-    """Python スクリプトの AST から add_argument で定義された --flag を抽出する。"""
-    root_flags, subcommand_flags = extract_argparse_flag_spec(py_path)
-    all_flags = set(root_flags)
-    for sub_flags in subcommand_flags.values():
-        all_flags.update(sub_flags)
-    return all_flags
 
 
 def strip_quoted_arg_values(text: str) -> str:
@@ -851,8 +511,7 @@ def _scan_doc_flags_from_lines(
                             active_script = None
                             active_subcmd = None
                             continue
-                        segs = _split_shell_segments(b_line)
-                        for seg_idx, seg in enumerate(segs):
+                        for seg_idx, seg in enumerate(_split_shell_segments(b_line)):
                             seg_stripped = seg.strip()
                             matched = detect_scripts(seg)
                             if len(matched) == 1:
@@ -866,7 +525,6 @@ def _scan_doc_flags_from_lines(
                                     seg, pattern_by_name[active_script], sub_set
                                 )
                             elif len(matched) > 1 or seg_idx > 0:
-                                # 1 セグメントに複数スクリプト混在、または別コマンド連結時は誤帰属を避けてリセット
                                 active_script = None
                                 active_subcmd = None
                             if active_script is not None and (
@@ -886,7 +544,6 @@ def _scan_doc_flags_from_lines(
         if in_fence:
             block_buf.append(line)
         else:
-            # 地の文では単一スクリプト名を含むインラインコード片のみから抽出する
             for inline_seg in BACKTICK_PATH_RE.findall(line):
                 for sub_seg in _split_shell_segments(inline_seg):
                     matched = detect_scripts(sub_seg)
@@ -926,6 +583,18 @@ def extract_doc_flags_from_lines(
     return dict(target_map)
 
 
+def _iter_safe_md_lines(md_paths: Iterable[Path]) -> Iterable[list[str]]:
+    seen_paths: set[Path] = set()
+    for md_path in md_paths:
+        if md_path in seen_paths or _is_reparse_or_symlink(md_path):
+            continue
+        seen_paths.add(md_path)
+        try:
+            yield md_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+
+
 def extract_doc_flags_by_script(
     md_paths: Iterable[Path],
     script_names: set[str],
@@ -934,40 +603,43 @@ def extract_doc_flags_by_script(
     if not script_names:
         return {}
     flags_by_script: dict[str, set[str]] = defaultdict(set)
-    seen_paths: set[Path] = set()
-    for md_path in md_paths:
-        if md_path in seen_paths or _is_reparse_or_symlink(md_path):
-            continue
-        seen_paths.add(md_path)
-        try:
-            lines = md_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            continue
+    for lines in _iter_safe_md_lines(md_paths):
         extract_doc_flags_from_lines(lines, script_names, flags_by_script)
     return dict(flags_by_script)
 
 
-def _build_impl_specs(
+def _find_doc_only_flags_from_line_batches(
+    line_batches: Iterable[Iterable[str]],
     script_paths: Iterable[Path],
-) -> tuple[dict[str, set[str]], dict[str, dict[str, set[str]]]]:
+) -> list[str]:
+    scripts = list(script_paths)
+    if not scripts:
+        return []
     root_by_script: dict[str, set[str]] = {}
     subs_by_script: dict[str, dict[str, set[str]]] = {}
-    for sp in script_paths:
+    for sp in scripts:
         rflags, sub_map = extract_argparse_flag_spec(sp)
         root_by_script.setdefault(sp.name, set()).update(rflags)
         target_subs = subs_by_script.setdefault(sp.name, {})
         for sub_name, sflags in sub_map.items():
             target_subs.setdefault(sub_name, set()).update(sflags)
-    return root_by_script, subs_by_script
 
+    script_names = {sp.name for sp in scripts}
+    known_subcommands = {sn: set(smap.keys()) for sn, smap in subs_by_script.items()}
 
-def _diff_doc_only_flags_with_subcommands(
-    doc_flags_by_script_sub: dict[str, dict[str | None, set[str]]],
-    root_by_script: dict[str, set[str]],
-    subs_by_script: dict[str, dict[str, set[str]]],
-) -> list[str]:
+    merged: dict[str, dict[str | None, set[str]]] = defaultdict(lambda: defaultdict(set))
+    for lines in line_batches:
+        scanned = _scan_doc_flags_from_lines(
+            lines,
+            script_names,
+            known_subcommands=known_subcommands,
+        )
+        for sname, smap in scanned.items():
+            for subcmd, fls in smap.items():
+                merged[sname][subcmd].update(fls)
+
     doc_only: set[str] = set()
-    for sname, sub_map in sorted(doc_flags_by_script_sub.items()):
+    for sname, sub_map in sorted(merged.items()):
         root_flags = root_by_script.get(sname, set())
         impl_subs = subs_by_script.get(sname, {})
         union_all = set(root_flags)
@@ -990,33 +662,7 @@ def find_doc_only_flags(
     script_paths: Iterable[Path],
 ) -> list[str]:
     """文書にのみ存在し対象スクリプトの AST にないフラグを script.py:--flag 昇順で返す。"""
-    scripts = list(script_paths)
-    if not scripts:
-        return []
-    root_by_script, subs_by_script = _build_impl_specs(scripts)
-    script_names = {sp.name for sp in scripts}
-    known_subcommands = {sn: set(smap.keys()) for sn, smap in subs_by_script.items()}
-
-    merged: dict[str, dict[str | None, set[str]]] = defaultdict(lambda: defaultdict(set))
-    seen_paths: set[Path] = set()
-    for md_path in md_paths:
-        if md_path in seen_paths or _is_reparse_or_symlink(md_path):
-            continue
-        seen_paths.add(md_path)
-        try:
-            lines = md_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            continue
-        scanned = _scan_doc_flags_from_lines(
-            lines,
-            script_names,
-            known_subcommands=known_subcommands,
-        )
-        for sname, smap in scanned.items():
-            for subcmd, fls in smap.items():
-                merged[sname][subcmd].update(fls)
-
-    return _diff_doc_only_flags_with_subcommands(merged, root_by_script, subs_by_script)
+    return _find_doc_only_flags_from_line_batches(_iter_safe_md_lines(md_paths), script_paths)
 
 
 def find_doc_only_flags_in_text(
@@ -1024,15 +670,4 @@ def find_doc_only_flags_in_text(
     script_paths: Iterable[Path],
 ) -> list[str]:
     """メモリ上の Markdown 文字列に対して不在フラグ一覧（script.py:--flag）を返す。"""
-    scripts = list(script_paths)
-    if not scripts:
-        return []
-    root_by_script, subs_by_script = _build_impl_specs(scripts)
-    script_names = {sp.name for sp in scripts}
-    known_subcommands = {sn: set(smap.keys()) for sn, smap in subs_by_script.items()}
-    scanned = _scan_doc_flags_from_lines(
-        doc_text.splitlines(),
-        script_names,
-        known_subcommands=known_subcommands,
-    )
-    return _diff_doc_only_flags_with_subcommands(scanned, root_by_script, subs_by_script)
+    return _find_doc_only_flags_from_line_batches([doc_text.splitlines()], script_paths)
