@@ -33,9 +33,14 @@ import subprocess  # noqa: E402
 from typing import Any, Optional, Sequence  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+REPO_DRIFT_SCRIPTS_DIR = (
+    Path(__file__).resolve().parents[2] / "repo-drift-audit" / "scripts"
+)
+for _import_dir in (SCRIPT_DIR, REPO_DRIFT_SCRIPTS_DIR):
+    if str(_import_dir) not in sys.path:
+        sys.path.insert(0, str(_import_dir))
 
+import argparse_flag_audit  # noqa: E402
 from check_plugin import (  # noqa: E402
     AGENTS_MD_PATH,
     AGENTS_SECTION_LINE_LIMIT,
@@ -834,94 +839,21 @@ def _count_structure_metrics(text: str) -> tuple[int, int]:
 
 def _extract_argparse_flags(py_path: Path) -> set[str]:
     """Python スクリプトの AST から add_argument で定義された --flag を抽出する。"""
-    try:
-        source = py_path.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(source, filename=str(py_path))
-    except (OSError, SyntaxError):
-        return set()
-    flags: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            attr_name = (
-                func.attr
-                if isinstance(func, ast.Attribute)
-                else (func.id if isinstance(func, ast.Name) else "")
-            )
-            if attr_name != "add_argument":
-                continue
-            for arg in node.args:
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    if arg.value.startswith("--") and len(arg.value) > 2:
-                        flags.add(arg.value)
-    return flags
+    return argparse_flag_audit.extract_argparse_flags(py_path)
 
 
 def _strip_quoted_arg_values(text: str) -> str:
     """フラグ値（例: --command "git push --force"）内部の誤検出を防ぐためクォート内を除去する。"""
-    cleaned = re.sub(r'"[^"\n]*"', '""', text)
-    cleaned = re.sub(r"'[^'\n]*'", "''", cleaned)
-    return cleaned
+    return argparse_flag_audit.strip_quoted_arg_values(text)
 
 
 def _extract_doc_flags_by_script(
     skill_dir: Path, script_names: set[str]
 ) -> dict[str, set[str]]:
     """スキル文書内のスクリプト呼び出し行に紐づく --flag 記載をスクリプト単位で抽出する。"""
-    if not script_names:
-        return {}
-    flags_by_script: dict[str, set[str]] = defaultdict(set)
-    ordered_names = sorted(script_names, key=lambda s: (-len(s), s))
-
-    def detect_scripts(text: str) -> list[str]:
-        return [sn for sn in ordered_names if sn in text]
-
-    for md_path in sorted(skill_dir.rglob("*.md")):
-        try:
-            lines = md_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            continue
-        in_fence = False
-        block_buf: list[str] = []
-        for line in lines:
-            if FENCE_RE.match(line):
-                if in_fence:
-                    block_text = "\n".join(block_buf)
-                    if detect_scripts(block_text):
-                        active_script: Optional[str] = None
-                        for b_line in block_buf:
-                            stripped = b_line.strip()
-                            if not stripped or stripped.startswith("#"):
-                                active_script = None
-                                continue
-                            matched = detect_scripts(b_line)
-                            if len(matched) == 1:
-                                active_script = matched[0]
-                            elif len(matched) > 1:
-                                # 1 行に複数スクリプトが混在する場合は誤帰属を避けてリセット
-                                active_script = None
-                            if active_script is not None and (
-                                matched or stripped.startswith("--")
-                            ):
-                                flags_by_script[active_script].update(
-                                    LONG_FLAG_RE.findall(_strip_quoted_arg_values(b_line))
-                                )
-                            if not stripped.endswith(("`", "\\")):
-                                active_script = None
-                    block_buf = []
-                in_fence = not in_fence
-                continue
-            if in_fence:
-                block_buf.append(line)
-            else:
-                # 地の文では単一スクリプト名を含むインラインコード片のみから抽出する
-                for seg in BACKTICK_PATH_RE.findall(line):
-                    matched = detect_scripts(seg)
-                    if len(matched) == 1:
-                        flags_by_script[matched[0]].update(
-                            LONG_FLAG_RE.findall(_strip_quoted_arg_values(seg))
-                        )
-    return dict(flags_by_script)
+    return argparse_flag_audit.extract_doc_flags_by_script(
+        sorted(skill_dir.rglob("*.md")), script_names
+    )
 
 
 def _count_ast_tests(test_path: Path) -> int:
