@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""triage_transcript_decision1.py のユニットテスト（SH-01–SH-20）。"""
+"""triage_transcript_decision1.py のユニットテスト（SH-01–SH-23）。"""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def _make_row(
 
 
 class TestTriageTranscriptDecision1(unittest.TestCase):
-    """SH-01–SH-20 の仕様検証テスト。"""
+    """SH-01–SH-23 の仕様検証テスト。"""
 
     def test_SH_01_load_jsonl_skips_blank_and_broken_lines(self) -> None:
         """SH-01: 空行、不正 JSON 行、非オブジェクト行を警告付きでスキップし有効行のみ読み込む。"""
@@ -137,7 +137,7 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
             "github=" + "ghp_" + "1234567890abcdefghijklmnop\n"
             "openai=" + "sk-" + "proj1234567890abcdefghijklmnop\n"
             "aws=" + "AKIA" + "IOSFODNN7EXAMPLE\n"
-            "auth=Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload\n"
+            "auth=Bearer " + "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload\n"
             "-----BEGIN " + "RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END " + "RSA PRIVATE KEY-----"
         )
         step = mod.normalize_step(_make_row(2, step_type="GENERIC", content=secret_content))
@@ -788,6 +788,105 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
         self.assertIn("却下", mod.STEP_CHOICE_CRITERIA["keep_decision"])
         self.assertIn("却下", mod.STEP_CHOICE_CRITERIA["drop_noise"])
         self.assertNotIn("解決済みの途中探索", mod.STEP_CHOICE_CRITERIA["drop_noise"])
+
+    def test_SH_21_mask_secrets_redacts_url_credentials(self) -> None:
+        """SH-21: 接続 URL の userinfo（user:pass@）をマスクし、通常の URL は変更しない。"""
+        masked = mod.mask_secrets("dsn=postgres://admin:S3cretPass@db.local:5432/app")
+        self.assertNotIn("S3cretPass", masked)
+        self.assertIn("postgres://[REDACTED]@db.local:5432/app", masked)
+        plain_url = "url=https://example.com/path"
+        self.assertEqual(mod.mask_secrets(plain_url), plain_url)
+
+    def test_SH_22_missing_full_line_emits_warning_with_line_idx(self) -> None:
+        """SH-22: transcript_full.jsonl に対象行がない・壊れている場合は警告へ line_idx を残す。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "transcript.jsonl"
+            full_p = Path(tmp) / "transcript_full.jsonl"
+            truncated_row = _make_row(
+                0,
+                step_type="GENERIC",
+                status="ERROR",
+                content="Command exited with code 1\nshort preview",
+            )
+            truncated_row["truncated_fields"] = ["content"]
+            p.write_text(json.dumps(truncated_row, ensure_ascii=False) + "\n", encoding="utf-8")
+            full_p.write_text("not a valid json line {\n", encoding="utf-8")
+
+            def fake_api(payload: dict, **_kwargs) -> dict:
+                return {
+                    "answers": {
+                        qkey: {"type": "choice", "choice": "keep_gotcha", "confidence": 0.91}
+                        for qkey in payload["questions"]
+                    }
+                }
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = mod.main(
+                    ["--transcript", str(p), "--keep-recent", "0", "--format", "json"],
+                    api_caller=fake_api,
+                )
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+            self.assertNotIn("full_excerpt", data["kept"][0])
+            self.assertTrue(
+                any(
+                    "対象行を取得できなかった" in w and "line_idx=[0]" in w
+                    for w in data["meta"]["warnings"]
+                )
+            )
+
+    def test_SH_23_render_markdown_limits_compact_sections_to_400_chars(self) -> None:
+        """SH-23: Decisions・Gotchas・Recent は 1,200 文字、Active State と Borderline は 400 文字で切り詰める。"""
+        body_decision = "DECISION_HEAD_" + ("あ" * 980) + "_DECISION_TAIL"
+        body_state = "STATE_HEAD_" + ("い" * 980) + "_STATE_TAIL"
+        body_borderline = "BORDER_HEAD_" + ("う" * 980) + "_BORDER_TAIL"
+        body_recent = "RECENT_HEAD_" + ("え" * 980) + "_RECENT_TAIL"
+
+        def make_step(idx: int, text: str) -> mod.TranscriptStep:
+            return mod.TranscriptStep(
+                step_index=idx,
+                source="MODEL",
+                step_type="PLANNER_RESPONSE",
+                status="DONE",
+                created_at="2026-11-28T00:00:00Z",
+                is_error_signal=False,
+                normalized_text=text,
+                line_idx=idx,
+            )
+
+        classified = [
+            mod.ClassifiedStep(step=make_step(0, body_decision), choice="keep_decision", confidence=0.95),
+            mod.ClassifiedStep(step=make_step(1, body_state), choice="keep_state", confidence=0.90),
+            mod.ClassifiedStep(
+                step=make_step(2, body_borderline),
+                choice="drop_noise",
+                confidence=0.40,
+                is_borderline=True,
+            ),
+        ]
+        recent = [make_step(3, body_recent)]
+        md = mod.render_markdown(
+            transcript_path=Path("transcript.jsonl"),
+            conv_id="conv-test",
+            classified=classified,
+            recent_steps=recent,
+            warnings=[],
+            drop_borderline=False,
+            api_calls=1,
+            truncated_old_steps=0,
+        )
+        decision_sec = md.split("## Decisions（確定仕様・方針候補）")[1].split("## Gotchas")[0]
+        state_sec = md.split("## Active State（現在地・未完了候補）")[1].split("## Borderline")[0]
+        border_sec = md.split("## Borderline（低信頼度の除外候補）")[1].split("## Recent Steps")[0]
+        recent_sec = md.split("## Recent Steps（直近保護ステップ）")[1]
+
+        self.assertIn("_DECISION_TAIL", decision_sec)
+        self.assertNotIn("...[省略]...", decision_sec)
+        self.assertIn("...[省略]...", state_sec)
+        self.assertIn("...[省略]...", border_sec)
+        self.assertIn("_RECENT_TAIL", recent_sec)
+        self.assertNotIn("...[省略]...", recent_sec)
 
 
 if __name__ == "__main__":

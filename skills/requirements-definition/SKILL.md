@@ -86,7 +86,7 @@ description: 要件定義書や仕様書の曖昧さ洗い出し、要協議事�
   - `Verbatim Raw Evidence`：判断の根拠となったエラー出力、計測値、ユーザー発言を要約せずフェンスコードブロックで 10 行以内引用し、シークレットはマスクする。
   - `Revert Condition（再検討条件）`：この判断を見直す具体的な観測条件を書く。
   - `Source`：`[session](conversation://<id>)` と `(conv_id, line_idx, step_index)` の組を書く（`line_idx` は `transcript.jsonl` の 0 始まり行番号）。
-- `Verbatim Raw Evidence` の引用に行頭の `- [ ]` や `- [x]` が含まれる場合は、各行の先頭に `L<行番号>: ` の接頭辞を付けてチェックボックス記法として解釈されないようにする。
+- `Verbatim Raw Evidence` の引用の行頭にチェックボックス記法（`-` または `*` に続く `[ ]`、`[x]`、`[X]`）が含まれる場合は、各行の先頭に `L<行番号>: ` の接頭辞を付けてチェックボックス記法として解釈されないようにする。
   - `docs/*.md` のチェックボックスを走査する検査（`shared-skills` の `check_plugin.py` の `check_docs` など）はフェンスコードブロックを除外しないため、決定記録が計画書と誤認されて `状態:` 行を要求される。
 
 ### `/learn` で残す内容の振り分け

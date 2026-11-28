@@ -35,6 +35,7 @@ DEFAULT_GENERIC_NORMAL_CHARS = 360
 DEFAULT_GENERIC_ERROR_CHARS = 800
 DEFAULT_THINKING_CHARS = 300
 DEFAULT_RENDER_EXCERPT_CHARS = 1_200
+DEFAULT_RENDER_COMPACT_CHARS = 400
 DEFAULT_FULL_ERROR_CHARS = 2_000
 DEFAULT_TIMEOUT = 30.0
 MAX_QUESTIONS_PER_REQUEST = 1_000
@@ -72,8 +73,10 @@ ERROR_SIGNAL_RE = re.compile(
 
 PRIVATE_KEY_BLOCK_RE = decision_hygiene.PRIVATE_KEY_BLOCK_RE
 PRIVATE_KEY_HEADER_RE = decision_hygiene.PRIVATE_KEY_HEADER_RE
+URL_CREDENTIAL_RE = re.compile(r"(?<=://)[^\s/@:]+:[^\s/@]+(?=@)")
 SECRET_REPLACE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    decision_hygiene.SECRET_REDACT_PATTERNS + (decision_hygiene.BEARER_TOKEN_RE,)
+    decision_hygiene.SECRET_REDACT_PATTERNS
+    + (decision_hygiene.BEARER_TOKEN_RE, URL_CREDENTIAL_RE)
 )
 
 PRIORITY_ARG_KEYS: tuple[str, ...] = (
@@ -135,7 +138,7 @@ def mask_secrets(text: str, secret: str | None = None) -> str:
     return decision_hygiene.mask_secrets(
         text,
         secrets=(secret,) if secret else (),
-        extra_patterns=(decision_hygiene.BEARER_TOKEN_RE,),
+        extra_patterns=(decision_hygiene.BEARER_TOKEN_RE, URL_CREDENTIAL_RE),
     )
 
 
@@ -591,9 +594,11 @@ def attach_full_excerpts(
         )
         return
 
+    missing: list[int] = []
     for step in targets:
         raw_text = full_contents.get(step.line_idx, "")
         if not raw_text.strip():
+            missing.append(step.line_idx)
             continue
         masked = mask_secrets(raw_text)
         cleaned = TIMESTAMP_HEADER_RE.sub("", masked).strip()
@@ -601,6 +606,12 @@ def attach_full_excerpts(
             step.full_excerpt = truncate_head_tail(
                 cleaned, DEFAULT_FULL_ERROR_CHARS, head_ratio=0.35
             )
+        else:
+            missing.append(step.line_idx)
+    if missing:
+        warnings.append(
+            f"transcript_full.jsonl で対象行を取得できなかったため短縮版のみ出力しました: line_idx={sorted(missing)}"
+        )
 
 
 def render_markdown(
@@ -645,7 +656,9 @@ def render_markdown(
             return f"[STEP {step.step_index:04d} | line_idx={step.line_idx}]"
         return f"[STEP {step.step_index:04d}]"
 
-    def append_classified_section(title: str, items: list[ClassifiedStep]) -> None:
+    def append_classified_section(
+        title: str, items: list[ClassifiedStep], excerpt_chars: int
+    ) -> None:
         lines.extend(["", f"## {title}"])
         if not items:
             lines.append("- 該当なし")
@@ -653,7 +666,7 @@ def render_markdown(
         for item in items:
             s = item.step
             excerpt = truncate_head_tail(
-                s.normalized_text, DEFAULT_RENDER_EXCERPT_CHARS, head_ratio=0.7
+                s.normalized_text, excerpt_chars, head_ratio=0.7
             ).replace("\n", "\n  ")
             entry = (
                 f"- **{format_step_tag(s)}** (`{s.step_type}`, confidence={item.confidence:.2f})\n"
@@ -664,11 +677,19 @@ def render_markdown(
                 entry += f"\n  [transcript_full L{s.line_idx}] {full_indented}"
             lines.append(entry)
 
-    append_classified_section("Decisions（確定仕様・方針候補）", decisions)
-    append_classified_section("Gotchas（失敗・制約候補）", gotchas)
-    append_classified_section("Active State（現在地・未完了候補）", states)
+    append_classified_section(
+        "Decisions（確定仕様・方針候補）", decisions, DEFAULT_RENDER_EXCERPT_CHARS
+    )
+    append_classified_section(
+        "Gotchas（失敗・制約候補）", gotchas, DEFAULT_RENDER_EXCERPT_CHARS
+    )
+    append_classified_section(
+        "Active State（現在地・未完了候補）", states, DEFAULT_RENDER_COMPACT_CHARS
+    )
     if not drop_borderline and borderlines:
-        append_classified_section("Borderline（低信頼度の除外候補）", borderlines)
+        append_classified_section(
+            "Borderline（低信頼度の除外候補）", borderlines, DEFAULT_RENDER_COMPACT_CHARS
+        )
 
     lines.extend(["", "## Recent Steps（直近保護ステップ）"])
     if not recent_steps:
