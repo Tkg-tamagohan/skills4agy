@@ -73,7 +73,7 @@ ERROR_SIGNAL_RE = re.compile(
 
 PRIVATE_KEY_BLOCK_RE = decision_hygiene.PRIVATE_KEY_BLOCK_RE
 PRIVATE_KEY_HEADER_RE = decision_hygiene.PRIVATE_KEY_HEADER_RE
-URL_CREDENTIAL_RE = re.compile(r"(?<=://)[^\s/@:]+:[^\s/@]+(?=@)")
+URL_CREDENTIAL_RE = re.compile(r"(?<=://)[^\s/?#@:]+:[^\s/?#@]+(?=@)")
 SECRET_REPLACE_PATTERNS: tuple[re.Pattern[str], ...] = (
     decision_hygiene.SECRET_REDACT_PATTERNS
     + (decision_hygiene.BEARER_TOKEN_RE, URL_CREDENTIAL_RE)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""triage_transcript_decision1.py のユニットテスト（SH-01–SH-23）。"""
+"""triage_transcript_decision1.py のユニットテスト（SH-01–SH-24）。"""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def _make_row(
 
 
 class TestTriageTranscriptDecision1(unittest.TestCase):
-    """SH-01–SH-23 の仕様検証テスト。"""
+    """SH-01–SH-24 の仕様検証テスト。"""
 
     def test_SH_01_load_jsonl_skips_blank_and_broken_lines(self) -> None:
         """SH-01: 空行、不正 JSON 行、非オブジェクト行を警告付きでスキップし有効行のみ読み込む。"""
@@ -794,8 +794,12 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
         masked = mod.mask_secrets("dsn=postgres://admin:S3cretPass@db.local:5432/app")
         self.assertNotIn("S3cretPass", masked)
         self.assertIn("postgres://[REDACTED]@db.local:5432/app", masked)
-        plain_url = "url=https://example.com/path"
-        self.assertEqual(mod.mask_secrets(plain_url), plain_url)
+        for plain_url in (
+            "url=https://example.com/path",
+            "https://example.com:8443?email=alice@example.org",
+            "https://example.com:8443/#frag@x",
+        ):
+            self.assertEqual(mod.mask_secrets(plain_url), plain_url)
 
     def test_SH_22_missing_full_line_emits_warning_with_line_idx(self) -> None:
         """SH-22: transcript_full.jsonl に対象行がない・壊れている場合は警告へ line_idx を残す。"""
@@ -887,6 +891,98 @@ class TestTriageTranscriptDecision1(unittest.TestCase):
         self.assertIn("...[省略]...", border_sec)
         self.assertIn("_RECENT_TAIL", recent_sec)
         self.assertNotIn("...[省略]...", recent_sec)
+
+    def test_SH_24_render_markdown_exact_length_boundaries(self) -> None:
+        """SH-24: 各区分の抜粋文字数上限（400 / 1,200）ちょうどと +1 文字の境界を検証する。"""
+        def make_step(text: str) -> mod.TranscriptStep:
+            return mod.TranscriptStep(
+                step_index=0,
+                source="MODEL",
+                step_type="PLANNER_RESPONSE",
+                status="DONE",
+                created_at="2026-11-28T00:00:00Z",
+                is_error_signal=False,
+                normalized_text=text,
+                line_idx=0,
+            )
+
+        classified_cases = (
+            ("keep_decision", False, mod.DEFAULT_RENDER_EXCERPT_CHARS),
+            ("keep_gotcha", False, mod.DEFAULT_RENDER_EXCERPT_CHARS),
+            ("keep_state", False, mod.DEFAULT_RENDER_COMPACT_CHARS),
+            ("drop_noise", True, mod.DEFAULT_RENDER_COMPACT_CHARS),
+        )
+        for choice, is_borderline, limit in classified_cases:
+            with self.subTest(kind=choice, is_borderline=is_borderline, limit=limit):
+                exact_body = "x" * limit
+                over_body = "x" * (limit + 1)
+                md_exact = mod.render_markdown(
+                    transcript_path=Path("transcript.jsonl"),
+                    conv_id="conv-test",
+                    classified=[
+                        mod.ClassifiedStep(
+                            step=make_step(exact_body),
+                            choice=choice,
+                            confidence=0.40 if is_borderline else 0.90,
+                            is_borderline=is_borderline,
+                        )
+                    ],
+                    recent_steps=[],
+                    warnings=[],
+                    drop_borderline=False,
+                    api_calls=1,
+                    truncated_old_steps=0,
+                )
+                self.assertIn(exact_body, md_exact)
+                self.assertNotIn("...[省略]...", md_exact)
+
+                md_over = mod.render_markdown(
+                    transcript_path=Path("transcript.jsonl"),
+                    conv_id="conv-test",
+                    classified=[
+                        mod.ClassifiedStep(
+                            step=make_step(over_body),
+                            choice=choice,
+                            confidence=0.40 if is_borderline else 0.90,
+                            is_borderline=is_borderline,
+                        )
+                    ],
+                    recent_steps=[],
+                    warnings=[],
+                    drop_borderline=False,
+                    api_calls=1,
+                    truncated_old_steps=0,
+                )
+                self.assertIn("...[省略]...", md_over)
+
+        with self.subTest(kind="recent_steps", limit=mod.DEFAULT_RENDER_EXCERPT_CHARS):
+            limit = mod.DEFAULT_RENDER_EXCERPT_CHARS
+            exact_body = "x" * limit
+            over_body = "x" * (limit + 1)
+            md_exact = mod.render_markdown(
+                transcript_path=Path("transcript.jsonl"),
+                conv_id="conv-test",
+                classified=[],
+                recent_steps=[make_step(exact_body)],
+                warnings=[],
+                drop_borderline=False,
+                api_calls=1,
+                truncated_old_steps=0,
+            )
+            self.assertIn(exact_body, md_exact)
+            self.assertNotIn("...[省略]...", md_exact)
+
+            md_over = mod.render_markdown(
+                transcript_path=Path("transcript.jsonl"),
+                conv_id="conv-test",
+                classified=[],
+                recent_steps=[make_step(over_body)],
+                warnings=[],
+                drop_borderline=False,
+                api_calls=1,
+                truncated_old_steps=0,
+            )
+            self.assertIn("...[省略]...", md_over)
 
 
 if __name__ == "__main__":
