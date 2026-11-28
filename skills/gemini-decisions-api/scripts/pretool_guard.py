@@ -83,8 +83,28 @@ TRUSTED_PLUGIN_SCRIPTS = frozenset(
         "skills/pr-review-triage/scripts/pr_ops.py",
         "skills/japanese-tech-writing/scripts/slop_lint.py",
         "skills/japanese-tech-writing/scripts/slop_diff.py",
+        "skills/repo-drift-audit/scripts/screen_drift_decision1.py",
+        "skills/repo-drift-audit/scripts/preflight_drift.py",
+        "skills/test-suite-pruning/scripts/screen_tests_decision1.py",
+        "skills/codebase-contract-extract/scripts/discover_contract_scope.py",
+        "skills/session-handoff/scripts/triage_transcript_decision1.py",
+        "skills/session-log-search/scripts/search_session_logs.py",
+        "skills/session-context-audit/scripts/audit_context_metrics.py",
     }
 )
+TRUSTED_SCRIPT_DIR_OPTS: dict[str, frozenset[str]] = {
+    "skills/plugin-authoring/scripts/audit_skills_weekly.py": frozenset(
+        {"--repo", "--prod-root", "--app-data-dir"}
+    ),
+    "skills/repo-drift-audit/scripts/screen_drift_decision1.py": frozenset({"--repo"}),
+    "skills/repo-drift-audit/scripts/preflight_drift.py": frozenset({"--repo"}),
+    "skills/codebase-contract-extract/scripts/discover_contract_scope.py": frozenset({"--root"}),
+    "skills/session-handoff/scripts/triage_transcript_decision1.py": frozenset({"--app-data-dir"}),
+    "skills/session-log-search/scripts/search_session_logs.py": frozenset(
+        {"--app-data-dir", "--repo"}
+    ),
+    "skills/session-context-audit/scripts/audit_context_metrics.py": frozenset({"--app-data-dir"}),
+}
 TRUSTED_PLUGIN_TEST_SCRIPT_RE = re.compile(
     r"^skills/[a-z0-9-]+/scripts/test_[a-z0-9_]+\.py$"
 )
@@ -2724,6 +2744,75 @@ def _classify_whitelisted_gh(
     return False, False
 
 
+def _is_safe_trusted_dir_opt_value(dir_val: str, *, base_cwd: Path) -> Path | None:
+    """信頼済みスクリプトのディレクトリ系引数値を検証し、安全なら解決候補 Path を返す。"""
+    if not dir_val or not dir_val.strip():
+        return None
+    expanded_dir = _expand_safe_path_vars(dir_val)
+    if expanded_dir is None or not _is_safe_filesystem_cd_target(expanded_dir):
+        return None
+    norm_dir = expanded_dir.replace("\\", "/")
+    if ".." in [seg for seg in norm_dir.split("/") if seg]:
+        return None
+    try:
+        dir_path = Path(expanded_dir)
+        is_abs = dir_path.is_absolute()
+        dir_cand = dir_path if is_abs else (base_cwd / expanded_dir)
+        if os.path.lexists(dir_cand) and (
+            _is_reparse_or_symlink(dir_cand) or not dir_cand.is_dir()
+        ):
+            return None
+        if not is_abs and _has_reparse_in_tree(base_cwd, dir_cand):
+            return None
+    except OSError:
+        return None
+    return dir_cand
+
+
+def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
+    """screen_drift_decision1.py の --paths 引数（相対パスまたはグロブ）が境界内か検証する。"""
+    if not path_val or not path_val.strip() or any(ord(ch) < 32 for ch in path_val):
+        return False
+    raw = path_val.strip()
+    if raw == "-" or raw.startswith(("~", "/", "\\")) or "$" in raw or ":" in raw:
+        return False
+    try:
+        if Path(raw).is_absolute() or WINDOWS_DRIVE_PREFIX_RE.match(raw):
+            return False
+    except OSError:
+        return False
+
+    norm = raw.replace("\\", "/")
+    segments = [seg for seg in norm.split("/") if seg]
+    if not segments or ".." in segments:
+        return False
+    if _is_secret_file_path(raw):
+        return False
+    if any(seg.lower() in SENSITIVE_CD_DIR_NAMES for seg in segments):
+        return False
+    base_low = segments[-1].lower()
+    if (base_low.startswith(".env") and dh.is_blocked_env_path(base_low.rstrip("*?[]"))) or base_low.endswith(".env"):
+        return False
+
+    if any(ch in raw for ch in "*?[]"):
+        prefix_parts: list[str] = []
+        for seg in segments:
+            if any(ch in seg for ch in "*?[]"):
+                break
+            prefix_parts.append(seg)
+        if prefix_parts:
+            try:
+                anchor = Path(base_cwd) if base_cwd else Path.cwd()
+                prefix_cand = anchor.joinpath(*prefix_parts)
+                if os.path.lexists(prefix_cand) and _has_reparse_in_tree(anchor, prefix_cand):
+                    return False
+            except OSError:
+                return False
+        return True
+
+    return _is_safe_non_secret_existing_file(raw, cwd=base_cwd)
+
+
 def _is_trusted_plugin_script(
     script_tok: str,
     script_args: list[str],
@@ -2842,7 +2931,16 @@ def _is_trusted_plugin_script(
         "--message-file",
         "--pr-json",
         "--rules",
+        "--facts-file",
+        "--backlog",
+        "--transcript",
+        "--plans-json",
     }
+    dir_opts = TRUSTED_SCRIPT_DIR_OPTS.get(rel_posix, frozenset())
+    is_drift_screen = rel_posix == "skills/repo-drift-audit/scripts/screen_drift_decision1.py"
+    drift_repo_dir: str | None = None
+    drift_paths: list[str] = []
+    base_dir_for_opts = Path(effective_script_cwd) if effective_script_cwd else Path.cwd()
 
     i = 0
     n = len(script_args)
@@ -2860,55 +2958,60 @@ def _is_trusted_plugin_script(
                 j += 1
             i = j
             continue
-        elif arg in output_opts or arg in input_opts:
+        elif arg == "--paths" and is_drift_screen:
+            j = i + 1
+            while j < n and not script_args[j].startswith("-"):
+                drift_paths.append(script_args[j])
+                j += 1
+            if j == i + 1:
+                return False
+            i = j
+            continue
+        elif (
+            arg in output_opts
+            or arg in input_opts
+            or arg in dir_opts
+            or arg in {"--base", "--endpoint"}
+        ):
             opt_name = arg
             if i + 1 >= n:
                 return False
             opt_val = script_args[i + 1]
             i += 1
-        if opt_name in output_opts:
+
+        if opt_name == "--paths" and is_drift_screen:
+            drift_paths.append(opt_val or "")
+        elif opt_name in output_opts:
             if not _is_safe_temp_output_path(opt_val or "", cwd=effective_script_cwd):
                 return False
         elif opt_name in input_opts:
-            if opt_val and opt_val != "-" and not _is_safe_non_secret_existing_file(opt_val, cwd=effective_script_cwd):
+            if opt_val is None or not opt_val.strip():
                 return False
-        elif arg == "--base" or arg.startswith("--base="):
-            if arg == "--base":
-                if i + 1 >= n:
-                    return False
-                base_val = script_args[i + 1]
-                i += 1
-            else:
-                base_val = arg.split("=", 1)[1]
-            if not base_val or base_val.startswith("-"):
-                return False
-        elif rel_posix == "skills/plugin-authoring/scripts/audit_skills_weekly.py" and (
-            arg in {"--repo", "--prod-root", "--app-data-dir"}
-            or arg.startswith(("--repo=", "--prod-root=", "--app-data-dir="))
-        ):
-            if "=" in arg:
-                dir_val = arg.split("=", 1)[1]
-            else:
-                if i + 1 >= n:
-                    return False
-                dir_val = script_args[i + 1]
-                i += 1
-            expanded_dir = _expand_safe_path_vars(dir_val)
-            if expanded_dir is None or not _is_safe_filesystem_cd_target(expanded_dir):
-                return False
-            norm_dir = expanded_dir.replace("\\", "/")
-            if ".." in [seg for seg in norm_dir.split("/") if seg]:
-                return False
-            dir_cand = (
-                Path(expanded_dir)
-                if Path(expanded_dir).is_absolute()
-                else (Path(effective_script_cwd or ".") / expanded_dir)
-            )
-            if os.path.lexists(dir_cand) and (
-                _is_reparse_or_symlink(dir_cand) or not dir_cand.is_dir()
+            if opt_val != "-" and not _is_safe_non_secret_existing_file(
+                opt_val, cwd=effective_script_cwd
             ):
                 return False
+        elif opt_name == "--base":
+            if not opt_val or opt_val.startswith("-"):
+                return False
+        elif opt_name == "--endpoint":
+            if opt_val != rd.DEFAULT_ENDPOINT:
+                return False
+        elif opt_name in dir_opts:
+            dir_cand = _is_safe_trusted_dir_opt_value(
+                opt_val or "", base_cwd=base_dir_for_opts
+            )
+            if dir_cand is None:
+                return False
+            if is_drift_screen and opt_name == "--repo":
+                drift_repo_dir = str(dir_cand)
         i += 1
+
+    if drift_paths:
+        paths_cwd = drift_repo_dir if drift_repo_dir is not None else effective_script_cwd
+        for p in drift_paths:
+            if not _is_safe_drift_paths_arg(p, base_cwd=paths_cwd):
+                return False
 
     return True
 

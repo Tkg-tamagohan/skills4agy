@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""decision_common.py の単体テスト（テスト ID: DC-01–DC-05）。
+"""decision_common.py の単体テスト（テスト ID: DC-01–DC-07）。
 
-数値判定・抽出、usage 集計、Markdown 表セル整形、エラー出力マスク、および POSIX glob 一致を検証する。
+数値判定・抽出、usage 集計、Markdown 表セル整形、エラー出力マスク、POSIX glob 一致、およびパイプ切断時の安全な標準出力書き込みを検証する。
 """
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import io
 import json
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
@@ -100,6 +103,72 @@ class TestDecisionCommon(unittest.TestCase):
         self.assertTrue(dc.glob_match("src/ab.py", "src/a?.py"))
         self.assertFalse(dc.glob_match("src/abc.py", "src/a?.py"))
         self.assertFalse(dc.glob_match("src/a/b.py", "src/*.py"))
+
+    def test_dc06_is_broken_pipe_error(self) -> None:
+        """DC-06: is_broken_pipe_error が BrokenPipeError、EPIPE、Windows EINVAL を判定し EACCES を除外する。"""
+        self.assertTrue(dc.is_broken_pipe_error(BrokenPipeError("broken pipe")))
+        self.assertTrue(dc.is_broken_pipe_error(OSError(errno.EPIPE, "epipe")))
+        self.assertFalse(dc.is_broken_pipe_error(OSError(errno.EACCES, "eacces")))
+        self.assertFalse(dc.is_broken_pipe_error(ValueError("not os error")))
+
+        win_einval = OSError(errno.EINVAL, "invalid argument")
+        with mock.patch.object(dc.os, "name", "nt"):
+            self.assertTrue(dc.is_broken_pipe_error(win_einval))
+            self.assertFalse(dc.is_broken_pipe_error(PermissionError(errno.EINVAL, "subclass")))
+            self.assertFalse(dc.is_broken_pipe_error(OSError(errno.EACCES, "eacces")))
+
+        with mock.patch.object(dc.os, "name", "posix"):
+            self.assertFalse(dc.is_broken_pipe_error(win_einval))
+            self.assertTrue(dc.is_broken_pipe_error(OSError(errno.EPIPE, "epipe")))
+
+    def test_dc07_safe_write_stdout_normal_and_errors(self) -> None:
+        """DC-07: safe_write_stdout が通常書き込み・改行補完・flush とパイプ切断抑止・EACCES 再送出を正しく行う。"""
+        class _RecordingStream:
+            def __init__(self, *, write_exc: BaseException | None = None, flush_exc: BaseException | None = None):
+                self.chunks: list[str] = []
+                self.flushed = 0
+                self._write_exc = write_exc
+                self._flush_exc = flush_exc
+
+            def write(self, data: str) -> int:
+                if self._write_exc is not None:
+                    raise self._write_exc
+                self.chunks.append(data)
+                return len(data)
+
+            def flush(self) -> None:
+                if self._flush_exc is not None:
+                    raise self._flush_exc
+                self.flushed += 1
+
+        ok_stream = _RecordingStream()
+        self.assertTrue(dc.safe_write_stdout("hello", stream=ok_stream))
+        self.assertEqual(ok_stream.chunks, ["hello\n"])
+        self.assertEqual(ok_stream.flushed, 1)
+
+        self.assertTrue(dc.safe_write_stdout("already\n", stream=ok_stream))
+        self.assertTrue(dc.safe_write_stdout("no_nl", stream=ok_stream, ensure_newline=False))
+        self.assertEqual(ok_stream.chunks, ["hello\n", "already\n", "no_nl"])
+        self.assertEqual(ok_stream.flushed, 3)
+
+        stdout_buf = _RecordingStream()
+        with contextlib.redirect_stdout(stdout_buf):  # type: ignore[arg-type]
+            self.assertTrue(dc.safe_write_stdout("via_stdout"))
+        self.assertEqual(stdout_buf.chunks, ["via_stdout\n"])
+        self.assertEqual(stdout_buf.flushed, 1)
+
+        self.assertFalse(dc.safe_write_stdout("x", stream=_RecordingStream(write_exc=BrokenPipeError())))
+        self.assertFalse(
+            dc.safe_write_stdout("x", stream=_RecordingStream(flush_exc=OSError(errno.EPIPE, "epipe")))
+        )
+        with mock.patch.object(dc.os, "name", "nt"):
+            self.assertFalse(
+                dc.safe_write_stdout("x", stream=_RecordingStream(flush_exc=OSError(errno.EINVAL, "einval")))
+            )
+
+        with self.assertRaises(OSError) as ctx:
+            dc.safe_write_stdout("x", stream=_RecordingStream(write_exc=OSError(errno.EACCES, "denied")))
+        self.assertEqual(ctx.exception.errno, errno.EACCES)
 
 
 if __name__ == "__main__":

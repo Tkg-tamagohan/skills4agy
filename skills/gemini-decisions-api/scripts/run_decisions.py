@@ -31,6 +31,8 @@ import decision_hygiene  # noqa: E402
 
 DEFAULT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/decisions"
 DEFAULT_MODEL = "gemini-decision-1"
+DEFAULT_TIMEOUT = 30.0
+VALID_BACKENDS = frozenset({"auto", "sdk", "rest"})
 
 QUESTION_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 VALID_RESOLUTIONS = frozenset({"low", "medium", "high", "ultra_high"})
@@ -622,6 +624,170 @@ def call_decisions_api(
         raise ApiRequestError(exc.code, f"HTTP {exc.code}: {err_text}", body=err_text) from exc
     except urllib.error.URLError as exc:
         raise ApiRequestError(None, f"通信エラー: {exc.reason}") from exc
+
+
+def _normalize_sdk_response(resp: Any) -> dict[str, Any]:
+    """google-genai SDK の応答オブジェクトを辞書形式へ正規化する。"""
+    if isinstance(resp, dict):
+        return resp
+    model_dump = getattr(resp, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(mode="json")
+            if isinstance(dumped, dict):
+                return dumped
+        except TypeError:
+            dumped = model_dump()
+            if isinstance(dumped, dict):
+                return dumped
+    to_json_dict = getattr(resp, "to_json_dict", None)
+    if callable(to_json_dict):
+        dumped = to_json_dict()
+        if isinstance(dumped, dict):
+            return dumped
+    result: dict[str, Any] = {}
+    for attr in ("answers", "prompt_feedback", "usage"):
+        val = getattr(resp, attr, None)
+        if val is not None:
+            result[attr] = val
+    return result
+
+
+def _extract_sdk_safety_block(exc: Exception, api_key: str) -> SafetyBlockError | None:
+    """SDK 例外が安全フィルタ遮断を表す場合、マスク済み SafetyBlockError を返す。"""
+    if isinstance(exc, SafetyBlockError):
+        return SafetyBlockError(
+            exc.source,
+            exc.code,
+            decision_hygiene.mask_secret(exc.message, api_key),
+            raw=exc.raw,
+        )
+    status_code = getattr(exc, "code", None)
+    if not (isinstance(status_code, int) and not isinstance(status_code, bool)):
+        status_code = getattr(exc, "status_code", None)
+    if status_code != 400:
+        return None
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        details = getattr(exc, "response_json", None)
+    if isinstance(details, dict) and isinstance(details.get("error"), dict):
+        err_obj = details["error"]
+        err_code = str(err_obj.get("code", "")).lower()
+        if err_code in SAFETY_ERROR_CODES:
+            err_msg = str(err_obj.get("message", str(exc)))
+            return SafetyBlockError(
+                "http_400",
+                err_code,
+                decision_hygiene.mask_secret(err_msg, api_key),
+                raw=details,
+            )
+    err_status = str(getattr(exc, "status", "")).lower()
+    if err_status in SAFETY_ERROR_CODES:
+        return SafetyBlockError(
+            "http_400",
+            err_status,
+            decision_hygiene.mask_secret(str(exc), api_key),
+            raw=details if isinstance(details, dict) else None,
+        )
+    return None
+
+
+def call_decisions_backend(
+    payload: dict[str, Any],
+    *,
+    api_key: str,
+    backend: str = "auto",
+    endpoint: str = DEFAULT_ENDPOINT,
+    timeout: float = DEFAULT_TIMEOUT,
+    opener: Callable[..., Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    """SDK 優先または REST で Decisions API を呼び出し、(応答辞書, 使用バックエンド名) を返す。"""
+    if backend not in VALID_BACKENDS:
+        raise ValueError(
+            f"不正な backend です: {backend!r}（'auto', 'sdk', 'rest' のいずれかを指定してください）"
+        )
+
+    use_rest = (
+        backend == "rest"
+        or (opener is not None and backend != "sdk")
+        or (backend == "auto" and endpoint != DEFAULT_ENDPOINT)
+    )
+
+    if not use_rest:
+        try:
+            from google import genai  # type: ignore[import-not-found]
+        except ImportError as exc:
+            if backend == "sdk":
+                raise ApiRequestError(
+                    None,
+                    decision_hygiene.mask_secret(
+                        f"google-genai SDK が見つかりません: {exc}", api_key
+                    ),
+                ) from exc
+            use_rest = True
+        else:
+            try:
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options={"api_version": "v1beta"},
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise ApiRequestError(
+                    None,
+                    decision_hygiene.mask_secret(str(exc), api_key),
+                ) from exc
+
+            decisions_api = getattr(client, "decisions", None)
+            create_fn = getattr(decisions_api, "create", None)
+            if decisions_api is None or not callable(create_fn):
+                if backend == "sdk":
+                    raise ApiRequestError(
+                        None,
+                        decision_hygiene.mask_secret(
+                            "導入済みの google-genai に client.decisions.create がありません（3.2.0 以上が必要です）。",
+                            api_key,
+                        ),
+                    )
+                use_rest = True
+            else:
+                try:
+                    raw_resp = create_fn(
+                        model=payload["model"],
+                        input=payload["input"],
+                        questions=payload["questions"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    safety_err = _extract_sdk_safety_block(exc, api_key)
+                    if safety_err is not None:
+                        raise safety_err from exc
+                    raise ApiRequestError(
+                        None,
+                        decision_hygiene.mask_secret(str(exc), api_key),
+                    ) from exc
+                return _normalize_sdk_response(raw_resp), "sdk"
+
+    try:
+        raw_rest = call_decisions_api(
+            payload,
+            api_key=api_key,
+            endpoint=endpoint,
+            timeout=timeout,
+            opener=opener,
+        )
+        return raw_rest, "rest"
+    except SafetyBlockError as exc:
+        raise SafetyBlockError(
+            exc.source,
+            exc.code,
+            decision_hygiene.mask_secret(exc.message, api_key),
+            raw=exc.raw,
+        ) from exc
+    except ApiRequestError as exc:
+        raise ApiRequestError(
+            exc.status,
+            decision_hygiene.mask_secret(exc.message, api_key),
+            body=exc.body,
+        ) from exc
 
 
 def format_table(enriched: dict[str, Any]) -> str:

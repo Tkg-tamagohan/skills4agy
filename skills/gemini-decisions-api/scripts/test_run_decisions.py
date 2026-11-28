@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""run_decisions.py の単体テスト（テスト ID: GD-01–GD-17）。
+"""run_decisions.py の単体テスト（テスト ID: GD-01–GD-24）。
 
 Gemini Decisions API 公式仕様（2026年11月版）を根拠とし、
-通信部分はモックオープナー注入で決定論的に検証する。
+通信部分はモックオープナー注入およびモック SDK 注入で決定論的に検証する。
 """
 
 from __future__ import annotations
@@ -16,7 +16,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.parse
 
@@ -655,6 +657,310 @@ class TestRunDecisions(unittest.TestCase):
         self.assertIn("| q_bool | score | - | - | - |", table)
         self.assertIn("| q_noul_bool | noul | - | - | - |", table)
         self.assertIn("| q_pipe | choice | opt\\|1 line2 | 0.90 | - |", table)
+
+    def _sample_backend_payload(self) -> dict:
+        return {
+            "model": rd.DEFAULT_MODEL,
+            "input": [{"type": "text", "text": "サンプル入力"}],
+            "questions": {"q1": {"type": "noul", "instructions": "有効ですか？"}},
+        }
+
+    def _fake_genai_modules(self, client_factory):
+        fake_google = types.ModuleType("google")
+        fake_genai = types.ModuleType("google.genai")
+        fake_genai.Client = client_factory  # type: ignore[attr-defined]
+        fake_google.genai = fake_genai  # type: ignore[attr-defined]
+        return {"google": fake_google, "google.genai": fake_genai}
+
+    def test_gd18_backend_auto_with_opener_routes_to_rest(self) -> None:
+        """GD-18: backend='auto' で opener 指定時は SDK を呼ばず REST へルーティングする。"""
+        rest_body = {"answers": {"q1": {"type": "noul", "noul": 0.9, "confidence": 0.9}}}
+        called_urls: list[str] = []
+
+        def fake_opener(req, timeout=30.0):
+            called_urls.append(req.full_url)
+            self.assertEqual(timeout, 12.0)
+            return _MockHTTPResponse(rest_body)
+
+        def fail_if_sdk_called(**_kwargs):
+            raise AssertionError("SDK must not be called when opener is provided in auto mode")
+
+        with mock.patch.dict(sys.modules, self._fake_genai_modules(fail_if_sdk_called)):
+            resp, used = rd.call_decisions_backend(
+                self._sample_backend_payload(),
+                api_key="test-" + "key-gd18",
+                backend="auto",
+                timeout=12.0,
+                opener=fake_opener,
+            )
+        self.assertEqual(used, "rest")
+        self.assertEqual(resp, rest_body)
+        self.assertEqual(called_urls, [rd.DEFAULT_ENDPOINT])
+
+    def test_gd19_backend_auto_sdk_success_and_response_normalization(self) -> None:
+        """GD-19: backend='auto' で google-genai SDK 成功時に v1beta 指定で呼び出し各種レスポンスを正規化する。"""
+        captured_calls: list[dict] = []
+
+        class _ModelDumpJsonResp:
+            def model_dump(self, mode=None):
+                if mode != "json":
+                    raise TypeError("unexpected mode")
+                return {"answers": {"q1": {"type": "noul", "noul": 0.88}}}
+
+        class _ModelDumpFallbackResp:
+            def model_dump(self):
+                return {"answers": {"q1": {"type": "noul", "noul": 0.77}}}
+
+        class _ToJsonDictResp:
+            def to_json_dict(self):
+                return {"answers": {"q1": {"type": "noul", "noul": 0.66}}}
+
+        class _AttrResp:
+            answers = {"q1": {"type": "noul", "noul": 0.55}}
+            prompt_feedback = None
+            usage = {"total_input_tokens": 10, "total_output_tokens": 0}
+
+        responses = [
+            {"answers": {"q1": {"type": "noul", "noul": 0.99}}},
+            _ModelDumpJsonResp(),
+            _ModelDumpFallbackResp(),
+            _ToJsonDictResp(),
+            _AttrResp(),
+        ]
+
+        class _FakeDecisions:
+            def create(self, **kwargs):
+                captured_calls.append(kwargs)
+                return responses.pop(0)
+
+        class _FakeClient:
+            def __init__(self, **kwargs):
+                self.init_kwargs = kwargs
+                self.decisions = _FakeDecisions()
+
+        created_clients: list[_FakeClient] = []
+
+        def client_factory(**kwargs):
+            client = _FakeClient(**kwargs)
+            created_clients.append(client)
+            return client
+
+        payload = self._sample_backend_payload()
+        api_key = "test-" + "key-gd19"
+        with mock.patch.dict(sys.modules, self._fake_genai_modules(client_factory)):
+            for idx in range(5):
+                with self.subTest(case=idx):
+                    resp, used = rd.call_decisions_backend(payload, api_key=api_key, backend="auto")
+                    self.assertEqual(used, "sdk")
+                    self.assertIn("answers", resp)
+        self.assertEqual(len(created_clients), 5)
+        self.assertEqual(
+            created_clients[0].init_kwargs,
+            {"api_key": api_key, "http_options": {"api_version": "v1beta"}},
+        )
+        self.assertEqual(captured_calls[0], payload)
+
+    def test_gd20_backend_auto_fallbacks_to_rest(self) -> None:
+        """GD-20: backend='auto' で ImportError、decisions.create 不在、カスタム endpoint 指定時は REST へフォールバックする。"""
+        payload = self._sample_backend_payload()
+        rest_body = {"answers": {"q1": {"type": "noul", "noul": 0.25}}}
+        api_key = "test-" + "key-gd20"
+
+        # 1. ImportError fallback
+        with mock.patch.dict(sys.modules, {"google": None, "google.genai": None}):
+            with mock.patch.object(rd, "call_decisions_api", return_value=rest_body) as mock_rest:
+                resp, used = rd.call_decisions_backend(payload, api_key=api_key, backend="auto")
+        self.assertEqual(used, "rest")
+        self.assertEqual(resp, rest_body)
+        mock_rest.assert_called_once()
+
+        # 2. client.decisions missing / create not callable fallback
+        class _NoDecisionsClient:
+            def __init__(self, **_kwargs):
+                self.decisions = None
+
+        class _NonCallableCreateClient:
+            def __init__(self, **_kwargs):
+                class _Decisions:
+                    create = "not-callable"
+
+                self.decisions = _Decisions()
+
+        for factory in (_NoDecisionsClient, _NonCallableCreateClient):
+            with self.subTest(factory=factory.__name__):
+                with mock.patch.dict(sys.modules, self._fake_genai_modules(factory)):
+                    with mock.patch.object(rd, "call_decisions_api", return_value=rest_body) as mock_rest2:
+                        resp2, used2 = rd.call_decisions_backend(payload, api_key=api_key, backend="auto")
+                self.assertEqual(used2, "rest")
+                self.assertEqual(resp2, rest_body)
+                mock_rest2.assert_called_once()
+
+        # 3. Custom endpoint routes to REST without invoking SDK
+        custom_endpoint = "https://example.invalid/v1beta/decisions"
+
+        def fail_sdk(**_kwargs):
+            raise AssertionError("SDK must not be called for custom endpoint in auto mode")
+
+        with mock.patch.dict(sys.modules, self._fake_genai_modules(fail_sdk)):
+            with mock.patch.object(rd, "call_decisions_api", return_value=rest_body) as mock_rest3:
+                resp3, used3 = rd.call_decisions_backend(
+                    payload, api_key=api_key, backend="auto", endpoint=custom_endpoint
+                )
+        self.assertEqual(used3, "rest")
+        self.assertEqual(resp3, rest_body)
+        mock_rest3.assert_called_once_with(
+            payload,
+            api_key=api_key,
+            endpoint=custom_endpoint,
+            timeout=rd.DEFAULT_TIMEOUT,
+            opener=None,
+        )
+
+    def test_gd21_backend_sdk_unavailable_raises_without_fallback(self) -> None:
+        """GD-21: backend='sdk' で ImportError または decisions.create 不在時は REST へ逃がさず ApiRequestError を送出する。"""
+        payload = self._sample_backend_payload()
+        api_key = "test-" + "key-gd21"
+
+        with mock.patch.dict(sys.modules, {"google": None, "google.genai": None}):
+            with mock.patch.object(rd, "call_decisions_api") as mock_rest:
+                with self.assertRaises(rd.ApiRequestError) as ctx1:
+                    rd.call_decisions_backend(payload, api_key=api_key, backend="sdk")
+        self.assertIsNone(ctx1.exception.status)
+        mock_rest.assert_not_called()
+
+        class _OldClient:
+            def __init__(self, **_kwargs):
+                pass
+
+        with mock.patch.dict(sys.modules, self._fake_genai_modules(_OldClient)):
+            with mock.patch.object(rd, "call_decisions_api") as mock_rest2:
+                with self.assertRaises(rd.ApiRequestError) as ctx2:
+                    rd.call_decisions_backend(payload, api_key=api_key, backend="sdk")
+        self.assertIsNone(ctx2.exception.status)
+        mock_rest2.assert_not_called()
+
+    def test_gd22_sdk_create_exceptions_never_fallback_and_mask_secrets(self) -> None:
+        """GD-22: decisions.create() 内の例外（AttributeError 含む）は auto でも REST へフォールバックせず秘密値をマスクする。"""
+        payload = self._sample_backend_payload()
+        raw_api_key = "AIza" + ("K" * 24) + "+sdk/secret=1"
+        dummy_ghp = "ghp_" + ("S" * 24)
+
+        def make_client_raising(exc_to_raise: Exception):
+            class _ErrDecisions:
+                def create(self, **_kwargs):
+                    raise exc_to_raise
+
+            class _ErrClient:
+                def __init__(self, **_kwargs):
+                    self.decisions = _ErrDecisions()
+
+            return _ErrClient
+
+        for mode in ("auto", "sdk"):
+            for exc_obj in (
+                AttributeError(f"internal attr err key={raw_api_key} tok={dummy_ghp}"),
+                RuntimeError(f"boom key={raw_api_key}"),
+            ):
+                with self.subTest(mode=mode, exc=type(exc_obj).__name__):
+                    with mock.patch.dict(sys.modules, self._fake_genai_modules(make_client_raising(exc_obj))):
+                        with mock.patch.object(rd, "call_decisions_api") as mock_rest:
+                            with self.assertRaises(rd.ApiRequestError) as ctx:
+                                rd.call_decisions_backend(payload, api_key=raw_api_key, backend=mode)
+                    mock_rest.assert_not_called()
+                    self.assertIsNone(ctx.exception.status)
+                    self.assertNotIn(raw_api_key, ctx.exception.message)
+                    self.assertNotIn(dummy_ghp, ctx.exception.message)
+                    self.assertIn("[REDACTED]", ctx.exception.message)
+
+        class _SdkHttp400SafetyError(Exception):
+            def __init__(self) -> None:
+                super().__init__(f"blocked key={raw_api_key}")
+                self.code = 400
+                self.details = {
+                    "error": {
+                        "code": "safety",
+                        "message": f"unsafe key={raw_api_key}",
+                    }
+                }
+
+        with mock.patch.dict(sys.modules, self._fake_genai_modules(make_client_raising(_SdkHttp400SafetyError()))):
+            with mock.patch.object(rd, "call_decisions_api") as mock_rest:
+                with self.assertRaises(rd.SafetyBlockError) as s_ctx:
+                    rd.call_decisions_backend(payload, api_key=raw_api_key, backend="auto")
+        mock_rest.assert_not_called()
+        self.assertEqual(s_ctx.exception.code, "safety")
+        self.assertNotIn(raw_api_key, s_ctx.exception.message)
+        self.assertIn("[REDACTED]", s_ctx.exception.message)
+
+    def test_gd23_backend_rest_and_invalid_backend(self) -> None:
+        """GD-23: backend='rest' は SDK をバイパスし、不正な backend 文字列は ValueError を送出する。"""
+        payload = self._sample_backend_payload()
+        rest_body = {"answers": {"q1": {"type": "noul", "noul": 0.42}}}
+        api_key = "test-" + "key-gd23"
+
+        def fail_sdk(**_kwargs):
+            raise AssertionError("SDK must not be called when backend='rest'")
+
+        with mock.patch.dict(sys.modules, self._fake_genai_modules(fail_sdk)):
+            with mock.patch.object(rd, "call_decisions_api", return_value=rest_body) as mock_rest:
+                resp, used = rd.call_decisions_backend(payload, api_key=api_key, backend="rest")
+        self.assertEqual(used, "rest")
+        self.assertEqual(resp, rest_body)
+        mock_rest.assert_called_once()
+
+        with self.assertRaises(ValueError):
+            rd.call_decisions_backend(payload, api_key=api_key, backend="invalid-backend")
+
+    def test_gd24_backend_rest_error_masks_secrets(self) -> None:
+        """GD-24: REST 経路で SafetyBlockError / ApiRequestError が発生した場合も API キーと秘密値をマスクする。"""
+        payload = self._sample_backend_payload()
+        raw_api_key = "key+with/rest=secret&9876"
+        encoded_api_key = urllib.parse.quote(raw_api_key, safe="")
+        dummy_ghp = "ghp_" + ("R" * 24)
+
+        def raise_http_500(_req, timeout=30.0):
+            raise urllib.error.HTTPError(
+                url=rd.DEFAULT_ENDPOINT,
+                code=500,
+                msg="Internal",
+                hdrs={},
+                fp=io.BytesIO(f"rest fail {raw_api_key} {encoded_api_key} {dummy_ghp}".encode("utf-8")),
+            )
+
+        with self.assertRaises(rd.ApiRequestError) as api_ctx:
+            rd.call_decisions_backend(
+                payload, api_key=raw_api_key, backend="rest", opener=raise_http_500
+            )
+        self.assertEqual(api_ctx.exception.status, 500)
+        self.assertNotIn(raw_api_key, api_ctx.exception.message)
+        self.assertNotIn(encoded_api_key, api_ctx.exception.message)
+        self.assertNotIn(dummy_ghp, api_ctx.exception.message)
+        self.assertIn("[REDACTED]", api_ctx.exception.message)
+
+        def raise_http_400_safety(_req, timeout=30.0):
+            err_json = {
+                "error": {
+                    "code": "safety",
+                    "message": f"blocked {raw_api_key} {encoded_api_key} {dummy_ghp}",
+                }
+            }
+            raise urllib.error.HTTPError(
+                url=rd.DEFAULT_ENDPOINT,
+                code=400,
+                msg="Bad Request",
+                hdrs={},
+                fp=io.BytesIO(json.dumps(err_json).encode("utf-8")),
+            )
+
+        with self.assertRaises(rd.SafetyBlockError) as safety_ctx:
+            rd.call_decisions_backend(
+                payload, api_key=raw_api_key, backend="rest", opener=raise_http_400_safety
+            )
+        self.assertEqual(safety_ctx.exception.code, "safety")
+        self.assertNotIn(raw_api_key, safety_ctx.exception.message)
+        self.assertNotIn(encoded_api_key, safety_ctx.exception.message)
+        self.assertNotIn(dummy_ghp, safety_ctx.exception.message)
+        self.assertIn("[REDACTED]", safety_ctx.exception.message)
 
 
 if __name__ == "__main__":

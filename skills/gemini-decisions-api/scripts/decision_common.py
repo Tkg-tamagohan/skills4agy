@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import errno
 import json
+import os
 import re
 import sys
 from typing import Any
@@ -123,3 +125,33 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
 def glob_match(path_str: str, pattern: str) -> bool:
     """正規化済み POSIX 相対パスに対して ** を含む glob 一致判定を行う。"""
     return bool(glob_to_regex(pattern).match(normalize_posix_rel_path(path_str)))
+
+
+def is_broken_pipe_error(exc: BaseException) -> bool:
+    """パイプ切断（BrokenPipeError / EPIPE / Windows の EINVAL）を示す例外か判定する。"""
+    return (
+        isinstance(exc, BrokenPipeError)
+        or (isinstance(exc, OSError) and exc.errno == errno.EPIPE)
+        or (os.name == "nt" and type(exc) is OSError and exc.errno == errno.EINVAL)
+    )
+
+
+def safe_write_stdout(
+    text: str,
+    *,
+    stream: Any = None,
+    ensure_newline: bool = True,
+) -> bool:
+    """標準出力（または指定ストリーム）へ書き込み、パイプ切断時のみ False を返す。"""
+    target = sys.stdout if stream is None else stream
+    if target is None:
+        return False
+    output = text if (not ensure_newline or text.endswith("\n")) else f"{text}\n"
+    try:
+        target.write(output)
+        target.flush()
+    except OSError as exc:
+        if is_broken_pipe_error(exc):
+            return False
+        raise
+    return True
