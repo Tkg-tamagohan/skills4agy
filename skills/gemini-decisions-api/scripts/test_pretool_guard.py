@@ -2417,6 +2417,129 @@ class TestPretoolGuard(unittest.TestCase):
                     )
                 )
 
+    def test_p2_43_drift_glob_double_star_prefix_pruning(self) -> None:
+        """P2-43: docs/v**/guide.md に対し非一致ディレクトリ docs/latest のリンクは枝刈りして allow し、一致し得る docs/v2 のリンクは拒否する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wt = root / "wt"
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            docs_v1 = wt / "docs" / "v1"
+            docs_v1.mkdir(parents=True)
+            (docs_v1 / "guide.md").write_text("# v1 guide\n", encoding="utf-8")
+
+            outside_dir = root / "outside_dir"
+            outside_dir.mkdir()
+            (outside_dir / "guide.md").write_text("# external\n", encoding="utf-8")
+
+            latest_dir = wt / "docs" / "latest"
+            try:
+                latest_dir.symlink_to(outside_dir, target_is_directory=True)
+            except OSError:
+                latest_dir.mkdir()
+                (latest_dir / "guide.md").write_text("# latest\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(
+                    pg,
+                    "_read_git_origin_url",
+                    return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+                ),
+                mock.patch.object(
+                    pg,
+                    "_is_reparse_or_symlink",
+                    side_effect=lambda p: Path(p).name in {"latest", "v2"},
+                ),
+            ):
+                ok_res = pg.evaluate_stage1(
+                    "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/v**/guide.md --dry-run",
+                    cwd=str(wt),
+                )
+                self.assertIsNotNone(ok_res)
+                self.assertEqual(ok_res[0], "allow")
+
+                v2_dir = wt / "docs" / "v2"
+                v2_dir.mkdir()
+                (v2_dir / "guide.md").write_text("# v2\n", encoding="utf-8")
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        "python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths docs/v**/guide.md --dry-run",
+                        cwd=str(wt),
+                    )
+                )
+
+    def test_p2_44_drift_glob_preserves_directory_whitespace(self) -> None:
+        """P2-44: 先頭/末尾空白を含むディレクトリ名（' docs' / 'docs '）で strip() による枝刈り漏れを起こさず秘密入りファイルを Stage 1 で拒否する。"""
+        self.assertTrue(pg._glob_segment_match("docs ", "docs *"))
+        self.assertTrue(pg._glob_can_descend_into("docs ", "docs */*.md"))
+        self.assertTrue(pg._glob_can_descend_into(" docs", " docs/*.md"))
+        self.assertFalse(pg._glob_can_descend_into("docs ", "docs/*.md"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "skills" / "repo-drift-audit" / "scripts").mkdir(parents=True)
+            (wt / ".git").mkdir()
+            (wt / "skills" / "repo-drift-audit" / "scripts" / "screen_drift_decision1.py").write_text(
+                "# stub\n", encoding="utf-8"
+            )
+            lead_dir = wt / " docs"
+            lead_dir.mkdir()
+            (lead_dir / "secret.md").write_text(
+                "token=" + ("ghp_" + "G" * 36) + "\n", encoding="utf-8"
+            )
+
+            with mock.patch.object(
+                pg,
+                "_read_git_origin_url",
+                return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+            ):
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        'python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths "**/*.md" --dry-run',
+                        cwd=str(wt),
+                    )
+                )
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        'python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths "*/*.md" --dry-run',
+                        cwd=str(wt),
+                    )
+                )
+
+            # POSIX 環境の末尾空白ディレクトリ ('docs ') も仮想 walk で枝刈り漏れしないことを検証
+            secret_dummy = wt / "secret_dummy.md"
+            secret_dummy.write_text("token=" + ("ghp_" + "H" * 36) + "\n", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    pg,
+                    "_read_git_origin_url",
+                    return_value="https://github.com/Tkg-tamagohan/skills4agy.git",
+                ),
+                mock.patch.object(
+                    pg.os,
+                    "walk",
+                    return_value=[
+                        (str(wt), ["docs "], []),
+                        (str(wt / "docs "), [], ["secret.md"]),
+                    ],
+                ),
+                mock.patch.object(
+                    pg,
+                    "_is_safe_resolved_non_secret_file",
+                    return_value=False,
+                ),
+                mock.patch.object(pg, "_is_reparse_or_symlink", return_value=False),
+            ):
+                self.assertIsNone(
+                    pg.evaluate_stage1(
+                        'python skills/repo-drift-audit/scripts/screen_drift_decision1.py docs --paths "docs */*.md" --dry-run',
+                        cwd=str(wt),
+                    )
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

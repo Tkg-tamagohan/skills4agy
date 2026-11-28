@@ -2784,18 +2784,40 @@ def _is_safe_trusted_dir_opt_value(dir_val: str, *, base_cwd: Path) -> Path | No
     return dir_cand
 
 
+def _glob_segment_match(seg: str, pat_seg: str) -> bool:
+    """空白を保持したまま単一パスセグメント用の glob 一致判定を行う。"""
+    parts: list[str] = ["^"]
+    for ch in pat_seg:
+        if ch == "*":
+            parts.append("[^/]*")
+        elif ch == "?":
+            parts.append("[^/]")
+        else:
+            parts.append(re.escape(ch))
+    parts.append("$")
+    return re.compile("".join(parts)).match(seg) is not None
+
+
 def _glob_can_descend_into(rel_dir_posix: str, pattern: str) -> bool:
-    """glob パターンが指定された相対ディレクトリ配下へ到達し得るか判定する。"""
-    dir_parts = [p for p in dc.normalize_posix_rel_path(rel_dir_posix).split("/") if p]
-    pat_parts = [p for p in dc.normalize_posix_rel_path(pattern).split("/") if p]
+    """glob パターンが指定された相対ディレクトリ配下へ到達し得るか判定する（空白を保持）。"""
+    dir_parts = [p for p in rel_dir_posix.replace("\\", "/").split("/") if p]
+    pat_norm = pattern.replace("\\", "/")
+    while pat_norm.startswith("./"):
+        pat_norm = pat_norm[2:]
+    pat_parts = [p for p in pat_norm.split("/") if p]
     if not dir_parts or not pat_parts:
         return True
     for idx, pat_seg in enumerate(pat_parts):
-        if "**" in pat_seg:
+        if pat_seg == "**":
             return True
+        if "**" in pat_seg:
+            if idx >= len(dir_parts):
+                return True
+            prefix_pat = pat_seg.split("**", 1)[0] + "*"
+            return _glob_segment_match(dir_parts[idx], prefix_pat)
         if idx >= len(dir_parts):
             return True
-        if not dc.glob_match(dir_parts[idx], pat_seg):
+        if not _glob_segment_match(dir_parts[idx], pat_seg):
             return False
     return False
 
@@ -2843,6 +2865,7 @@ def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
                 return True
 
             allow_dot_git = ".git" in segments
+            glob_rx = dc.glob_to_regex(raw)
             entries = 0
             walk_error = False
 
@@ -2877,7 +2900,7 @@ def _is_safe_drift_paths_arg(path_val: str, *, base_cwd: str) -> bool:
                         return False
                     full = Path(dirpath) / fname
                     rel_posix = full.relative_to(anchor).as_posix()
-                    if not dc.glob_match(rel_posix, raw):
+                    if not glob_rx.match(rel_posix):
                         continue
                     if _is_reparse_or_symlink(full):
                         return False
