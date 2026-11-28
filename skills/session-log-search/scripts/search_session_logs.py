@@ -1027,37 +1027,51 @@ def _find_best_casefold_span(
     return best_span
 
 
+_UNSET_SPAN = object()
+
+
+def _resolve_excerpt_span(
+    best_win: WindowCandidate, terms_cf: Sequence[str]
+) -> tuple[int, int] | None:
+    """代表窓（窓内に収まらない場合は行全体）から一致範囲 (start, end) を 1 回だけ解決する。"""
+    win_start = best_win.window_idx * WINDOW_STRIDE
+    win_span = _find_best_casefold_span(best_win.window_text, terms_cf)
+    if win_span is not None:
+        return (win_start + win_span[0], win_start + win_span[1])
+    return _find_best_casefold_span(best_win.line_text, terms_cf)
+
+
 def _make_window_excerpt(
-    best_win: WindowCandidate, terms_cf: Sequence[str], radius: int = EXCERPT_RADIUS
+    best_win: WindowCandidate,
+    terms_cf: Sequence[str],
+    radius: int = EXCERPT_RADIUS,
+    *,
+    resolved_span: Any = _UNSET_SPAN,
 ) -> str:
-    """一致窓（または行全体）で検索語の範囲全体の前後 radius 文字を切り出す（マスク済みテキスト前提）。"""
+    """一致窓（またはキャッシュ済みスパン）で検索範囲の前後 radius 文字を切り出す（マスク済みテキスト前提）。"""
     line_text = best_win.line_text
     win_text = best_win.window_text
     win_start = best_win.window_idx * WINDOW_STRIDE
 
-    win_span = _find_best_casefold_span(win_text, terms_cf)
-    if win_span is not None:
-        match_start = win_start + win_span[0]
-        match_end = win_start + win_span[1]
+    span = (
+        _resolve_excerpt_span(best_win, terms_cf)
+        if resolved_span is _UNSET_SPAN
+        else resolved_span
+    )
+    if span is not None:
+        match_start, match_end = span
+        start = max(0, match_start - radius)
+        end = min(len(line_text), match_end + radius)
     else:
-        line_span = _find_best_casefold_span(line_text, terms_cf)
-        if line_span is not None:
-            match_start, match_end = line_span
-        else:
-            center = min(len(line_text), win_start + len(win_text) // 2)
-            # マスク等で一致語が消えた場合でも省略記号のみの空抜粋を防ぐ
-            eff_rad = max(radius, 32)
-            start = max(0, center - eff_rad)
-            end = min(len(line_text), center + eff_rad)
-            excerpt = line_text[start:end]
-            prefix = "..." if start > 0 else ""
-            suffix = "..." if end < len(line_text) else ""
-            return f"{prefix}{excerpt}{suffix}"
+        center = min(len(line_text), win_start + len(win_text) // 2)
+        start = max(0, center - radius)
+        end = min(len(line_text), center + radius)
 
-    start = max(0, match_start - radius)
-    end = min(len(line_text), match_end + radius)
-    if start == end and line_text:
-        end = min(len(line_text), start + 32)
+    if start >= end and line_text:
+        anchor = min(start if span is not None else min(len(line_text), win_start + len(win_text) // 2), len(line_text) - 1)
+        start = max(0, anchor)
+        end = min(len(line_text), start + 1)
+
     excerpt = line_text[start:end]
     prefix = "..." if start > 0 else ""
     suffix = "..." if end < len(line_text) else ""
@@ -1067,8 +1081,6 @@ def _make_window_excerpt(
 def _next_smaller_radius(radius: int, floor_radius: int) -> int:
     if radius <= floor_radius:
         return floor_radius
-    if radius <= 10 and floor_radius == 0:
-        return 0
     nxt = int(radius * 0.8)
     if nxt >= radius:
         nxt = radius - 1
@@ -1081,17 +1093,23 @@ def _shrink_excerpt_to_budget(
     target_tokens: float,
     *,
     floor_radius: int = MIN_EXCERPT_RADIUS,
+    resolved_span: Any = _UNSET_SPAN,
 ) -> tuple[str, int, int]:
     """一致範囲を保ったまま割当トークン予算内に収まるまで外側余白を縮小する。"""
+    span = (
+        _resolve_excerpt_span(win, terms_cf)
+        if resolved_span is _UNSET_SPAN
+        else resolved_span
+    )
     radius = EXCERPT_RADIUS
-    ex = _make_window_excerpt(win, terms_cf, radius)
+    ex = _make_window_excerpt(win, terms_cf, radius, resolved_span=span)
     tok = estimate_tokens(ex)
     while tok > target_tokens and radius > floor_radius:
         next_radius = _next_smaller_radius(radius, floor_radius)
         if next_radius == radius:
             break
         radius = next_radius
-        ex = _make_window_excerpt(win, terms_cf, radius)
+        ex = _make_window_excerpt(win, terms_cf, radius, resolved_span=span)
         tok = estimate_tokens(ex)
     return ex, tok, radius
 
@@ -1175,19 +1193,28 @@ def select_and_restore_turns(
     else:
         fallback = True
         per_cap = budget_tokens / len(primary_entries)
+        resolved_spans = [
+            _resolve_excerpt_span(ex_win, terms_cf) for _, ex_win, _ in primary_entries
+        ]
         # state: [text, is_excerpt, tokens, radius]
         rendered_states: list[list[Any]] = []
-        for (turn, ex_win, _), txt, tok in zip(primary_entries, full_texts, full_tokens):
+        for idx, ((turn, ex_win, _), txt, tok) in enumerate(
+            zip(primary_entries, full_texts, full_tokens)
+        ):
             if tok > per_cap:
-                ex, ex_tok, rad = _shrink_excerpt_to_budget(ex_win, terms_cf, per_cap)
+                ex, ex_tok, rad = _shrink_excerpt_to_budget(
+                    ex_win, terms_cf, per_cap, resolved_span=resolved_spans[idx]
+                )
                 rendered_states.append([ex, True, ex_tok, rad])
             else:
                 rendered_states.append([txt, False, tok, EXCERPT_RADIUS])
 
         if sum(st[2] for st in rendered_states) > budget_tokens:
             rendered_states = []
-            for _, ex_win, _ in primary_entries:
-                ex, ex_tok, rad = _shrink_excerpt_to_budget(ex_win, terms_cf, per_cap)
+            for idx, (_, ex_win, _) in enumerate(primary_entries):
+                ex, ex_tok, rad = _shrink_excerpt_to_budget(
+                    ex_win, terms_cf, per_cap, resolved_span=resolved_spans[idx]
+                )
                 rendered_states.append([ex, True, ex_tok, rad])
 
         # 均等割当後も超過する場合は、第1段として MIN_EXCERPT_RADIUS まで、
@@ -1207,7 +1234,9 @@ def select_and_restore_turns(
                 if new_rad == cur_rad:
                     break
                 _, ex_win, _ = primary_entries[target_idx]
-                new_ex = _make_window_excerpt(ex_win, terms_cf, new_rad)
+                new_ex = _make_window_excerpt(
+                    ex_win, terms_cf, new_rad, resolved_span=resolved_spans[target_idx]
+                )
                 rendered_states[target_idx] = [
                     new_ex,
                     True,

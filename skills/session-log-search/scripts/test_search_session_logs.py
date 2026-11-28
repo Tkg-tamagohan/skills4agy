@@ -1107,14 +1107,14 @@ class SearchSessionLogsTests(unittest.TestCase):
 
     def test_sl32_cross_window_match_and_masked_match_never_produce_ellipsis_only(self) -> None:
         """SL-32: 窓境界をまたぐ長いパスも省略記号だけにならず保持され、マスク後消失時も本文が残る。"""
-        long_path = "C:/cross_boundary/" + ("nested_directory/" * 5) + "final_module.py"
-        self.assertGreater(len(long_path), 100)
+        long_path = "C:/cross_boundary/" + ("nested_directory/" * 6) + "final_module.py"
+        self.assertGreaterEqual(len(long_path), 118)
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp)
             for idx in range(8):
                 tp = app_dir / "brain" / f"conv-cross-{idx}" / ".system_generated" / "logs" / "transcript.jsonl"
-                # 768 文字窓境界を必ずまたぐ 700 文字目付近に長いパスを配置
-                body = ("あ" * 700) + " " + long_path + " " + ("い" * 200)
+                # 位置 660 から 118 文字超のパスを置き、先頭窓 (0..768) と第 2 窓 (672..1440) のどちらにも収まらない状態にする
+                body = ("あ" * 660) + long_path + ("い" * 200)
                 _write_jsonl(tp, [_make_planner(0, body, f"2026-11-20T10:0{idx}:00Z")])
 
             rc, data = self._run_main_json(
@@ -1160,6 +1160,65 @@ class SearchSessionLogsTests(unittest.TestCase):
             self.assertEqual(data_m["restored_turns"], 1)
             self.assertNotIn(fake_ghp, data_m["results"][0]["text"])
             self.assertNotEqual(data_m["results"][0]["text"].strip("."), "")
+
+    def test_sl33_masked_multi_hits_shrink_within_budget_without_warning(self) -> None:
+        """SL-33: 検索語がマスクで消えたログ 8 件でも指定半径で縮小して予算内に収まる。"""
+        fake_ghp = "ghp_" + ("Z" * 30)
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            for idx in range(8):
+                tp = app_dir / "brain" / f"conv-mask8-{idx}" / ".system_generated" / "logs" / "transcript.jsonl"
+                body = ("前の文脈" * 80) + f" secret={fake_ghp} " + ("後の文脈" * 80)
+                _write_jsonl(tp, [_make_planner(0, body, f"2026-11-20T10:0{idx}:00Z")])
+
+            rc, data = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--budget-tokens",
+                    "100",
+                    "--format",
+                    "json",
+                    "--",
+                    "ghp_",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(data["restored_turns"], 8)
+            self.assertLessEqual(data["estimated_tokens"], 100)
+            self.assertEqual(data["warnings"], [])
+            for res in data["results"]:
+                self.assertNotIn("ghp_", res["text"])
+                self.assertNotEqual(res["text"].strip("."), "")
+
+    def test_sl34_cross_window_span_resolved_only_once_across_shrink_steps(self) -> None:
+        """SL-34: 窓跨ぎの長い行を予算縮小しても _find_best_casefold_span の呼び出しは 2 回にとどまる。"""
+        long_path = "C:/cross_cache/" + ("nested_directory/" * 6) + "cached_module.py"
+        self.assertGreaterEqual(len(long_path), 118)
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            tp = app_dir / "brain" / "conv-cache-span" / ".system_generated" / "logs" / "transcript.jsonl"
+            body = ("あ" * 660) + long_path + ("い" * 3000)
+            _write_jsonl(tp, [_make_planner(0, body, "2026-11-20T10:00:00Z")])
+
+            with mock.patch.object(
+                mod, "_find_best_casefold_span", wraps=mod._find_best_casefold_span
+            ) as spy:
+                rc, data = self._run_main_json(
+                    [
+                        "--app-data-dir",
+                        str(app_dir),
+                        "--budget-tokens",
+                        "100",
+                        "--format",
+                        "json",
+                        "--",
+                        long_path,
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn(long_path, data["results"][0]["text"])
+            self.assertEqual(spy.call_count, 2)
 
 
 if __name__ == "__main__":
