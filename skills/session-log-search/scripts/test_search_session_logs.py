@@ -409,11 +409,12 @@ class SearchSessionLogsTests(unittest.TestCase):
                 ),
             ]
             many_lines = "\n".join(f"log line {i:03d}" for i in range(120))
+            fake_secret = "SecretTokenValue" + "1234567890"
             full_rows = [
                 short_rows[0],
                 _make_generic(
                     1,
-                    f"HEAD_MARKER_LINE\nerror: TRUNC_FULL_NEEDLE detail\n{many_lines}\nTAIL_MARKER_LINE Bearer SecretTokenValue1234567890",
+                    f"HEAD_MARKER_LINE\nerror: TRUNC_FULL_NEEDLE detail\n{many_lines}\nTAIL_MARKER_LINE Bearer {fake_secret}",
                     "2026-11-20T16:00:01Z",
                     status="ERROR",
                 ),
@@ -563,6 +564,391 @@ class SearchSessionLogsTests(unittest.TestCase):
             self.assertIn("12345678", out)
             self.assertIn("経過時間", out)
             self.assertNotIn("SECRET_BODY_SHOULD_NOT_APPEAR", out)
+
+    def test_sl15_short_error_generic_not_dropped(self) -> None:
+        """SL-15: 40 文字未満の短いエラー GENERIC も検索対象として保持される。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            tp = app_dir / "brain" / "conv-short-err" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_jsonl(
+                tp,
+                [
+                    _make_planner(
+                        0,
+                        "テストを実行します",
+                        "2026-11-20T10:00:00Z",
+                        tool_calls=[{"name": "run_command", "args": {"CommandLine": "pytest"}}],
+                    ),
+                    _make_generic(1, "FAILED x", "2026-11-20T10:00:01Z", status="ERROR"),
+                ],
+            )
+            rc, data = self._run_main_json(
+                ["--app-data-dir", str(app_dir), "--format", "json", "--", "FAILED"]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(data["restored_turns"], 1)
+            self.assertIn("FAILED x", data["results"][0]["text"])
+
+    def test_sl16_no_rg_matches_json_escaped_windows_path(self) -> None:
+        """SL-16: --no-rg 経路でも JSON エスケープされた Windows パスがヒットする。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            tp = app_dir / "brain" / "conv-winpath" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_jsonl(
+                tp,
+                [_make_user(0, r"作業パスは C:\Users\meshi\proj です", "2026-11-20T10:00:00Z")],
+            )
+            rc, data = self._run_main_json(
+                ["--app-data-dir", str(app_dir), "--no-rg", "--format", "json", "--", r"C:\Users\meshi\proj"]
+            )
+            self.assertEqual(rc, 0)
+            self.assertFalse(data["used_rg"])
+            self.assertEqual(data["restored_turns"], 1)
+            self.assertIn(r"C:\Users\meshi\proj", data["results"][0]["text"])
+
+    def test_sl17_excerpt_picks_window_with_most_term_hits(self) -> None:
+        """SL-17: 長文内で分割部品のみ頻出する窓より完全一致を含む窓が抜粋に選ばれる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            tp = app_dir / "brain" / "conv-winpick" / ".system_generated" / "logs" / "transcript.jsonl"
+            # 冒頭に完全一致、後方に分離語の大量出現を置く
+            head_part = "冒頭の調査結果: std::io::ErrorKind が原因でした。" + ("X" * 1200)
+            tail_part = (" std io Error Kind " * 60) + ("Y" * 300)
+            _write_jsonl(tp, [_make_planner(0, head_part + tail_part, "2026-11-20T10:00:00Z")])
+
+            rc, data = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--budget-tokens",
+                    "250",
+                    "--format",
+                    "json",
+                    "--",
+                    "std::io::ErrorKind",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(data["restored_turns"], 1)
+            self.assertIn("std::io::ErrorKind", data["results"][0]["text"])
+
+    def test_sl18_max_turns_caps_primary_hits(self) -> None:
+        """SL-18: --max-turns が --max-primary より小さい場合、主ヒットも max_turns 以下に抑えられる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            for idx in range(5):
+                tp = app_dir / "brain" / f"conv-cap-{idx}" / ".system_generated" / "logs" / "transcript.jsonl"
+                _write_jsonl(tp, [_make_user(0, f"CAP_NEEDLE_{idx} CAP_COMMON_KEY", f"2026-11-20T10:0{idx}:00Z")])
+
+            rc, data = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--max-primary",
+                    "8",
+                    "--max-turns",
+                    "2",
+                    "--format",
+                    "json",
+                    "--",
+                    "CAP_COMMON_KEY",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertLessEqual(data["restored_turns"], 2)
+            self.assertLessEqual(len(data["results"]), 2)
+
+    def test_sl19_long_log_many_windows_does_not_crowd_out_other_conv(self) -> None:
+        """SL-19: 1 会話の 40 窓以上がヒットしても、別会話の短い一致が主ヒットから押し出されない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            tp_long = app_dir / "brain" / "conv-long-flood" / ".system_generated" / "logs" / "transcript.jsonl"
+            # 40 窓超（672 * 42 文字以上）の全窓に検索語を配置
+            flood_chunk = "FLOOD_TERM_ALPHA " + ("a" * 655)
+            _write_jsonl(tp_long, [_make_planner(0, flood_chunk * 42, "2026-11-20T10:00:00Z")])
+
+            tp_short = app_dir / "brain" / "conv-short-gem" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_jsonl(tp_short, [_make_planner(0, "短い決定: FLOOD_TERM_ALPHA は却下", "2026-11-20T11:00:00Z")])
+
+            rc, data = self._run_main_json(
+                ["--app-data-dir", str(app_dir), "--format", "json", "--", "FLOOD_TERM_ALPHA"]
+            )
+            self.assertEqual(rc, 0)
+            cids = {r["conv_id"] for r in data["results"]}
+            self.assertIn("conv-long-flood", cids)
+            self.assertIn("conv-short-gem", cids)
+
+    def test_sl20_artifact_keeps_real_conv_id_and_session_link(self) -> None:
+        """SL-20: アーティファクト md は実 conv_id を保持し conversation://<実ID> でリンクされる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            art = app_dir / "brain" / "abc12345-real" / "decision.md"
+            art.parent.mkdir(parents=True, exist_ok=True)
+            art.write_text("決定記録: ARTIFACT_LINK_NEEDLE", encoding="utf-8")
+
+            rc_j, data = self._run_main_json(
+                ["--app-data-dir", str(app_dir), "--format", "json", "--", "ARTIFACT_LINK_NEEDLE"]
+            )
+            self.assertEqual(rc_j, 0)
+            self.assertEqual(data["results"][0]["conv_id"], "abc12345-real")
+            self.assertTrue(data["results"][0]["source_key"].startswith("artifact:"))
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc_m = mod.main(["--app-data-dir", str(app_dir), "--", "ARTIFACT_LINK_NEEDLE"])
+            self.assertEqual(rc_m, 0)
+            md_out = buf.getvalue()
+            self.assertIn("conversation://abc12345-real", md_out)
+            self.assertNotIn("conversation://artifact:", md_out)
+            self.assertIn("decision.md", md_out)
+
+    def test_sl21_match_line_idx_distinguished_from_turn_first_line(self) -> None:
+        """SL-21: L0 の planner と L1 の GENERIC のうち後者だけに一致すると line_idx=0, match_line_idx=1 となる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            tp = app_dir / "brain" / "conv-matchline" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_jsonl(
+                tp,
+                [
+                    _make_planner(
+                        0,
+                        "テストを実行します",
+                        "2026-11-20T10:00:00Z",
+                        tool_calls=[{"name": "run_command", "args": {"CommandLine": "pytest"}}],
+                    ),
+                    _make_generic(
+                        1,
+                        "PermissionError: MATCH_LINE_NEEDLE in subprocess execution with details",
+                        "2026-11-20T10:00:01Z",
+                        status="ERROR",
+                    ),
+                ],
+            )
+            rc, data = self._run_main_json(
+                ["--app-data-dir", str(app_dir), "--format", "json", "--", "MATCH_LINE_NEEDLE"]
+            )
+            self.assertEqual(rc, 0)
+            res = data["results"][0]
+            self.assertEqual(res["line_idx"], 0)
+            self.assertEqual(res["match_line_idx"], 1)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                mod.main(["--app-data-dir", str(app_dir), "--", "MATCH_LINE_NEEDLE"])
+            self.assertIn("match L1", buf.getvalue())
+
+    def test_sl22_full_replacement_keeps_short_when_second_term_omitted(self) -> None:
+        """SL-22: 複数語検索で完全版 head/tail に片方の語しかない場合は短縮版も併記される。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            logs_dir = app_dir / "brain" / "conv-full2" / ".system_generated" / "logs"
+            tp = logs_dir / "transcript.jsonl"
+            full_tp = logs_dir / "transcript_full.jsonl"
+
+            short_rows = [
+                _make_planner(
+                    0,
+                    "テスト実行",
+                    "2026-11-20T16:00:00Z",
+                    tool_calls=[{"name": "run_command", "args": {"CommandLine": "cargo test"}}],
+                ),
+                _make_generic(
+                    1,
+                    "error: TERM_ALPHA_ONLY_HEAD と TERM_BETA_ONLY_SHORT が失敗しました " + ("Z" * 50),
+                    "2026-11-20T16:00:01Z",
+                    status="ERROR",
+                    truncated_fields=["content"],
+                ),
+            ]
+            # 完全版では TERM_BETA_ONLY_SHORT が中略（50行目付近）にだけある
+            mid_lines = [f"line {i:03d}" for i in range(120)]
+            mid_lines[55] = "TERM_BETA_ONLY_SHORT"
+            full_rows = [
+                short_rows[0],
+                _make_generic(
+                    1,
+                    "error: TERM_ALPHA_ONLY_HEAD\n" + "\n".join(mid_lines),
+                    "2026-11-20T16:00:01Z",
+                    status="ERROR",
+                ),
+            ]
+            _write_jsonl(tp, short_rows)
+            _write_jsonl(full_tp, full_rows)
+
+            rc, data = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--format",
+                    "json",
+                    "--",
+                    "TERM_ALPHA_ONLY_HEAD",
+                    "TERM_BETA_ONLY_SHORT",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            body = data["results"][0]["text"]
+            self.assertIn("TERM_ALPHA_ONLY_HEAD", body)
+            self.assertIn("TERM_BETA_ONLY_SHORT", body)
+            self.assertIn("[run_command full]", body)
+
+    def test_sl23_budget_shrinks_excerpt_radius_to_fit_100_tokens(self) -> None:
+        """SL-23: --budget-tokens 100 で長い日本語ログを検索すると半径縮小により予算内に収まる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            tp = app_dir / "brain" / "conv-tight" / ".system_generated" / "logs" / "transcript.jsonl"
+            long_jp = ("あ" * 600) + "却下の理由" + ("い" * 600)
+            _write_jsonl(tp, [_make_planner(0, long_jp, "2026-11-20T10:00:00Z")])
+
+            rc, data = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--budget-tokens",
+                    "100",
+                    "--format",
+                    "json",
+                    "--",
+                    "却下",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertTrue(data["fallback"])
+            self.assertLessEqual(data["estimated_tokens"], 100)
+            self.assertIn("却下", data["results"][0]["text"])
+
+    def test_sl24_utc_sort_key_normalizes_timezone_offsets(self) -> None:
+        """SL-24: 時差付きコミットと Z 時刻の transcript が UTC 基準の正しい時系列で並ぶ。"""
+        self.assertLess(
+            mod._utc_sort_key("2026-11-01T00:30:00+09:00"),
+            mod._utc_sort_key("2026-10-31T22:00:00Z"),
+        )
+        self.assertEqual(mod._utc_sort_key(""), "9999-12-31T23:59:59.999999Z")
+
+        if not shutil.which("git"):
+            self.skipTest("git が見つからない環境のためスキップ")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_dir = root / "app"
+            tp = app_dir / "brain" / "conv-tz" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_jsonl(tp, [_make_user(0, "TZ_ORDER_NEEDLE transcript", "2026-10-31T22:00:00Z")])
+
+            repo = root / "repo"
+            repo.mkdir(parents=True)
+            (repo / "a.txt").write_text("x", encoding="utf-8")
+            env = os.environ.copy()
+            env["GIT_COMMITTER_DATE"] = "2026-11-01T00:30:00+09:00"
+            env["GIT_AUTHOR_DATE"] = "2026-11-01T00:30:00+09:00"
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-m", "TZ_ORDER_NEEDLE commit"],
+                cwd=repo,
+                env=env,
+                check=True,
+                capture_output=True,
+            )
+
+            rc, data = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--repo",
+                    str(repo),
+                    "--format",
+                    "json",
+                    "--",
+                    "TZ_ORDER_NEEDLE",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                [r["source_kind"] for r in data["results"]],
+                ["git_commit", "USER_INPUT"],
+            )
+
+    def test_sl25_git_commit_subject_secret_masked_in_heading(self) -> None:
+        """SL-25: git コミット件名に含まれる秘密トークンが見出し出力でもマスクされる。"""
+        if not shutil.which("git"):
+            self.skipTest("git が見つからない環境のためスキップ")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_dir = root / "app"
+            (app_dir / "brain").mkdir(parents=True)
+            repo = root / "repo"
+            repo.mkdir(parents=True)
+            (repo / "a.txt").write_text("x", encoding="utf-8")
+            fake_ghp = "ghp_" + ("X" * 30)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-m", f"COMMIT_SECRET_KEY {fake_ghp}"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = mod.main(
+                    ["--app-data-dir", str(app_dir), "--repo", str(repo), "--", "COMMIT_SECRET_KEY"]
+                )
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("[REDACTED]", out)
+            self.assertNotIn("ghp_", out)
+
+    def test_sl26_tool_arg_masked_before_200char_truncation(self) -> None:
+        """SL-26: ツール引数の切り詰め位置をまたぐ秘密トークンも切断前にマスクされる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            tp = app_dir / "brain" / "conv-toolmask" / ".system_generated" / "logs" / "transcript.jsonl"
+            fake_ghp = "ghp_" + ("A" * 30)
+            cmd = ("x" * 190) + fake_ghp
+            _write_jsonl(
+                tp,
+                [
+                    _make_planner(
+                        0,
+                        "TOOL_ARG_MASK_QUERY の実行記録",
+                        "2026-11-20T10:00:00Z",
+                        tool_calls=[{"name": "run_command", "args": {"CommandLine": cmd}}],
+                    )
+                ],
+            )
+            rc, data = self._run_main_json(
+                ["--app-data-dir", str(app_dir), "--format", "json", "--", "TOOL_ARG_MASK_QUERY"]
+            )
+            self.assertEqual(rc, 0)
+            text = data["results"][0]["text"]
+            self.assertIn("[REDACTED]", text)
+            self.assertNotIn("ghp_", text)
+            self.assertNotIn("AAAAAAAA", text)
+
+    def test_sl27_query_terms_masked_in_markdown_json_and_stats_only(self) -> None:
+        """SL-27: 検索語に含まれる URL 認証情報が 0 件時・stats-only を含む全出力形式でマスクされる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            (app_dir / "brain").mkdir(parents=True)
+            cred_url = "https://user:pass123@example.com"
+
+            buf_md = io.StringIO()
+            with contextlib.redirect_stdout(buf_md):
+                rc1 = mod.main(["--app-data-dir", str(app_dir), "--", cred_url])
+            self.assertEqual(rc1, 0)
+            self.assertNotIn("pass123", buf_md.getvalue())
+            self.assertIn("[REDACTED]", buf_md.getvalue())
+
+            rc2, data_json = self._run_main_json(
+                ["--app-data-dir", str(app_dir), "--format", "json", "--stats-only", "--", cred_url]
+            )
+            self.assertEqual(rc2, 0)
+            self.assertNotIn("pass123", json.dumps(data_json, ensure_ascii=False))
+            self.assertIn("[REDACTED]", data_json["terms"][0])
 
 
 if __name__ == "__main__":

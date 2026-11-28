@@ -42,11 +42,13 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/session-log-search/scr
 ```
 
 3. 必要に応じて原文の前後を読み足す。
-   - 出力の各ターン見出しには `conv_id` と 0 始まりの物理行番号 `L<line_idx>`、および `[session](conversation://<id>)` が付く。
-   - 抜粋に省略された詳細を確認したいときだけ、該当 `transcript.jsonl` を `read_file`（`StartLine` は `line_idx + 1`）で局所読み込みする。
+   - 出力の各ターン見出しには `conv_id` と物理行番号（`match L<n>` があればその一致行、なければ `L<line_idx>`）、および `[session](conversation://<id>)` が付く。
+   - 抜粋に省略された詳細を確認したいときだけ、該当 `transcript.jsonl` を `read_file`（`StartLine` は `match_line_idx + 1` または `line_idx + 1`）で局所読み込みする。
 
 4. 0 件のときは 1 回だけ語を変えて再検索する。
-   - 展開語を変えて再実行しても 0 件であれば、該当履歴なしと報告して探索を終える。
+   - 事前フィルタと行選別は casefold した原文の部分一致で行い、NFKC 正規化は採点時だけに適用するため、全角と半角の表記揺れがある語は両表記を展開語に含める。
+   - 完全版ログ（`transcript_full.jsonl`）は短縮版でヒットしたエラー出力の補足に限定されるため、完全版側にしか残っていない語は検索対象外となる。
+   - 展開語を変えて再実行しても 0 件であれば、短縮ログ上では該当履歴なしと報告して探索を終える。
 
 ## 対象と除外の方針
 
@@ -57,5 +59,5 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/session-log-search/scr
 ## 原則
 
 - 外部 API 呼び出しや永続インデックス DB を作らず、実行ごとのステートレス走査にとどめる。
-- UI の巻き戻しによる `step_index` 重複に影響されないよう、同定と復元順序には物理行 `line_idx` と `created_at` を使う。
-- 予算超過時は主ヒットの件数を削らず、一致窓の前後 400 文字抜粋へ切り替えて因果の取りこぼしを防ぐ。
+- UI の巻き戻しによる `step_index` 重複に影響されないよう、同定と復元順序には物理行 `line_idx` と UTC 正規化時刻を使う。
+- `--budget-tokens` は出力の上限として扱い、超過時は一致位置を中心に抜粋半径を縮小する（最小抜粋 60 文字でも収まらない場合のみ主ヒット件数を優先して警告を出す）。

@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -43,6 +43,7 @@ MAX_PRIMARY_UPPER = 10
 DEFAULT_MAX_TURNS = 15
 DEFAULT_BUDGET_TOKENS = 4500
 EXCERPT_RADIUS = 400
+MIN_EXCERPT_RADIUS = 60
 CONTEXT_EXCERPT_CHARS = 800
 FULL_HEAD_LINES = 40
 FULL_TAIL_LINES = 60
@@ -121,6 +122,7 @@ class TurnEntry:
     lines: list[tuple[int, str]] = field(default_factory=list)
     label: str = ""
     can_expand_context: bool = True
+    source_key: str = ""
 
     def full_text(self) -> str:
         return "\n".join(text for _, text in self.lines if text)
@@ -138,6 +140,7 @@ class WindowCandidate:
     window_text: str
     created_at: str
     tokens: list[str]
+    source_key: str = ""
     score: float = 0.0
     term_hits: int = 0
 
@@ -152,6 +155,7 @@ class SelectedTurn:
     excerpted: bool
     tokens: int
     best_score: float
+    match_line_idx: int | None = None
 
 
 def apply_mask(text: str) -> str:
@@ -242,6 +246,31 @@ def _mtime_iso(stat_res: os.stat_result) -> str:
     )
 
 
+def _parse_iso_to_utc_dt(value: str) -> datetime | None:
+    if not value:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if cleaned.endswith(("Z", "z")):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _utc_sort_key(value: str) -> str:
+    """ISO 8601 文字列を UTC 基準の比較用文字列へ正規化する（欠損時は末尾扱い）。"""
+    dt = _parse_iso_to_utc_dt(value)
+    if dt is None:
+        return "9999-12-31T23:59:59.999999Z"
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def _parse_since_timestamp(since: str | None) -> float | None:
     if not since:
         return None
@@ -255,6 +284,7 @@ def _parse_since_timestamp(since: str | None) -> float | None:
 def _collect_git_commits(
     repo_path: Path, since: str | None, warnings: list[str]
 ) -> list[SourceSpec]:
+    since_ts = _parse_since_timestamp(since)
     cmd = [
         "git",
         "-c",
@@ -263,7 +293,7 @@ def _collect_git_commits(
         str(repo_path),
         "--no-optional-locks",
         "log",
-        f"-n",
+        "-n",
         str(GIT_LOG_LIMIT),
         "--format=%H%x1f%cI%x1f%s%x1f%b%x1e",
     ]
@@ -297,11 +327,14 @@ def _collect_git_commits(
         committed_iso = fields[1].strip()
         subject = fields[2].strip()
         body = fields[3].strip() if len(fields) > 3 else ""
-        if since and committed_iso[:10] < since:
-            continue
+        if since_ts is not None:
+            commit_dt = _parse_iso_to_utc_dt(committed_iso)
+            if commit_dt is not None and commit_dt.timestamp() < since_ts:
+                continue
         text = f"commit {commit_hash}\n{subject}"
         if body:
             text += f"\n\n{body}"
+        masked_subject = apply_mask(subject)
         specs.append(
             SourceSpec(
                 source_id=f"git:{commit_hash[:8]}",
@@ -309,7 +342,7 @@ def _collect_git_commits(
                 conv_id=f"git:{commit_hash[:8]}",
                 mtime_iso=committed_iso,
                 raw_text=text,
-                label=f"git:{commit_hash[:8]} ({subject[:60]})",
+                label=f"git:{commit_hash[:8]} ({masked_subject[:60]})",
             )
         )
     return specs
@@ -454,8 +487,8 @@ def _term_variants_for_rg(terms: Sequence[str]) -> list[str]:
 
 
 def prefilter_python(paths: Sequence[Path], terms: Sequence[str]) -> set[str]:
-    """Python ストリーミングで検索語を含むファイルパス集合を返す。"""
-    terms_cf = [t.casefold() for t in terms if t]
+    """Python ストリーミングで検索語（JSON エスケープ形を含む）を含むファイルパス集合を返す。"""
+    terms_cf = [v.casefold() for v in _term_variants_for_rg(terms) if v]
     matched: set[str] = set()
     if not terms_cf:
         return matched
@@ -612,7 +645,7 @@ def _summarize_non_noise_tools(
                     break
             if chosen_key is None:
                 chosen_key = next(iter(args_dict.keys()))
-            val_str = re.sub(r"\s+", " ", str(args_dict[chosen_key])).strip()
+            val_str = apply_mask(re.sub(r"\s+", " ", str(args_dict[chosen_key])).strip())
             if len(val_str) > 200:
                 val_str = val_str[:197] + "..."
             arg_preview = f"{chosen_key}={val_str}"
@@ -729,6 +762,7 @@ def load_transcript_turns(
                     first_line_idx=line_idx,
                     step_index=step_index,
                     lines=[(line_idx, user_text)] if user_text else [],
+                    source_key=conv_id,
                 )
                 turns.append(turn)
                 current_turn = turn
@@ -757,6 +791,7 @@ def load_transcript_turns(
                     first_line_idx=line_idx,
                     step_index=step_index,
                     lines=[(line_idx, body)] if body else [],
+                    source_key=conv_id,
                 )
                 turns.append(turn)
                 current_turn = turn
@@ -776,7 +811,8 @@ def load_transcript_turns(
 
                 raw_content = str(obj.get("content") or "")
                 cleaned = _extract_generic_content(raw_content)
-                if not cleaned or _is_trivial_generic(cleaned):
+                is_err = status.upper() == "ERROR" or bool(ERROR_SIGNAL_RE.search(cleaned))
+                if not cleaned or (_is_trivial_generic(cleaned) and not is_err):
                     continue
 
                 if current_turn is None:
@@ -787,6 +823,7 @@ def load_transcript_turns(
                         created_at=created_at,
                         first_line_idx=line_idx,
                         step_index=step_index,
+                        source_key=conv_id,
                     )
                     turns.append(current_turn)
 
@@ -796,7 +833,6 @@ def load_transcript_turns(
 
                 raw_trunc = obj.get("truncated_fields")
                 is_truncated = isinstance(raw_trunc, list) and "content" in raw_trunc
-                is_err = status.upper() == "ERROR" or bool(ERROR_SIGNAL_RE.search(cleaned))
                 if tool_name == "run_command" and is_truncated and is_err:
                     cf = tagged_text.casefold()
                     if any(t in cf for t in terms_cf):
@@ -832,10 +868,12 @@ def load_transcript_turns(
                 excerpted_full = _head_tail_lines(
                     full_masked, FULL_HEAD_LINES, FULL_TAIL_LINES
                 )
-                if any(t in excerpted_full.casefold() for t in terms_cf):
+                orig_masked = apply_mask(turns[t_idx].lines[l_pos][1])
+                orig_cf = orig_masked.casefold()
+                excerpt_cf = excerpted_full.casefold()
+                if all(t in excerpt_cf for t in terms_cf if t in orig_cf):
                     turns[t_idx].lines[l_pos] = (l_idx, f"[run_command full] {excerpted_full}")
                 else:
-                    orig_masked = apply_mask(turns[t_idx].lines[l_pos][1])
                     turns[t_idx].lines[l_pos] = (
                         l_idx,
                         f"{orig_masked}\n[run_command full]\n{excerpted_full}",
@@ -870,6 +908,7 @@ def load_document_turn(spec: SourceSpec, warnings: list[str]) -> list[TurnEntry]
             lines=[(0, text)],
             label=spec.label,
             can_expand_context=False,
+            source_key=spec.source_id,
         )
     ]
 
@@ -893,7 +932,7 @@ def score_windows_bm25(
     windows: list[WindowCandidate],
     terms: Sequence[str],
 ) -> list[WindowCandidate]:
-    """候補窓集合に対して Hybrid BM25 (k1=1.2, b=0.75) を計算し上位 30 窓を返す。"""
+    """候補窓集合に対して Hybrid BM25 (k1=1.2, b=0.75) を計算し、スコア降順の全窓を返す。"""
     if not windows:
         return []
 
@@ -942,15 +981,22 @@ def score_windows_bm25(
         win.term_hits = sum(1 for t in terms_cf if t in win_cf)
 
     windows.sort(
-        key=lambda w: (-w.score, -w.term_hits, w.created_at, w.conv_id, w.line_idx, w.window_idx)
+        key=lambda w: (
+            -w.score,
+            -w.term_hits,
+            _utc_sort_key(w.created_at),
+            w.source_key or w.conv_id,
+            w.line_idx,
+            w.window_idx,
+        )
     )
-    return windows[:TOP_WINDOWS]
+    return windows
 
 
 def _make_window_excerpt(
-    best_win: WindowCandidate, terms_cf: Sequence[str]
+    best_win: WindowCandidate, terms_cf: Sequence[str], radius: int = EXCERPT_RADIUS
 ) -> str:
-    """一致窓内で検索語の位置（または中央）の前後 400 文字を切り出す（マスク済みテキスト前提）。"""
+    """一致窓内で検索語の位置（または中央）の前後 radius 文字を切り出す（マスク済みテキスト前提）。"""
     line_text = best_win.line_text
     win_text = best_win.window_text
     win_start = best_win.window_idx * WINDOW_STRIDE
@@ -967,12 +1013,29 @@ def _make_window_excerpt(
     else:
         center = win_start + hit_offset
 
-    start = max(0, center - EXCERPT_RADIUS)
-    end = min(len(line_text), center + EXCERPT_RADIUS)
+    start = max(0, center - radius)
+    end = min(len(line_text), center + radius)
     excerpt = line_text[start:end]
     prefix = "..." if start > 0 else ""
     suffix = "..." if end < len(line_text) else ""
     return f"{prefix}{excerpt}{suffix}"
+
+
+def _shrink_excerpt_to_budget(
+    win: WindowCandidate, terms_cf: Sequence[str], target_tokens: float
+) -> tuple[str, int]:
+    """一致位置を保ったまま割当トークン予算内に収まるまで抜粋半径を縮小する。"""
+    radius = EXCERPT_RADIUS
+    ex = _make_window_excerpt(win, terms_cf, radius)
+    tok = estimate_tokens(ex)
+    while tok > target_tokens and radius > MIN_EXCERPT_RADIUS:
+        next_radius = max(MIN_EXCERPT_RADIUS, int(radius * 0.8))
+        if next_radius == radius:
+            break
+        radius = next_radius
+        ex = _make_window_excerpt(win, terms_cf, radius)
+        tok = estimate_tokens(ex)
+    return ex, tok
 
 
 def _truncate_head_tail(text: str, max_chars: int) -> str:
@@ -994,38 +1057,47 @@ def _masked_turn_full_text(turn: TurnEntry) -> str:
 
 
 def select_and_restore_turns(
-    top_windows: list[WindowCandidate],
-    turns_by_conv: dict[str, list[TurnEntry]],
+    scored_windows: list[WindowCandidate],
+    turns_by_key: dict[str, list[TurnEntry]],
     terms_cf: Sequence[str],
     *,
+    windows_by_key: dict[tuple[str, int], list[WindowCandidate]] | None = None,
     max_primary: int,
     max_turns: int,
     budget_tokens: int,
     warnings: list[str],
 ) -> tuple[list[SelectedTurn], bool, int]:
-    """上位 30 窓から主ヒット枠を確保し、5K 予算内で前後ターンを時系列復元する。"""
-    if not top_windows:
+    """ターン単位で重複排除した代表窓から主ヒット枠を確保し、予算内で前後ターンを時系列復元する。"""
+    if not scored_windows:
         return [], False, 0
 
-    primary_entries: list[tuple[TurnEntry, WindowCandidate]] = []
+    primary_limit = min(max_primary, max_turns, TOP_WINDOWS)
+    primary_entries: list[tuple[TurnEntry, WindowCandidate, float]] = []
     seen_keys: set[tuple[str, int]] = set()
-    for win in top_windows:
-        key = (win.conv_id, win.turn_idx)
+    for win in scored_windows:
+        key_id = win.source_key or win.conv_id
+        key = (key_id, win.turn_idx)
         if key in seen_keys:
             continue
-        conv_turns = turns_by_conv.get(win.conv_id)
+        conv_turns = turns_by_key.get(key_id)
         if not conv_turns or win.turn_idx >= len(conv_turns):
             continue
         seen_keys.add(key)
-        primary_entries.append((conv_turns[win.turn_idx], win))
-        if len(primary_entries) >= max_primary:
+        cand_wins = (windows_by_key or {}).get(key)
+        best_excerpt_win = (
+            max(cand_wins, key=lambda w: (w.term_hits, w.score))
+            if cand_wins
+            else win
+        )
+        primary_entries.append((conv_turns[win.turn_idx], best_excerpt_win, win.score))
+        if len(primary_entries) >= primary_limit:
             break
 
     if not primary_entries:
         return [], False, 0
 
-    # ステップ (b): 主ヒット全件の全文サイズを計測し、超過時は抜粋へフォールバック（主ヒット数は維持）
-    full_texts = [_masked_turn_full_text(turn) for turn, _ in primary_entries]
+    # ステップ (b): 主ヒット全件の全文サイズを計測し、超過時は抜粋（必要に応じて半径縮小）へフォールバック
+    full_texts = [_masked_turn_full_text(turn) for turn, _, _ in primary_entries]
     full_tokens = [estimate_tokens(txt) for txt in full_texts]
     fallback = False
 
@@ -1037,26 +1109,27 @@ def select_and_restore_turns(
                 rendered_text=txt,
                 excerpted=False,
                 tokens=tok,
-                best_score=win.score,
+                best_score=b_score,
+                match_line_idx=ex_win.line_idx,
             )
-            for (turn, win), txt, tok in zip(primary_entries, full_texts, full_tokens)
+            for (turn, ex_win, b_score), txt, tok in zip(primary_entries, full_texts, full_tokens)
         ]
     else:
         fallback = True
         per_cap = budget_tokens / len(primary_entries)
         rendered_list: list[tuple[str, bool, int]] = []
-        for (turn, win), txt, tok in zip(primary_entries, full_texts, full_tokens):
+        for (turn, ex_win, _), txt, tok in zip(primary_entries, full_texts, full_tokens):
             if tok > per_cap:
-                ex = _make_window_excerpt(win, terms_cf)
-                rendered_list.append((ex, True, estimate_tokens(ex)))
+                ex, ex_tok = _shrink_excerpt_to_budget(ex_win, terms_cf, per_cap)
+                rendered_list.append((ex, True, ex_tok))
             else:
                 rendered_list.append((txt, False, tok))
 
         if sum(item[2] for item in rendered_list) > budget_tokens:
             rendered_list = []
-            for _, win in primary_entries:
-                ex = _make_window_excerpt(win, terms_cf)
-                rendered_list.append((ex, True, estimate_tokens(ex)))
+            for _, ex_win, _ in primary_entries:
+                ex, ex_tok = _shrink_excerpt_to_budget(ex_win, terms_cf, per_cap)
+                rendered_list.append((ex, True, ex_tok))
 
         selected = [
             SelectedTurn(
@@ -1065,25 +1138,29 @@ def select_and_restore_turns(
                 rendered_text=r_txt,
                 excerpted=is_ex,
                 tokens=r_tok,
-                best_score=win.score,
+                best_score=b_score,
+                match_line_idx=ex_win.line_idx,
             )
-            for (turn, win), (r_txt, is_ex, r_tok) in zip(primary_entries, rendered_list)
+            for (turn, ex_win, b_score), (r_txt, is_ex, r_tok) in zip(
+                primary_entries, rendered_list
+            )
         ]
         if sum(s.tokens for s in selected) > budget_tokens:
             warnings.append(
-                f"主ヒット {len(selected)} 件の抜粋合計が予算 {budget_tokens} トークンを超過しました"
+                f"主ヒット件数を優先したため予算 {budget_tokens} トークンを超過しました（最小抜粋 {MIN_EXCERPT_RADIUS} 文字）"
             )
 
     used_tokens = sum(s.tokens for s in selected)
 
     # ステップ (c): 残余予算で前後 ±1 因果ターンを展開
     if used_tokens < budget_tokens and len(selected) < max_turns:
-        for turn, _ in primary_entries:
+        for turn, _, _ in primary_entries:
             if len(selected) >= max_turns or used_tokens >= budget_tokens:
                 break
             if not turn.can_expand_context:
                 continue
-            conv_turns = turns_by_conv.get(turn.conv_id, [])
+            turn_key_id = turn.source_key or turn.conv_id
+            conv_turns = turns_by_key.get(turn_key_id, [])
 
             neighbors: list[TurnEntry] = []
             for direction in (-1, 1):
@@ -1098,15 +1175,15 @@ def select_and_restore_turns(
             for nb in neighbors:
                 if len(selected) >= max_turns or used_tokens >= budget_tokens:
                     break
-                key = (nb.conv_id, nb.turn_idx)
-                if key in seen_keys:
+                nb_key = (nb.source_key or nb.conv_id, nb.turn_idx)
+                if nb_key in seen_keys:
                     continue
                 nb_full = _masked_turn_full_text(nb)
                 if not nb_full.strip():
                     continue
                 nb_tok = estimate_tokens(nb_full)
                 if used_tokens + nb_tok <= budget_tokens:
-                    seen_keys.add(key)
+                    seen_keys.add(nb_key)
                     selected.append(
                         SelectedTurn(
                             turn=nb,
@@ -1115,6 +1192,7 @@ def select_and_restore_turns(
                             excerpted=False,
                             tokens=nb_tok,
                             best_score=0.0,
+                            match_line_idx=None,
                         )
                     )
                     used_tokens += nb_tok
@@ -1122,7 +1200,7 @@ def select_and_restore_turns(
                     nb_ex = _truncate_head_tail(nb_full, CONTEXT_EXCERPT_CHARS)
                     nb_ex_tok = estimate_tokens(nb_ex)
                     if used_tokens + nb_ex_tok <= budget_tokens:
-                        seen_keys.add(key)
+                        seen_keys.add(nb_key)
                         selected.append(
                             SelectedTurn(
                                 turn=nb,
@@ -1131,13 +1209,14 @@ def select_and_restore_turns(
                                 excerpted=True,
                                 tokens=nb_ex_tok,
                                 best_score=0.0,
+                                match_line_idx=None,
                             )
                         )
                         used_tokens += nb_ex_tok
 
-    # ステップ (d): 時系列昇順 (created_at, conv_id, first_line_idx)
+    # ステップ (d): UTC 正規化時刻の昇順 (_utc_sort_key(created_at), conv_id, first_line_idx)
     selected.sort(
-        key=lambda s: (s.turn.created_at, s.turn.conv_id, s.turn.first_line_idx)
+        key=lambda s: (_utc_sort_key(s.turn.created_at), s.turn.conv_id, s.turn.first_line_idx)
     )
     return selected, fallback, used_tokens
 
@@ -1155,14 +1234,27 @@ def _format_turn_heading(item: SelectedTurn) -> str:
     tag = "PRIMARY" if item.role == "primary" else "CONTEXT"
     ex_note = " excerpt" if item.excerpted else ""
     if turn.source_kind in ("repo_doc", "git_commit"):
+        safe_label = apply_mask(turn.label or turn.conv_id)
         return (
-            f"### [{tag}{ex_note}] {turn.label or turn.conv_id} "
+            f"### [{tag}{ex_note}] {safe_label} "
             f"({turn.created_at or 'unknown'})"
         )
+    if turn.source_kind == "artifact":
+        file_label = apply_mask(turn.label or turn.conv_id)
+        return (
+            f"### [{tag}{ex_note}] artifact `{turn.conv_id}` "
+            f"({file_label}, {turn.created_at or 'unknown'}) "
+            f"[session](conversation://{turn.conv_id})"
+        )
     step_str = f"step={turn.step_index}" if turn.step_index >= 0 else "doc"
+    match_str = (
+        f", match L{item.match_line_idx}"
+        if item.match_line_idx is not None and item.match_line_idx != turn.first_line_idx
+        else ""
+    )
     return (
         f"### [{tag}{ex_note}] `{turn.conv_id}` L{turn.first_line_idx} "
-        f"({step_str}, {turn.source_kind}, {turn.created_at or 'unknown'}) "
+        f"({step_str}{match_str}, {turn.source_kind}, {turn.created_at or 'unknown'}) "
         f"[session](conversation://{turn.conv_id})"
     )
 
@@ -1181,10 +1273,11 @@ def render_markdown(
     warnings: Sequence[str],
     stats_only: bool,
 ) -> str:
+    masked_terms = [apply_mask(t) for t in terms]
     lines: list[str] = [
         "# Session Log Search Results",
         "",
-        f"- 検索語: {', '.join(f'`{t}`' for t in terms)}",
+        f"- 検索語: {', '.join(f'`{t}`' for t in masked_terms)}",
         f"- 走査経路: {'ripgrep (-l) + Python BM25' if used_rg else 'Python ストリーミング + BM25'}",
         f"- 経過時間: {elapsed_ms:.1f} ms",
         f"- 対象ソース数: {candidate_count} / ヒットソース数: {matched_count} / 評価窓数: {window_count}",
@@ -1234,8 +1327,9 @@ def render_json(
     warnings: Sequence[str],
     stats_only: bool,
 ) -> str:
+    masked_terms = [apply_mask(t) for t in terms]
     payload: dict[str, Any] = {
-        "terms": list(terms),
+        "terms": masked_terms,
         "used_rg": used_rg,
         "elapsed_ms": round(elapsed_ms, 2),
         "candidate_sources": candidate_count,
@@ -1253,11 +1347,14 @@ def render_json(
         payload["results"] = [
             {
                 "conv_id": s.turn.conv_id,
+                "source_key": s.turn.source_key or s.turn.conv_id,
                 "turn_idx": s.turn.turn_idx,
                 "source_kind": s.turn.source_kind,
                 "created_at": s.turn.created_at,
                 "line_idx": s.turn.first_line_idx,
+                "match_line_idx": s.match_line_idx,
                 "step_index": s.turn.step_index,
+                "label": apply_mask(s.turn.label),
                 "role": s.role,
                 "excerpted": s.excerpted,
                 "tokens": s.tokens,
@@ -1325,7 +1422,8 @@ def run_search(
         if any(t in cf for t in terms_cf):
             candidate_sources.append(spec)
 
-    turns_by_conv: dict[str, list[TurnEntry]] = {}
+    turns_by_key: dict[str, list[TurnEntry]] = {}
+    windows_by_key: dict[tuple[str, int], list[WindowCandidate]] = defaultdict(list)
     all_windows: list[WindowCandidate] = []
 
     for spec in candidate_sources:
@@ -1340,13 +1438,13 @@ def run_search(
             key_id = spec.conv_id
         else:
             turns = load_document_turn(spec, warnings)
-            # transcript と conv_id が衝突しないようドキュメントは source_id 単位に隔離する
+            # transcript と重複しないよう source_key で隔離しつつ conv_id は実 ID を保つ
             key_id = spec.source_id
-            for t in turns:
-                t.conv_id = key_id
         if not turns:
             continue
-        turns_by_conv[key_id] = turns
+        for t in turns:
+            t.source_key = key_id
+        turns_by_key[key_id] = turns
 
         for turn in turns:
             for l_idx, raw_line_text in turn.lines:
@@ -1360,24 +1458,26 @@ def run_search(
                     w_toks = tokenize(w_text)
                     if not w_toks:
                         continue
-                    all_windows.append(
-                        WindowCandidate(
-                            conv_id=key_id,
-                            turn_idx=turn.turn_idx,
-                            line_idx=l_idx,
-                            window_idx=w_idx,
-                            line_text=masked_line,
-                            window_text=w_text,
-                            created_at=turn.created_at,
-                            tokens=w_toks,
-                        )
+                    win_cand = WindowCandidate(
+                        conv_id=turn.conv_id,
+                        turn_idx=turn.turn_idx,
+                        line_idx=l_idx,
+                        window_idx=w_idx,
+                        line_text=masked_line,
+                        window_text=w_text,
+                        created_at=turn.created_at,
+                        tokens=w_toks,
+                        source_key=key_id,
                     )
+                    all_windows.append(win_cand)
+                    windows_by_key[(key_id, turn.turn_idx)].append(win_cand)
 
-    top_windows = score_windows_bm25(all_windows, terms)
+    scored_windows = score_windows_bm25(all_windows, terms)
     selected, fallback, total_tokens = select_and_restore_turns(
-        top_windows,
-        turns_by_conv,
+        scored_windows,
+        turns_by_key,
         terms_cf,
+        windows_by_key=windows_by_key,
         max_primary=max_primary,
         max_turns=max_turns,
         budget_tokens=budget_tokens,
