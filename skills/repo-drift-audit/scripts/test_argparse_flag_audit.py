@@ -87,14 +87,14 @@ class ArgparseFlagAuditTests(unittest.TestCase):
             self.assertEqual(extracted["beta.py"], {"--bash-cont"})
 
     def test_AFA_04_mixed_script_lines_and_similar_names_not_misattributed(self) -> None:
-        """AFA-04: 同一行に複数スクリプトが混在する場合や接尾辞一致するスクリプト名で誤帰属しない。"""
+        """AFA-04: 同一セグメントに複数スクリプトが混在する場合や接尾辞一致するスクリプト名で誤帰属しない。"""
         lines = [
             "```bash",
-            "python run.py --valid-run && python sub_run.py --only-sub",
+            "python run.py sub_run.py --ambiguous",
             "  --dangling-after-mixed",
             "python sub_run.py --sub-flag",
             "```",
-            "Mixed inline `run.py --a && sub_run.py --b` should be ignored.",
+            "Mixed inline `run.py sub_run.py --b` should be ignored.",
             "Single inline `run.py --single-run` should be kept.",
         ]
         extracted = afa.extract_doc_flags_from_lines(lines, {"run.py", "sub_run.py"})
@@ -221,6 +221,95 @@ class ArgparseFlagAuditTests(unittest.TestCase):
                 "```\n"
             )
             self.assertEqual(afa.find_doc_only_flags_in_text(doc_text, [cli]), ["tool.py:--stdin"])
+
+    def test_AFA_09_chained_commands_preserve_per_segment_subcommands(self) -> None:
+        """AFA-09: && や ; で連結されたコマンドで各セグメントのサブコマンド固有フラグを正しく許容する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "preflight_drift.py"
+            cli.write_text(
+                "import argparse\n"
+                "p = argparse.ArgumentParser()\n"
+                "subs = p.add_subparsers(dest='cmd')\n"
+                "s = subs.add_parser('scan')\n"
+                "s.add_argument('--repo')\n"
+                "pt = subs.add_parser('plan-tracks')\n"
+                "pt.add_argument('--plans-json')\n",
+                encoding="utf-8",
+            )
+            doc_ok = (
+                "```bash\n"
+                "python preflight_drift.py scan --repo . && python preflight_drift.py plan-tracks --plans-json plans.json\n"
+                "```\n"
+                "Inline: `preflight_drift.py scan --repo . && preflight_drift.py plan-tracks --plans-json plans.json`\n"
+            )
+            self.assertEqual(afa.find_doc_only_flags_in_text(doc_ok, [cli]), [])
+
+            doc_bad = (
+                "```bash\n"
+                "python preflight_drift.py scan --plans-json bad.json && python preflight_drift.py plan-tracks --repo .\n"
+                "```\n"
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text(doc_bad, [cli]),
+                ["preflight_drift.py:--plans-json", "preflight_drift.py:--repo"],
+            )
+
+    def test_AFA_10_class_method_and_nested_func_add_argument_collected(self) -> None:
+        """AFA-10: ClassDef 内のメソッドやネスト関数で定義された add_argument が漏れない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "cls_cli.py"
+            cli.write_text(
+                "import argparse\n\n"
+                "class Cli:\n"
+                "    @classmethod\n"
+                "    def build(cls) -> argparse.ArgumentParser:\n"
+                "        parser = argparse.ArgumentParser()\n"
+                "        parser.add_argument('--output-dir')\n"
+                "        def add_nested(p: argparse.ArgumentParser) -> None:\n"
+                "            p.add_argument('--nested-opt')\n"
+                "        add_nested(parser)\n"
+                "        return parser\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                afa.extract_argparse_flags(cli),
+                {"--nested-opt", "--output-dir"},
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text(
+                    "`cls_cli.py --output-dir out --nested-opt 1`", [cli]
+                ),
+                [],
+            )
+
+    def test_AFA_11_repeated_parent_factory_calls_inherit_for_all_subcommands(self) -> None:
+        """AFA-11: 複数サブコマンドが同じ親パーサー生成関数 parents=[common()] を呼んでも全サブコマンドへ継承される。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "multi_parent.py"
+            cli.write_text(
+                "import argparse\n\n"
+                "def common() -> argparse.ArgumentParser:\n"
+                "    p = argparse.ArgumentParser(add_help=False)\n"
+                "    p.add_argument('--common-flag')\n"
+                "    return p\n\n"
+                "def build() -> argparse.ArgumentParser:\n"
+                "    root_p = argparse.ArgumentParser()\n"
+                "    subs = root_p.add_subparsers(dest='cmd')\n"
+                "    a = subs.add_parser('alpha', parents=[common()])\n"
+                "    a.add_argument('--alpha-only')\n"
+                "    b = subs.add_parser('beta', parents=[common()])\n"
+                "    b.add_argument('--beta-only')\n"
+                "    return root_p\n",
+                encoding="utf-8",
+            )
+            doc_ok = (
+                "`multi_parent.py alpha --common-flag 1 --alpha-only 2`\n"
+                "`multi_parent.py beta --common-flag 1 --beta-only 2`\n"
+            )
+            self.assertEqual(afa.find_doc_only_flags_in_text(doc_ok, [cli]), [])
 
 
 if __name__ == "__main__":

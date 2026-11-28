@@ -511,11 +511,38 @@ class DriftRepoTests(unittest.TestCase):
         # 先頭 1 バイトだけ読んでパイプ読み端を閉じ、子プロセス側の書き込み/終了時フラッシュで破損パイプを再現
         proc.stdout.read(1)
         proc.stdout.close()
-        stderr_data = proc.stderr.read().decode("utf-8", errors="replace")
-        proc.stderr.close()
-        rc = proc.wait(timeout=10)
-        self.assertEqual(rc, 0, msg=f"stderr={stderr_data!r}")
+        proc.stdout = None
+        _, stderr_bytes = proc.communicate(timeout=10)
+        stderr_data = (stderr_bytes or b"").decode("utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={stderr_data!r}")
         self.assertEqual(stderr_data, "")
+
+    def test_DRR_13_empty_existing_dir_allowed_vs_unstaged_deleted_dir_flagged(self) -> None:
+        """DRR-13: 実在する空ディレクトリ output/ は True となり、追跡ファイル削除で空になった sub/ は False となる。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "output").mkdir()
+            (root / "sub").mkdir()
+            subfile = root / "sub" / "item.txt"
+            subfile.write_text("tracked\n", encoding="utf-8")
+            (root / "README.md").write_text("Dirs: `output/` and `sub/`.\n", encoding="utf-8")
+
+            try:
+                _init_git_repo(root)
+                _git_commit_at(root, "initial", "2026-11-10T00:00:00Z")
+            except (OSError, subprocess.CalledProcessError) as exc:
+                self.skipTest(f"git unavailable for test: {exc}")
+
+            subfile.unlink()
+            ctx = dr.collect_repo_context(root, 0)
+            self.assertTrue(dr._resolve_repo_candidate("output/", "README.md", ctx))
+            self.assertFalse(dr._resolve_repo_candidate("sub/", "README.md", ctx))
+            hints = dr.extract_missing_path_hints(
+                (root / "README.md").read_text(encoding="utf-8"),
+                "README.md",
+                ctx,
+            )
+            self.assertEqual(hints, ["sub/"])
 
 
 if __name__ == "__main__":

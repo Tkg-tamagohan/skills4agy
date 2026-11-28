@@ -1302,10 +1302,14 @@ class UpgradeFeaturesTests(unittest.TestCase):
             assert proc.stdout is not None and proc.stderr is not None
             proc.stdout.read(1)
             proc.stdout.close()
-            stderr_bytes = proc.stderr.read()
-            proc.stderr.close()
-            rc = proc.wait(timeout=10)
-            self.assertEqual(rc, 0, msg=stderr_bytes.decode("utf-8", errors="replace"))
+            proc.stdout = None
+            try:
+                _, stderr_bytes = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _, stderr_bytes = proc.communicate()
+                raise
+            self.assertEqual(proc.returncode, 0, msg=stderr_bytes.decode("utf-8", errors="replace"))
             self.assertEqual(stderr_bytes, b"")
 
     def test_SDD_27_backlog_checkbox_immediately_after_table_preserved(self) -> None:

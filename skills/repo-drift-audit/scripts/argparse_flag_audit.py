@@ -78,17 +78,42 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
     except (OSError, SyntaxError):
         return set(), {}
 
-    funcs_by_name: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            funcs_by_name[node.name] = node
+    funcs_by_name: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = defaultdict(list)
+
+    def _collect_functions(stmts: list[ast.stmt]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                funcs_by_name[stmt.name].append(stmt)
+                _collect_functions(stmt.body)
+            elif isinstance(stmt, ast.ClassDef):
+                _collect_functions(stmt.body)
+            elif isinstance(stmt, ast.If):
+                _collect_functions(stmt.body)
+                _collect_functions(stmt.orelse)
+            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                _collect_functions(stmt.body)
+                _collect_functions(stmt.orelse)
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                _collect_functions(stmt.body)
+            elif isinstance(stmt, ast.Try):
+                _collect_functions(stmt.body)
+                _collect_functions(stmt.orelse)
+                _collect_functions(stmt.finalbody)
+                for handler in stmt.handlers:
+                    _collect_functions(handler.body)
+
+    _collect_functions(tree.body)
+    all_functions = [fn for fn_list in funcs_by_name.values() for fn in fn_list]
 
     flags_by_tag: dict[str, set[str]] = defaultdict(set)
     subcommand_names: set[str] = set()
     subparser_roots: set[str] = set()
     parent_edges: dict[str, set[str]] = defaultdict(set)
+    parent_sources: set[str] = set()
+    resolved_func_ids: set[int] = set()
     parser_counter = 0
-    visited_calls: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+    active_calls: set[tuple[int, tuple[tuple[str, str], ...]]] = set()
+    completed_returns: dict[tuple[int, tuple[tuple[str, str], ...]], str | None] = {}
 
     def new_parser_tag() -> str:
         nonlocal parser_counter
@@ -102,6 +127,32 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
                     ptag = eval_expr(elem, env)
                     if ptag is not None:
                         parent_edges[target_tag].add(ptag)
+                        parent_sources.add(ptag)
+
+    def _bind_and_call(
+        callee: ast.FunctionDef | ast.AsyncFunctionDef,
+        expr: ast.Call,
+        env: dict[str, str],
+        *,
+        skip_self_cls: bool = False,
+    ) -> str | None:
+        bound: dict[str, str] = {}
+        pos_names = [a.arg for a in callee.args.posonlyargs] + [a.arg for a in callee.args.args]
+        if skip_self_cls and pos_names and pos_names[0] in ("self", "cls"):
+            pos_names = pos_names[1:]
+        for idx, arg_node in enumerate(expr.args):
+            if idx < len(pos_names):
+                arg_tag = eval_expr(arg_node, env)
+                if arg_tag is not None:
+                    bound[pos_names[idx]] = arg_tag
+        for kw in expr.keywords:
+            if kw.arg is not None:
+                arg_tag = eval_expr(kw.value, env)
+                if arg_tag is not None:
+                    bound[kw.arg] = arg_tag
+        if any(not v.startswith("param:") for v in bound.values()):
+            resolved_func_ids.add(id(callee))
+        return run_function(callee, bound)
 
     def eval_expr(expr: ast.AST | None, env: dict[str, str]) -> str | None:
         if expr is None:
@@ -138,26 +189,22 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
                 target = owner_tag if owner_tag is not None else "unknown:root"
                 flags_by_tag[target].update(_extract_long_flags_from_call(expr))
                 return None
+            cands = funcs_by_name.get(attr, [])
+            if len(cands) == 1:
+                return _bind_and_call(cands[0], expr, env, skip_self_cls=True)
+            for arg_node in expr.args:
+                eval_expr(arg_node, env)
+            for kw in expr.keywords:
+                eval_expr(kw.value, env)
+            return None
 
         if isinstance(func, ast.Name):
             if func.id == "add_argument":
                 flags_by_tag["unknown:root"].update(_extract_long_flags_from_call(expr))
                 return None
-            callee = funcs_by_name.get(func.id)
-            if callee is not None:
-                bound: dict[str, str] = {}
-                pos_names = [a.arg for a in callee.args.posonlyargs] + [a.arg for a in callee.args.args]
-                for idx, arg_node in enumerate(expr.args):
-                    if idx < len(pos_names):
-                        arg_tag = eval_expr(arg_node, env)
-                        if arg_tag is not None:
-                            bound[pos_names[idx]] = arg_tag
-                for kw in expr.keywords:
-                    if kw.arg is not None:
-                        arg_tag = eval_expr(kw.value, env)
-                        if arg_tag is not None:
-                            bound[kw.arg] = arg_tag
-                return run_function(callee, bound)
+            cands = funcs_by_name.get(func.id, [])
+            if len(cands) == 1:
+                return _bind_and_call(cands[0], expr, env, skip_self_cls=False)
             for arg_node in expr.args:
                 eval_expr(arg_node, env)
             for kw in expr.keywords:
@@ -218,27 +265,38 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
         fn: ast.FunctionDef | ast.AsyncFunctionDef,
         bound: dict[str, str],
     ) -> str | None:
-        key = (fn.name, tuple(sorted(bound.items())))
-        if key in visited_calls:
+        key = (id(fn), tuple(sorted(bound.items())))
+        if key in completed_returns:
+            return completed_returns[key]
+        if key in active_calls:
             return None
-        visited_calls.add(key)
-        local_env: dict[str, str] = {}
-        all_params = (
-            [a.arg for a in fn.args.posonlyargs]
-            + [a.arg for a in fn.args.args]
-            + [a.arg for a in fn.args.kwonlyargs]
-        )
-        for p in all_params:
-            if p in bound:
-                local_env[p] = bound[p]
-            else:
-                local_env[p] = f"param:{fn.name}:{p}"
-        return walk_stmts(fn.body, local_env)
+        active_calls.add(key)
+        try:
+            local_env: dict[str, str] = {}
+            all_params = (
+                [a.arg for a in fn.args.posonlyargs]
+                + [a.arg for a in fn.args.args]
+                + [a.arg for a in fn.args.kwonlyargs]
+            )
+            for p in all_params:
+                if p in bound:
+                    local_env[p] = bound[p]
+                else:
+                    local_env[p] = f"param:{id(fn)}:{p}"
+            ret = walk_stmts(fn.body, local_env)
+        finally:
+            active_calls.discard(key)
+        completed_returns[key] = ret
+        return ret
 
     top_env: dict[str, str] = {}
-    top_stmts = [n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    top_stmts = [
+        n
+        for n in tree.body
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
     walk_stmts(top_stmts, top_env)
-    for fn in funcs_by_name.values():
+    for fn in all_functions:
         run_function(fn, {})
 
     def collect_inherited(tag: str, seen: set[str] | None = None) -> set[str]:
@@ -255,17 +313,23 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
     for sub_name in sorted(subcommand_names):
         subcommand_flags[sub_name] = collect_inherited(f"sub:{sub_name}")
 
+    unresolved_param_prefixes = tuple(
+        f"param:{id(fn)}:" for fn in all_functions if id(fn) not in resolved_func_ids
+    )
     root_flags: set[str] = set(flags_by_tag.get("unknown:root", set()))
+    for tag, fls in flags_by_tag.items():
+        if tag.startswith("param:") and tag.startswith(unresolved_param_prefixes):
+            root_flags.update(fls)
+
     if subcommand_names:
         for rtag in subparser_roots:
             root_flags.update(collect_inherited(rtag))
-        if not subparser_roots:
-            for tag, fls in flags_by_tag.items():
-                if tag.startswith("parser:"):
-                    root_flags.update(fls)
+        for tag, fls in flags_by_tag.items():
+            if tag.startswith("parser:") and tag not in parent_sources and tag not in subparser_roots:
+                root_flags.update(fls)
     else:
         for tag, fls in flags_by_tag.items():
-            if not tag.startswith("sub:"):
+            if not tag.startswith("sub:") and not tag.startswith("param:"):
                 root_flags.update(fls)
 
     return root_flags, subcommand_flags
@@ -306,6 +370,45 @@ def _detect_subcommand_after_script(
             return None
         return tok if tok in subcmds else None
     return None
+
+
+def _split_shell_segments(text: str) -> list[str]:
+    """引用符外のシェル演算子（&&, ||, ;, |）でコマンド文字列をコマンド単位に分割する。"""
+    segments: list[str] = []
+    buf: list[str] = []
+    in_quote: str | None = None
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_quote is not None:
+            buf.append(ch)
+            if ch == "\\" and in_quote == '"' and i + 1 < n:
+                i += 1
+                buf.append(text[i])
+            elif ch == in_quote:
+                in_quote = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if text[i : i + 2] in ("&&", "||"):
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in (";", "|"):
+            segments.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [seg for seg in segments if seg.strip()]
 
 
 def _scan_doc_flags_from_lines(
@@ -357,27 +460,30 @@ def _scan_doc_flags_from_lines(
                             active_script = None
                             active_subcmd = None
                             continue
-                        matched = detect_scripts(b_line)
-                        if len(matched) == 1:
-                            active_script = matched[0]
-                            sub_set = (
-                                known_subcommands.get(active_script, set())
-                                if known_subcommands
-                                else set()
-                            )
-                            active_subcmd = _detect_subcommand_after_script(
-                                b_line, pattern_by_name[active_script], sub_set
-                            )
-                        elif len(matched) > 1:
-                            # 1 行に複数スクリプトが混在する場合は誤帰属を避けてリセット
-                            active_script = None
-                            active_subcmd = None
-                        if active_script is not None and (
-                            matched or stripped.startswith("--")
-                        ):
-                            result[active_script][active_subcmd].update(
-                                LONG_FLAG_RE.findall(strip_quoted_arg_values(b_line))
-                            )
+                        segs = _split_shell_segments(b_line)
+                        for seg_idx, seg in enumerate(segs):
+                            seg_stripped = seg.strip()
+                            matched = detect_scripts(seg)
+                            if len(matched) == 1:
+                                active_script = matched[0]
+                                sub_set = (
+                                    known_subcommands.get(active_script, set())
+                                    if known_subcommands
+                                    else set()
+                                )
+                                active_subcmd = _detect_subcommand_after_script(
+                                    seg, pattern_by_name[active_script], sub_set
+                                )
+                            elif len(matched) > 1 or seg_idx > 0:
+                                # 1 セグメントに複数スクリプト混在、または別コマンド連結時は誤帰属を避けてリセット
+                                active_script = None
+                                active_subcmd = None
+                            if active_script is not None and (
+                                matched or seg_stripped.startswith("--")
+                            ):
+                                result[active_script][active_subcmd].update(
+                                    LONG_FLAG_RE.findall(strip_quoted_arg_values(seg))
+                                )
                         if not stripped.endswith(("`", "\\")):
                             active_script = None
                             active_subcmd = None
@@ -390,21 +496,22 @@ def _scan_doc_flags_from_lines(
             block_buf.append(line)
         else:
             # 地の文では単一スクリプト名を含むインラインコード片のみから抽出する
-            for seg in BACKTICK_PATH_RE.findall(line):
-                matched = detect_scripts(seg)
-                if len(matched) == 1:
-                    sname = matched[0]
-                    sub_set = (
-                        known_subcommands.get(sname, set())
-                        if known_subcommands
-                        else set()
-                    )
-                    subcmd = _detect_subcommand_after_script(
-                        seg, pattern_by_name[sname], sub_set
-                    )
-                    result[sname][subcmd].update(
-                        LONG_FLAG_RE.findall(strip_quoted_arg_values(seg))
-                    )
+            for inline_seg in BACKTICK_PATH_RE.findall(line):
+                for sub_seg in _split_shell_segments(inline_seg):
+                    matched = detect_scripts(sub_seg)
+                    if len(matched) == 1:
+                        sname = matched[0]
+                        sub_set = (
+                            known_subcommands.get(sname, set())
+                            if known_subcommands
+                            else set()
+                        )
+                        subcmd = _detect_subcommand_after_script(
+                            sub_seg, pattern_by_name[sname], sub_set
+                        )
+                        result[sname][subcmd].update(
+                            LONG_FLAG_RE.findall(strip_quoted_arg_values(sub_seg))
+                        )
     return {sn: dict(sub_map) for sn, sub_map in result.items()}
 
 

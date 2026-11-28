@@ -892,7 +892,10 @@ def _resolve_repo_candidate(candidate: str, doc_relpath: str, ctx: RepoContext) 
                             if any(not is_reparse_or_symlink(p) for p in target_disk.iterdir()):
                                 return True
                         except OSError:
-                            pass
+                            continue
+                        dir_prefix = rel.rstrip("/") + "/"
+                        if not any(f.startswith(dir_prefix) for f in ctx.repo_files):
+                            return True
             continue
 
         if rel in ctx.repo_files_set:
