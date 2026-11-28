@@ -862,6 +862,12 @@ class TestAuditSkillsWeekly(unittest.TestCase):
             copied_scripts.mkdir(parents=True)
             shutil.copy2(SCRIPT_DIR / "audit_skills_weekly.py", copied_scripts / "audit_skills_weekly.py")
             shutil.copy2(SCRIPT_DIR / "check_plugin.py", copied_scripts / "check_plugin.py")
+            copied_drift_scripts = root / "skills" / "repo-drift-audit" / "scripts"
+            copied_drift_scripts.mkdir(parents=True)
+            shutil.copy2(
+                SCRIPT_DIR.parents[1] / "repo-drift-audit" / "scripts" / "argparse_flag_audit.py",
+                copied_drift_scripts / "argparse_flag_audit.py",
+            )
             _build_fixture_repo(root)
 
             env = os.environ.copy()
@@ -890,6 +896,7 @@ class TestAuditSkillsWeekly(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertFalse((copied_scripts / "__pycache__").exists())
+            self.assertFalse((copied_drift_scripts / "__pycache__").exists())
 
             with mock.patch.object(asw.subprocess, "run") as mock_run:
                 mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
@@ -942,6 +949,94 @@ class TestAuditSkillsWeekly(unittest.TestCase):
         self.assertEqual(asw.main(["--days", "0"]), 2)
         self.assertEqual(asw.main(["--days", "10", "--window-days", "5"]), 2)
         self.assertEqual(asw.main(["--now", "2026-11-27T00:00:00"]), 2)
+
+    def test_shared_argparse_flag_audit_delegation_and_divergence(self) -> None:
+        """ASW-01: argparse_flag_audit への委譲と連結・エスケープ・引用・--help を含む乖離検出を検証する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "skills" / "demo-skill"
+            tool_a = skill_dir / "scripts" / "tool_a.py"
+            tool_b = skill_dir / "scripts" / "tool_b.py"
+            _write_text(
+                tool_a,
+                "import argparse\n\n"
+                "def main():\n"
+                "    p = argparse.ArgumentParser()\n"
+                "    p.add_argument('--alpha')\n"
+                "    p.add_argument('--format')\n"
+                "    return 0\n",
+            )
+            _write_text(
+                tool_b,
+                "import argparse\n\n"
+                "def main():\n"
+                "    p = argparse.ArgumentParser()\n"
+                "    p.add_argument('--beta')\n"
+                "    return 0\n",
+            )
+            _write_text(
+                skill_dir / "SKILL.md",
+                "---\nname: demo-skill\ndescription: 共有ヘルパ検証用スキル。\n---\n\n"
+                "# Demo\n\n"
+                "```bash\n"
+                'python tool_a.py --alpha --format "x --fake-in-dq" \'y --fake-in-sq\' --help && python tool_b.py --beta\n'
+                "python tool_a.py --alpha; python tool_a.py --bogus-chained\n"
+                "python tool_a.py --format json \\| grep ok --bogus-after-escaped-pipe\n"
+                "```\n\n"
+                "補足: `python tool_b.py --help` と `python tool_b.py --bogus-inline` を参照。\n",
+            )
+            _write_text(
+                skill_dir / "references" / "extra.md",
+                "詳細: `python tool_a.py --bogus-ref`\n",
+            )
+
+            with (
+                mock.patch.object(
+                    asw.argparse_flag_audit,
+                    "extract_argparse_flags",
+                    wraps=asw.argparse_flag_audit.extract_argparse_flags,
+                ) as spy_extract_ast,
+                mock.patch.object(
+                    asw.argparse_flag_audit,
+                    "strip_quoted_arg_values",
+                    wraps=asw.argparse_flag_audit.strip_quoted_arg_values,
+                ) as spy_strip,
+                mock.patch.object(
+                    asw.argparse_flag_audit,
+                    "extract_doc_flags_by_script",
+                    wraps=asw.argparse_flag_audit.extract_doc_flags_by_script,
+                ) as spy_extract_doc,
+            ):
+                stripped = asw._strip_quoted_arg_values('python tool_a.py --msg "a --inside" \'b --sq\' --outer')
+                self.assertEqual(stripped, "python tool_a.py --msg \"\" '' --outer")
+                self.assertEqual(spy_strip.call_count, 1)
+
+                skills, _, _ = asw.collect_inventory(
+                    root,
+                    now_dt=asw.parse_iso_datetime("2026-11-27T12:00:00Z"),
+                    use_git=False,
+                )
+                self.assertEqual(spy_extract_ast.call_count, 2)
+                self.assertEqual(spy_extract_doc.call_count, 1)
+                passed_md_paths, passed_names = spy_extract_doc.call_args[0]
+                self.assertEqual(
+                    passed_md_paths,
+                    sorted(skill_dir.rglob("*.md")),
+                )
+                self.assertEqual(passed_names, {"tool_a.py", "tool_b.py"})
+
+            self.assertEqual(len(skills), 1)
+            demo = skills[0]
+            self.assertEqual(demo.implemented_flags, ["--alpha", "--beta", "--format"])
+            self.assertEqual(
+                demo.doc_only_flags,
+                [
+                    "tool_a.py:--bogus-after-escaped-pipe",
+                    "tool_a.py:--bogus-chained",
+                    "tool_a.py:--bogus-ref",
+                    "tool_b.py:--bogus-inline",
+                ],
+            )
 
 
 if __name__ == "__main__":
