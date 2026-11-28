@@ -311,6 +311,87 @@ class ArgparseFlagAuditTests(unittest.TestCase):
             )
             self.assertEqual(afa.find_doc_only_flags_in_text(doc_ok, [cli]), [])
 
+    def test_AFA_12_module_func_isolated_from_unrelated_class_method_collision(self) -> None:
+        """AFA-12: 同名クラスメソッド Other.configure() があってもモジュール関数 configure(alpha) を誤帰属させない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "scoped.py"
+            cli.write_text(
+                "import argparse\n\n"
+                "class Other:\n"
+                "    def configure(self) -> None:\n"
+                "        pass\n\n"
+                "def configure(p: argparse.ArgumentParser) -> None:\n"
+                "    p.add_argument('--alpha-only')\n\n"
+                "def build() -> argparse.ArgumentParser:\n"
+                "    root_p = argparse.ArgumentParser()\n"
+                "    subs = root_p.add_subparsers(dest='cmd')\n"
+                "    alpha = subs.add_parser('alpha')\n"
+                "    configure(alpha)\n"
+                "    beta = subs.add_parser('beta')\n"
+                "    beta.add_argument('--beta-only')\n"
+                "    return root_p\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text("`scoped.py alpha --alpha-only`", [cli]),
+                [],
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text("`scoped.py beta --alpha-only`", [cli]),
+                ["scoped.py:--alpha-only"],
+            )
+
+    def test_AFA_13_nested_closure_preserves_outer_subparser_binding(self) -> None:
+        """AFA-13: ネスト関数が外側のサブパーサー変数 alpha をクロージャ参照しても他サブコマンドへ漏れない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "closure_cli.py"
+            cli.write_text(
+                "import argparse\n\n"
+                "def build() -> argparse.ArgumentParser:\n"
+                "    root_p = argparse.ArgumentParser()\n"
+                "    subs = root_p.add_subparsers(dest='cmd')\n"
+                "    alpha = subs.add_parser('alpha')\n"
+                "    beta = subs.add_parser('beta')\n"
+                "    beta.add_argument('--beta-only')\n"
+                "    def configure() -> None:\n"
+                "        alpha.add_argument('--alpha-only')\n"
+                "    configure()\n"
+                "    return root_p\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text("`closure_cli.py alpha --alpha-only`", [cli]),
+                [],
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text("`closure_cli.py beta --alpha-only`", [cli]),
+                ["closure_cli.py:--alpha-only"],
+            )
+
+    def test_AFA_14_escaped_pipe_and_semicolon_do_not_split_flags(self) -> None:
+        """AFA-14: バックスラッシュエスケープされた \\| や \\; で分割せず後続の不在フラグを検出する。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = root / "tool.py"
+            cli.write_text(
+                "import argparse\n"
+                "p = argparse.ArgumentParser()\n"
+                "p.add_argument('--pattern')\n",
+                encoding="utf-8",
+            )
+            doc_text = (
+                "```bash\n"
+                "python tool.py --pattern foo\\|bar --typo\n"
+                "```\n"
+                "Inline: `tool.py --pattern foo\\;bar --typo-inline`\n"
+            )
+            self.assertEqual(
+                afa.find_doc_only_flags_in_text(doc_text, [cli]),
+                ["tool.py:--typo", "tool.py:--typo-inline"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

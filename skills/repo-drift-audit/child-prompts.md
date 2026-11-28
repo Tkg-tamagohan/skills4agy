@@ -105,8 +105,8 @@ Confirm the target locations on the current branch before editing.
 - Do not fix real bugs outside your scope; report them to the parent in `notes`
 
 ## Completion Criteria
-- Commit your track's changes on `audit/<slug>` (and create a PR if instructed) and record test results
-- Return `{summary, branch_or_pr, test_status, notes, blockers}` via `finish` (all JSON summary strings in Japanese, following `japanese-tech-writing`)
+- Commit your track's changes on `audit/<slug>`, then either create a PR or push the branch via `git push -u origin audit/<slug>` (unpushed local commits inside an isolated clone cannot be referenced directly from the parent repository) and record test results
+- Return `{summary, branch_or_pr, test_status, notes, blockers}` via `finish` (set `branch_or_pr` to the pushed remote branch or PR URL; all JSON summary strings in Japanese, following `japanese-tech-writing`)
 ```
 
 ### モード B プロンプト定型（`workspace="share"` のローカル専用ブランチ、または単一ワークスペースの未コミット返却）
@@ -131,7 +131,7 @@ Confirm the target locations on the current branch before editing.
 - Do not fix real bugs outside your scope; report them to the parent in `notes`
 
 ## Completion Criteria
-- In `workspace="share"`, commit on `<worker_branch>` without pushing and set `branch_or_pr` to `<worker_branch>` (post-workflow branch visibility to the parent is runtime-dependent, so complete any cross-track integration inside the workflow if required); in single-workspace sequential mode, leave edits uncommitted and set `branch_or_pr` to `"working-tree (uncommitted)"`
+- In `workspace="share"`, commit on `<worker_branch>` without pushing and set `branch_or_pr` to `<worker_branch>` for the post-`parallel()` integration and verification agent in the same `run_workflow` (which merges or cherry-picks each `<worker_branch>` into an integration branch, runs integration tests, and returns `{integrated_branch, merge_status, test_status}` to the parent); in single-workspace sequential mode, leave edits uncommitted and set `branch_or_pr` to `"working-tree (uncommitted)"`
 - Return `{summary, branch_or_pr, test_status, notes, blockers}` via `finish` (list edited files and test results; write all JSON strings in Japanese, following `japanese-tech-writing`)
 ```
 
@@ -155,10 +155,10 @@ IMPL_SCHEMA = {
 
 - 計画フェーズは読み取り中心のため `workspace="inherit"`（または `invoke_subagent` の `TypeName="research"`）でよい。
 - 計画ワーカーの `finish` 出力からユーザーが採択した項目（いずれも `verdict == "confirmed"`）だけを抽出した JSON 配列を `preflight_drift.py plan-tracks` へ渡し、`target_files` 連結成分から排他トラックを算出する。
-- `workspace="branch"` はリポジトリの完全独立クローンをワーカーごとに作成するため、並列ブランチ作成（`audit/<slug>`）、コミット、PR 作成が他ワーカーの作業や `.git` と干渉せず、結果から確定ブランチや PR として回収できる。
+- `workspace="branch"` はリポジトリの完全独立クローンをワーカーごとに作成するため、並列ブランチ作成（`audit/<slug>`）、コミット、push、PR 作成が他ワーカーの作業や `.git` と干渉せず、PR または `git push -u origin audit/<slug>` 済みリモートブランチから親が確定ブランチを回収できる（一時クローン内の未 push ローカルコミットのみでは親リポジトリから直接参照できない）。
   並列ブランチ運用は `workspace="branch"`（モード A）へ統一して既定とする。
 - `workspace="share"` は作業ツリーを分離しつつ下層 `.git` を共有するため、ワーカー同士が同一ブランチを更新したり push したりすると競合を招きやすい。
-  `workspace="share"` でワーカー専用のローカル作業ブランチへコミットする方式（モード B、push と PR 作成は禁止）を採る場合、`run_workflow` 終了後にワーカーのローカルブランチが親から参照できるかは実行基盤依存で未検証のため、ワークフロー内で統合検証まで行うか、確認が必要な場合は `workspace="branch"` または単一ワークスペースでの順次実行（未コミット編集を親の作業ツリーへ残して返却）を選ぶ。
+  `workspace="share"` でワーカー専用のローカル作業ブランチへコミットする方式（モード B、push と PR 作成は禁止）を採る場合、`run_workflow` 終了後にワーカーのローカルブランチが親から参照できるかは実行基盤依存で未検証のため、同 `run_workflow` の `parallel()` 後段に統合と検証の担当エージェント（各ワーカーの `<worker_branch>` を統合ブランチへマージまたは `cherry-pick` し、統合テストを実行して `{integrated_branch, merge_status, test_status}` を親へ返す役割）を設けるか、確認が必要な場合は `workspace="branch"` または単一ワークスペースでの順次実行（未コミット編集を親の作業ツリーへ残して返却）を選ぶ。
 - ワークフローのワーカーは親とコンテキストを共有しないため、対象リポジトリパス、共通規約、および実装フェーズでは計画ワーカーが返した確定済み `plan_path` を親がプロンプト本文へ展開して渡す（計画書の保存先は計画ワーカー自身が `<Worker Artifact Directory>/scratch/plans/<slug>.md` を解決し、保存した実在の絶対パスを `plan_path` で返す）。
 - 親は集約時に各計画ワーカーの `plan_path` を実際に読み取れることを確認し、`workspace="branch"` 等の環境制約により実装ワーカーが他ワーカーの Artifact ディレクトリを `read_file` で直接読めない場合は、確定済み計画書を親の `<Artifact Directory Path>/scratch/plans/` へ複製して渡すか、計画本文を実装ワーカーのプロンプトへ直接展開する。
-- 実装フェーズで `workspace="branch"`（モード A）によりワーカーが作成したブランチや PR は、ワークフロー終了後に親が差分とテスト結果を確認して統合する（`workspace="share"` の場合はワークフロー内で統合検証まで終えた結果を確認する）。
+- 実装フェーズで `workspace="branch"`（モード A）によりワーカーが作成したリモートブランチや PR は、ワークフロー終了後に親が差分とテスト結果を確認して統合する（`workspace="share"` の場合は後段の統合と検証担当エージェントが返した `{integrated_branch, merge_status, test_status}` を確認する）。

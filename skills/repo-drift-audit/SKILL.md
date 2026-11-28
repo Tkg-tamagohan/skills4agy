@@ -90,12 +90,12 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scrip
 5. 実装フェーズでは算出済みの排他ファイル境界に沿って、採択項目を 1 ワーカー 1 トラックで並列に実装させる。
    - 他トラック所有のファイルを変更せずに済むか検討し、避けられない呼び出しは公開シグネチャを維持したファサード化（薄い委譲層の追加）で吸収する指定を計画へ入れる。
    - 並列実装の既定（モード A）は `run_workflow` の `parallel()` で `agent(..., workspace="branch")` を指定する。
-     完全独立クローン上で専用ブランチ `audit/<slug>` を作成し、編集、テスト、コミット、必要に応じた PR 作成まで完結して結果から確定ブランチや PR として回収する。
-   - 代替のモード B として `workspace="share"`（作業ツリーを分離し下層 `.git` を共有）でワーカー専用のローカル作業ブランチへコミットする方式を採る場合、`run_workflow` 終了後にワーカーのローカルブランチが親から参照できるかは実行基盤依存で未検証のため、ワークフロー内で統合検証まで行うか、確実な回収が要る場合は `workspace="branch"` を使う。
+     完全独立クローン上で専用ブランチ `audit/<slug>` を作成し、編集、テスト、コミットを行ったうえで PR を作成するか、PR を作らない場合は `git push -u origin audit/<slug>` を必須とする（一時クローン内の未 push ローカルコミットのみでは親リポジトリから直接参照できないため、親はリモートブランチまたは PR から確定ブランチを回収する）。
+   - 代替のモード B として `workspace="share"`（作業ツリーを分離し下層 `.git` を共有）でワーカー専用のローカル作業ブランチへコミットする方式を採る場合、`run_workflow` 終了後にワーカーのローカルブランチが親から参照できるかは実行基盤依存で未検証のため、`run_workflow` の `parallel()` 後段に統合と検証の担当エージェントを設けて各 `<worker_branch>` を統合ブランチへマージまたは `cherry-pick` し、統合テストを実行して `{integrated_branch, merge_status, test_status}` を親へ返させる（確実な回収が要る場合は `workspace="branch"` を使う）。
      単一ワークスペースで親が順次統合する場合はブランチ切替、コミット、push を禁止し、未コミット編集とテスト結果を親へ返させる。
    - 計画書の絶対パスをプロンプトで渡し、`child-prompts.md` の該当モード定型に沿って lint、typecheck、test の全パス、および `finish` スキーマ（`{summary, branch_or_pr, test_status, notes, blockers}`）での報告を完了条件にする。
    - 各トラックのコミットや PR 作成前には、任意で `invariant-gate`（`check_invariants_decision1.py`）を併用して実装差分の規約違反を確認できる。
-6. 各ワーカーの出力を回収し、ブランチの統合（または PR 一覧、モード B の単一ワークスペース順次実行では差分検証と順次コミット、`workspace="share"` はワークフロー内統合検証の回収結果確認）と、見送った事項に先送り理由と再検討条件を添えた残課題をユーザーへ報告する。
+6. 各ワーカーの出力を回収し、ブランチの統合（または PR 一覧、モード B の単一ワークスペース順次実行では差分検証と順次コミット、`workspace="share"` は後段の統合と検証担当が返した `{integrated_branch, merge_status, test_status}` の確認）と、見送った事項に先送り理由と再検討条件を添えた残課題をユーザーへ報告する。
 
 ## 設計の要点
 
@@ -107,8 +107,8 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/repo-drift-audit/scrip
 - 複数トラックが同じファイルの別箇所を触る必要がある場合は `plan-tracks` で同一トラックへ統合され、集約書に共有ファイル衝突理由と統合順を添える。
 - PR やコード変更以外の作業（プラグイン設定の更新、外部サービスの設定変更、ユーザー確認が必要な作業）はワーカーに振らず親エージェントが直接行う。
 - 計画書は各計画ワーカー自身の `<Worker Artifact Directory>/scratch/plans/` へ、集約書は親の `<Artifact Directory Path>/` へそれぞれ置き、作業対象リポジトリに一時計画書を残さない。
-- `workspace="branch"` でワーカーが作成した確定ブランチや PR は、親が差分とテスト結果を確認して統合または PR レビューへ進める。
-  `workspace="share"` ではワークフロー終了後に親がワーカーのローカルブランチを参照できるかは実行基盤依存で未検証なため、ワークフロー内で統合検証まで終える用途に限り、親の手元で回収と統合を行う場合は `workspace="branch"` か単一ワークスペースの順次実行を選ぶ。
+- `workspace="branch"` でワーカーが push したリモートブランチや作成した PR は、親が差分とテスト結果を確認して統合または PR レビューへ進める。
+  `workspace="share"` ではワークフロー終了後に親がワーカーのローカルブランチを参照できるかは実行基盤依存で未検証なため、`run_workflow` の `parallel()` 後段に統合と検証の担当エージェントを置いて統合ブランチへマージまたは `cherry-pick` し `{integrated_branch, merge_status, test_status}` を回収する用途に限り、親の手元で回収と統合を行う場合は `workspace="branch"` か単一ワークスペースの順次実行を選ぶ。
 
 ## リファクタ系トラックの検証技法
 

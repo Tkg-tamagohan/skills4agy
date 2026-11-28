@@ -78,32 +78,82 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
     except (OSError, SyntaxError):
         return set(), {}
 
-    funcs_by_name: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = defaultdict(list)
+    module_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    class_methods: dict[str, dict[str, ast.FunctionDef | ast.AsyncFunctionDef]] = defaultdict(dict)
+    all_nested_funcs: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
 
-    def _collect_functions(stmts: list[ast.stmt]) -> None:
+    def _collect_nested_only(stmts: list[ast.stmt]) -> None:
         for stmt in stmts:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                funcs_by_name[stmt.name].append(stmt)
-                _collect_functions(stmt.body)
+                all_nested_funcs.append(stmt)
+                _collect_nested_only(stmt.body)
             elif isinstance(stmt, ast.ClassDef):
-                _collect_functions(stmt.body)
+                _collect_nested_only(stmt.body)
             elif isinstance(stmt, ast.If):
-                _collect_functions(stmt.body)
-                _collect_functions(stmt.orelse)
+                _collect_nested_only(stmt.body)
+                _collect_nested_only(stmt.orelse)
             elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-                _collect_functions(stmt.body)
-                _collect_functions(stmt.orelse)
+                _collect_nested_only(stmt.body)
+                _collect_nested_only(stmt.orelse)
             elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-                _collect_functions(stmt.body)
+                _collect_nested_only(stmt.body)
             elif isinstance(stmt, ast.Try):
-                _collect_functions(stmt.body)
-                _collect_functions(stmt.orelse)
-                _collect_functions(stmt.finalbody)
+                _collect_nested_only(stmt.body)
+                _collect_nested_only(stmt.orelse)
+                _collect_nested_only(stmt.finalbody)
                 for handler in stmt.handlers:
-                    _collect_functions(handler.body)
+                    _collect_nested_only(handler.body)
 
-    _collect_functions(tree.body)
-    all_functions = [fn for fn_list in funcs_by_name.values() for fn in fn_list]
+    def _collect_class_methods(cls_name: str, stmts: list[ast.stmt]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                class_methods[cls_name][stmt.name] = stmt
+                _collect_nested_only(stmt.body)
+            elif isinstance(stmt, ast.ClassDef):
+                _collect_class_methods(stmt.name, stmt.body)
+            elif isinstance(stmt, ast.If):
+                _collect_class_methods(cls_name, stmt.body)
+                _collect_class_methods(cls_name, stmt.orelse)
+            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                _collect_class_methods(cls_name, stmt.body)
+                _collect_class_methods(cls_name, stmt.orelse)
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                _collect_class_methods(cls_name, stmt.body)
+            elif isinstance(stmt, ast.Try):
+                _collect_class_methods(cls_name, stmt.body)
+                _collect_class_methods(cls_name, stmt.orelse)
+                _collect_class_methods(cls_name, stmt.finalbody)
+                for handler in stmt.handlers:
+                    _collect_class_methods(cls_name, handler.body)
+
+    def _collect_module_callables(stmts: list[ast.stmt]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                module_funcs[stmt.name] = stmt
+                _collect_nested_only(stmt.body)
+            elif isinstance(stmt, ast.ClassDef):
+                _collect_class_methods(stmt.name, stmt.body)
+            elif isinstance(stmt, ast.If):
+                _collect_module_callables(stmt.body)
+                _collect_module_callables(stmt.orelse)
+            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                _collect_module_callables(stmt.body)
+                _collect_module_callables(stmt.orelse)
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                _collect_module_callables(stmt.body)
+            elif isinstance(stmt, ast.Try):
+                _collect_module_callables(stmt.body)
+                _collect_module_callables(stmt.orelse)
+                _collect_module_callables(stmt.finalbody)
+                for handler in stmt.handlers:
+                    _collect_module_callables(handler.body)
+
+    _collect_module_callables(tree.body)
+    all_functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = [
+        *module_funcs.values(),
+        *(m for methods in class_methods.values() for m in methods.values()),
+        *all_nested_funcs,
+    ]
 
     flags_by_tag: dict[str, set[str]] = defaultdict(set)
     subcommand_names: set[str] = set()
@@ -111,20 +161,31 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
     parent_edges: dict[str, set[str]] = defaultdict(set)
     parent_sources: set[str] = set()
     resolved_func_ids: set[int] = set()
+    directly_called_func_ids: set[int] = set()
     parser_counter = 0
-    active_calls: set[tuple[int, tuple[tuple[str, str], ...]]] = set()
-    completed_returns: dict[tuple[int, tuple[tuple[str, str], ...]], str | None] = {}
+    active_calls: set[
+        tuple[int, tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]
+    ] = set()
+    completed_returns: dict[
+        tuple[int, tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]],
+        str | None,
+    ] = {}
 
     def new_parser_tag() -> str:
         nonlocal parser_counter
         parser_counter += 1
         return f"parser:{parser_counter}"
 
-    def _record_parents(target_tag: str, call: ast.Call, env: dict[str, str]) -> None:
+    def _record_parents(
+        target_tag: str,
+        call: ast.Call,
+        env: dict[str, str],
+        lexical_funcs: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]],
+    ) -> None:
         for kw in call.keywords:
             if kw.arg == "parents" and isinstance(kw.value, (ast.List, ast.Tuple)):
                 for elem in kw.value.elts:
-                    ptag = eval_expr(elem, env)
+                    ptag = eval_expr(elem, env, lexical_funcs)
                     if ptag is not None:
                         parent_edges[target_tag].add(ptag)
                         parent_sources.add(ptag)
@@ -133,28 +194,41 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
         callee: ast.FunctionDef | ast.AsyncFunctionDef,
         expr: ast.Call,
         env: dict[str, str],
+        lexical_funcs: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]],
         *,
+        closure_env: dict[str, str] | None = None,
         skip_self_cls: bool = False,
+        self_instance_tag: str | None = None,
     ) -> str | None:
         bound: dict[str, str] = {}
         pos_names = [a.arg for a in callee.args.posonlyargs] + [a.arg for a in callee.args.args]
         if skip_self_cls and pos_names and pos_names[0] in ("self", "cls"):
+            if self_instance_tag is not None:
+                bound[pos_names[0]] = self_instance_tag
             pos_names = pos_names[1:]
         for idx, arg_node in enumerate(expr.args):
             if idx < len(pos_names):
-                arg_tag = eval_expr(arg_node, env)
+                arg_tag = eval_expr(arg_node, env, lexical_funcs)
                 if arg_tag is not None:
                     bound[pos_names[idx]] = arg_tag
         for kw in expr.keywords:
             if kw.arg is not None:
-                arg_tag = eval_expr(kw.value, env)
+                arg_tag = eval_expr(kw.value, env, lexical_funcs)
                 if arg_tag is not None:
                     bound[kw.arg] = arg_tag
-        if any(not v.startswith("param:") for v in bound.values()):
+        closure_snap = dict(closure_env) if closure_env else {}
+        directly_called_func_ids.add(id(callee))
+        if any(not v.startswith("param:") for v in bound.values()) or any(
+            not v.startswith("param:") for v in closure_snap.values()
+        ):
             resolved_func_ids.add(id(callee))
-        return run_function(callee, bound)
+        return run_function(callee, bound, closure_snap, lexical_funcs)
 
-    def eval_expr(expr: ast.AST | None, env: dict[str, str]) -> str | None:
+    def eval_expr(
+        expr: ast.AST | None,
+        env: dict[str, str],
+        lexical_funcs: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]],
+    ) -> str | None:
         if expr is None:
             return None
         if isinstance(expr, ast.Name):
@@ -164,12 +238,12 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
 
         if _is_argument_parser_init(expr):
             tag = new_parser_tag()
-            _record_parents(tag, expr, env)
+            _record_parents(tag, expr, env, lexical_funcs)
             return tag
 
         func = expr.func
         if isinstance(func, ast.Attribute):
-            owner_tag = eval_expr(func.value, env)
+            owner_tag = eval_expr(func.value, env, lexical_funcs)
             attr = func.attr
             if attr == "add_subparsers":
                 if owner_tag is not None:
@@ -180,7 +254,7 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
                 if sub_name:
                     subcommand_names.add(sub_name)
                     tag = f"sub:{sub_name}"
-                    _record_parents(tag, expr, env)
+                    _record_parents(tag, expr, env, lexical_funcs)
                     return tag
                 return None
             if attr in ("add_argument_group", "add_mutually_exclusive_group"):
@@ -189,74 +263,114 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
                 target = owner_tag if owner_tag is not None else "unknown:root"
                 flags_by_tag[target].update(_extract_long_flags_from_call(expr))
                 return None
-            cands = funcs_by_name.get(attr, [])
-            if len(cands) == 1:
-                return _bind_and_call(cands[0], expr, env, skip_self_cls=True)
+
+            cls_name: str | None = None
+            if isinstance(func.value, ast.Name) and func.value.id in class_methods:
+                cls_name = func.value.id
+            elif owner_tag is not None and owner_tag.startswith("instance:"):
+                cls_name = owner_tag[len("instance:") :]
+
+            if cls_name is not None and attr in class_methods.get(cls_name, {}):
+                return _bind_and_call(
+                    class_methods[cls_name][attr],
+                    expr,
+                    env,
+                    lexical_funcs,
+                    skip_self_cls=True,
+                    self_instance_tag=f"instance:{cls_name}",
+                )
             for arg_node in expr.args:
-                eval_expr(arg_node, env)
+                eval_expr(arg_node, env, lexical_funcs)
             for kw in expr.keywords:
-                eval_expr(kw.value, env)
+                eval_expr(kw.value, env, lexical_funcs)
             return None
 
         if isinstance(func, ast.Name):
             if func.id == "add_argument":
                 flags_by_tag["unknown:root"].update(_extract_long_flags_from_call(expr))
                 return None
-            cands = funcs_by_name.get(func.id, [])
-            if len(cands) == 1:
-                return _bind_and_call(cands[0], expr, env, skip_self_cls=False)
+            if func.id in lexical_funcs:
+                callee, closure_env_ref = lexical_funcs[func.id]
+                return _bind_and_call(
+                    callee,
+                    expr,
+                    env,
+                    lexical_funcs,
+                    closure_env=closure_env_ref,
+                    skip_self_cls=False,
+                )
+            if func.id in module_funcs:
+                return _bind_and_call(
+                    module_funcs[func.id],
+                    expr,
+                    env,
+                    lexical_funcs,
+                    skip_self_cls=False,
+                )
+            if func.id in class_methods:
+                for arg_node in expr.args:
+                    eval_expr(arg_node, env, lexical_funcs)
+                for kw in expr.keywords:
+                    eval_expr(kw.value, env, lexical_funcs)
+                return f"instance:{func.id}"
             for arg_node in expr.args:
-                eval_expr(arg_node, env)
+                eval_expr(arg_node, env, lexical_funcs)
             for kw in expr.keywords:
-                eval_expr(kw.value, env)
+                eval_expr(kw.value, env, lexical_funcs)
             return None
 
         for arg_node in expr.args:
-            eval_expr(arg_node, env)
+            eval_expr(arg_node, env, lexical_funcs)
         for kw in expr.keywords:
-            eval_expr(kw.value, env)
+            eval_expr(kw.value, env, lexical_funcs)
         return None
 
-    def walk_stmts(stmts: list[ast.stmt], env: dict[str, str]) -> str | None:
+    def walk_stmts(
+        stmts: list[ast.stmt],
+        env: dict[str, str],
+        lexical_funcs: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]],
+    ) -> str | None:
         ret_tag: str | None = None
         for stmt in stmts:
-            if isinstance(stmt, ast.Assign):
-                val_tag = eval_expr(stmt.value, env)
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                lexical_funcs[stmt.name] = (stmt, env)
+            elif isinstance(stmt, ast.Assign):
+                val_tag = eval_expr(stmt.value, env, lexical_funcs)
                 if val_tag is not None:
                     for tgt in stmt.targets:
                         if isinstance(tgt, ast.Name):
                             env[tgt.id] = val_tag
             elif isinstance(stmt, ast.AnnAssign):
-                val_tag = eval_expr(stmt.value, env)
+                val_tag = eval_expr(stmt.value, env, lexical_funcs)
                 if val_tag is not None and isinstance(stmt.target, ast.Name):
                     env[stmt.target.id] = val_tag
             elif isinstance(stmt, ast.Expr):
-                eval_expr(stmt.value, env)
+                eval_expr(stmt.value, env, lexical_funcs)
             elif isinstance(stmt, ast.Return):
-                rtag = eval_expr(stmt.value, env)
+                rtag = eval_expr(stmt.value, env, lexical_funcs)
                 if rtag is not None and ret_tag is None:
                     ret_tag = rtag
             elif isinstance(stmt, ast.If):
                 for sub_body in (stmt.body, stmt.orelse):
-                    rtag = walk_stmts(sub_body, env)
+                    rtag = walk_stmts(sub_body, env, lexical_funcs)
                     if rtag is not None and ret_tag is None:
                         ret_tag = rtag
             elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
                 for sub_body in (stmt.body, stmt.orelse):
-                    rtag = walk_stmts(sub_body, env)
+                    rtag = walk_stmts(sub_body, env, lexical_funcs)
                     if rtag is not None and ret_tag is None:
                         ret_tag = rtag
             elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-                rtag = walk_stmts(stmt.body, env)
+                rtag = walk_stmts(stmt.body, env, lexical_funcs)
                 if rtag is not None and ret_tag is None:
                     ret_tag = rtag
             elif isinstance(stmt, ast.Try):
                 for sub_body in (stmt.body, stmt.orelse, stmt.finalbody):
-                    rtag = walk_stmts(sub_body, env)
+                    rtag = walk_stmts(sub_body, env, lexical_funcs)
                     if rtag is not None and ret_tag is None:
                         ret_tag = rtag
                 for h in stmt.handlers:
-                    rtag = walk_stmts(h.body, env)
+                    rtag = walk_stmts(h.body, env, lexical_funcs)
                     if rtag is not None and ret_tag is None:
                         ret_tag = rtag
         return ret_tag
@@ -264,15 +378,22 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
     def run_function(
         fn: ast.FunctionDef | ast.AsyncFunctionDef,
         bound: dict[str, str],
+        closure_env: dict[str, str],
+        parent_lexical: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]],
     ) -> str | None:
-        key = (id(fn), tuple(sorted(bound.items())))
+        key = (
+            id(fn),
+            tuple(sorted(bound.items())),
+            tuple(sorted(closure_env.items())),
+        )
         if key in completed_returns:
             return completed_returns[key]
         if key in active_calls:
             return None
         active_calls.add(key)
         try:
-            local_env: dict[str, str] = {}
+            local_env: dict[str, str] = dict(closure_env)
+            local_lexical = dict(parent_lexical)
             all_params = (
                 [a.arg for a in fn.args.posonlyargs]
                 + [a.arg for a in fn.args.args]
@@ -281,23 +402,39 @@ def extract_argparse_flag_spec(py_path: Path) -> tuple[set[str], dict[str, set[s
             for p in all_params:
                 if p in bound:
                     local_env[p] = bound[p]
-                else:
+                elif p not in local_env:
                     local_env[p] = f"param:{id(fn)}:{p}"
-            ret = walk_stmts(fn.body, local_env)
+            ret = walk_stmts(fn.body, local_env, local_lexical)
         finally:
             active_calls.discard(key)
         completed_returns[key] = ret
         return ret
 
     top_env: dict[str, str] = {}
+    top_lexical: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, str]]] = {}
     top_stmts = [
         n
         for n in tree.body
         if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     ]
-    walk_stmts(top_stmts, top_env)
-    for fn in all_functions:
-        run_function(fn, {})
+    walk_stmts(top_stmts, top_env, top_lexical)
+
+    for fn in module_funcs.values():
+        if id(fn) not in directly_called_func_ids:
+            run_function(fn, {}, {}, {})
+
+    for cls_name, methods in class_methods.items():
+        for m_fn in methods.values():
+            if id(m_fn) not in directly_called_func_ids:
+                pos_names = [a.arg for a in m_fn.args.posonlyargs] + [a.arg for a in m_fn.args.args]
+                m_bound: dict[str, str] = {}
+                if pos_names and pos_names[0] in ("self", "cls"):
+                    m_bound[pos_names[0]] = f"instance:{cls_name}"
+                run_function(m_fn, m_bound, {}, {})
+
+    for n_fn in all_nested_funcs:
+        if id(n_fn) not in directly_called_func_ids:
+            run_function(n_fn, {}, {}, {})
 
     def collect_inherited(tag: str, seen: set[str] | None = None) -> set[str]:
         visited = set() if seen is None else seen
@@ -373,7 +510,7 @@ def _detect_subcommand_after_script(
 
 
 def _split_shell_segments(text: str) -> list[str]:
-    """引用符外のシェル演算子（&&, ||, ;, |）でコマンド文字列をコマンド単位に分割する。"""
+    """引用符外のバックスラッシュエスケープとシェル演算子（&&, ||, ;, |）を考慮して分割する。"""
     segments: list[str] = []
     buf: list[str] = []
     in_quote: str | None = None
@@ -381,12 +518,16 @@ def _split_shell_segments(text: str) -> list[str]:
     n = len(text)
     while i < n:
         ch = text[i]
-        if in_quote is not None:
+        if ch == "\\" and in_quote != "'":
             buf.append(ch)
-            if ch == "\\" and in_quote == '"' and i + 1 < n:
+            if i + 1 < n:
                 i += 1
                 buf.append(text[i])
-            elif ch == in_quote:
+            i += 1
+            continue
+        if in_quote is not None:
+            buf.append(ch)
+            if ch == in_quote:
                 in_quote = None
             i += 1
             continue
