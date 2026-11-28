@@ -1,0 +1,36 @@
+{
+  "questions": {
+    "session_log_search_mask_before_truncation": {
+      "heading": "PRG-001",
+      "description": "search_session_logs.py の出力テキスト（検索語、見出しラベル、警告、ツール引数要約、抜粋）は窓分割や切り詰めの前に apply_mask を通す。",
+      "start_line": 3,
+      "end_line": 18,
+      "path_globs": [
+        "skills/session-log-search/scripts/search_session_logs.py"
+      ],
+      "instructions": "Does the Git diff in skills/session-log-search/scripts/search_session_logs.py emit or store any user-visible output text (search terms, heading labels, warnings, tool argument summaries, git subjects/stderr, or turn/document excerpts) without passing it through apply_mask (decision_hygiene.mask_secrets) before window splitting, truncation, or rendering?",
+      "criteria": {
+        "true_description": "The diff in skills/session-log-search/scripts/search_session_logs.py introduces or modifies code that outputs, truncates, or splits text (search terms, labels, warnings, tool summaries, git metadata, or excerpts) before passing it through apply_mask.",
+        "false_description": "The diff does not modify skills/session-log-search/scripts/search_session_logs.py, or every new/modified output path in search_session_logs.py applies apply_mask before window splitting, truncation, and rendering."
+      },
+      "threshold": 0.70,
+      "warn_threshold": 0.40
+    },
+    "session_log_search_rg_python_parity": {
+      "heading": "PRG-002",
+      "description": "search_session_logs.py の rg 経路と Python フォールバック経路で同じ検索語集合（JSON エスケープ版を含む）と一致判定および除外判定を使う。",
+      "start_line": 19,
+      "end_line": 34,
+      "path_globs": [
+        "skills/session-log-search/scripts/search_session_logs.py"
+      ],
+      "instructions": "Does the Git diff in skills/session-log-search/scripts/search_session_logs.py introduce a divergence between the ripgrep prefilter path (prefilter_with_rg) and the Python fallback prefilter path (prefilter_python) in the expanded term set (including JSON-escaped variants from _term_variants_for_rg), case-insensitive matching semantics, or blocked-path filtering (is_blocked_path)?",
+      "criteria": {
+        "true_description": "The diff in skills/session-log-search/scripts/search_session_logs.py changes prefilter_with_rg, prefilter_python, or term expansion so that the rg path and Python fallback path use different term sets (such as missing JSON-escaped variants on one path) or different matching/exclusion rules.",
+        "false_description": "The diff does not modify skills/session-log-search/scripts/search_session_logs.py, does not alter prefilter logic, or keeps prefilter_with_rg and prefilter_python aligned on the same term variants (_term_variants_for_rg), case-insensitive matching, and blocked-path checks."
+      },
+      "threshold": 0.70,
+      "warn_threshold": 0.40
+    }
+  }
+}
