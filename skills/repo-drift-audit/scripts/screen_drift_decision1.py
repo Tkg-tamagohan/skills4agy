@@ -1,643 +1,191 @@
 #!/usr/bin/env python3
-"""repo-drift-audit 向け Gemini Decision 1 一次スクリーニング CLI。
+"""repo-drift-audit 向け Gemini Decision 1 一次スクリーニング CLI（ファサード）。
 
-docs（文書・スキルの陳腐化と機械化余地）、backlog（残課題帳簿と履歴の 1 リクエスト突合）、
-candidates（第一走査候補の計画ワーカー投入前トリアージ）の 3 サブコマンドを提供する。
+`drift_repo.py` と `drift_format.py` の公開シンボルを再エクスポートしつつ、
+docs（チャンク/単一）、backlog（見出しパンくず・Markdown 表対応）、
+candidates（任意スナップショット・チャンク/単一）、SDK/REST 切替（--backend）を提供する。
 """
 
 from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
-import hashlib
 import json
 import os
 from pathlib import Path
-import posixpath
 import re
-import subprocess
 import sys
 from typing import Any, Callable
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
 _DECISIONS_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "gemini-decisions-api" / "scripts"
 if str(_DECISIONS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_DECISIONS_SCRIPTS_DIR))
 
 import decision_common  # noqa: E402
-import decision_hygiene  # noqa: E402
+import drift_format  # noqa: E402
+import drift_repo  # noqa: E402
 import run_decisions  # noqa: E402
 
-DEFAULT_MODEL = run_decisions.DEFAULT_MODEL
-DEFAULT_ENDPOINT = run_decisions.DEFAULT_ENDPOINT
-DEFAULT_TIMEOUT = 30.0
-DEFAULT_MAX_WORKERS = 4
-DEFAULT_DOCS_MAX_CHARS = 200_000
-DEFAULT_BACKLOG_MAX_CHARS = 200_000
-DEFAULT_CANDIDATES_MAX_CHARS = 50_000
-MAX_QUESTIONS = 1_000
+# --- drift_repo / drift_format 公開シンボルのファサード再エクスポート ---
+DEFAULT_MODEL = drift_repo.DEFAULT_MODEL
+DEFAULT_ENDPOINT = drift_repo.DEFAULT_ENDPOINT
+DEFAULT_TIMEOUT = drift_repo.DEFAULT_TIMEOUT
+DEFAULT_MAX_WORKERS = drift_repo.DEFAULT_MAX_WORKERS
+DEFAULT_DOCS_MAX_CHARS = drift_repo.DEFAULT_DOCS_MAX_CHARS
+DEFAULT_BACKLOG_MAX_CHARS = drift_repo.DEFAULT_BACKLOG_MAX_CHARS
+DEFAULT_CANDIDATES_MAX_CHARS = drift_repo.DEFAULT_CANDIDATES_MAX_CHARS
+MAX_QUESTIONS = drift_repo.MAX_QUESTIONS
 
-DEFAULT_MIN_CONFIDENCE = 0.80
-DEFAULT_DISCUSSION_THRESHOLD = 0.50
-DEFAULT_NOUL_CLEAN_CEILING = 0.40
-DEFAULT_MECHANIZABLE_THRESHOLD = 0.65
-DEFAULT_DOCS_GIT_LOG_LIMIT = 30
-DEFAULT_BACKLOG_GIT_LOG_LIMIT = 50
-MAX_REPO_FILES_IN_SNAPSHOT = 800
+DEFAULT_MIN_CONFIDENCE = drift_repo.DEFAULT_MIN_CONFIDENCE
+DEFAULT_DISCUSSION_THRESHOLD = drift_repo.DEFAULT_DISCUSSION_THRESHOLD
+DEFAULT_NOUL_CLEAN_CEILING = drift_repo.DEFAULT_NOUL_CLEAN_CEILING
+DEFAULT_MECHANIZABLE_THRESHOLD = drift_repo.DEFAULT_MECHANIZABLE_THRESHOLD
+DEFAULT_DOCS_GIT_LOG_LIMIT = drift_repo.DEFAULT_DOCS_GIT_LOG_LIMIT
+DEFAULT_BACKLOG_GIT_LOG_LIMIT = drift_repo.DEFAULT_BACKLOG_GIT_LOG_LIMIT
+MAX_REPO_FILES_IN_SNAPSHOT = drift_repo.MAX_REPO_FILES_IN_SNAPSHOT
+BULK_STALENESS_MAX_PATHS = drift_repo.BULK_STALENESS_MAX_PATHS
+BULK_STALENESS_MAX_CHARS = drift_repo.BULK_STALENESS_MAX_CHARS
 
-DEFAULT_DOC_GLOBS: tuple[str, ...] = (
-    "README.md",
-    "AGENTS.md",
-    "GEMINI.md",
-    "CLAUDE.md",
-    "docs/**/*.md",
-    "skills/**/*.md",
-    ".agents/skills/**/*.md",
-    ".agents/rules/**/*.md",
-    ".agent/rules/**/*.md",
-    "_agents/rules/**/*.md",
-    "_agent/rules/**/*.md",
-    "rules/**/*.md",
-)
-DEFAULT_EXCLUDED_DOC_GLOBS: tuple[str, ...] = ("**/slop-catalog.md",)
+DEFAULT_DOC_GLOBS = drift_repo.DEFAULT_DOC_GLOBS
+DEFAULT_EXCLUDED_DOC_GLOBS = drift_repo.DEFAULT_EXCLUDED_DOC_GLOBS
+DEFAULT_EXCLUDED_DIRS = drift_repo.DEFAULT_EXCLUDED_DIRS
+SAFE_ENV_BASENAMES = drift_repo.SAFE_ENV_BASENAMES
+SAFE_ENV_SUFFIXES = drift_repo.SAFE_ENV_SUFFIXES
+PRIVATE_KEY_BLOCK_RE = drift_repo.PRIVATE_KEY_BLOCK_RE
+PRIVATE_KEY_HEADER_RE = drift_repo.PRIVATE_KEY_HEADER_RE
+SECRET_PATTERNS = drift_repo.SECRET_PATTERNS
 
-DEFAULT_EXCLUDED_DIRS: frozenset[str] = frozenset(
+FENCE_RE = drift_repo.FENCE_RE
+MARKDOWN_LINK_RE = drift_repo.MARKDOWN_LINK_RE
+INLINE_CODE_RE = drift_repo.INLINE_CODE_RE
+UNCHECKED_TASK_RE = drift_repo.UNCHECKED_TASK_RE
+QUESTION_KEY_SAFE_RE = drift_repo.QUESTION_KEY_SAFE_RE
+
+DOCS_RECOMMENDED_ACTIONS = drift_repo.DOCS_RECOMMENDED_ACTIONS
+DRIFT_SEVERITY_CRITERIA = drift_repo.DRIFT_SEVERITY_CRITERIA
+BACKLOG_STATUS_CRITERIA = drift_repo.BACKLOG_STATUS_CRITERIA
+CANDIDATES_IMPACT_CRITERIA = drift_repo.CANDIDATES_IMPACT_CRITERIA
+CANDIDATES_DISPATCH_ROUTES = drift_repo.CANDIDATES_DISPATCH_ROUTES
+VALID_BACKLOG_CHOICES = drift_repo.VALID_BACKLOG_CHOICES
+VALID_DISPATCH_ROUTES = drift_repo.VALID_DISPATCH_ROUTES
+LOW_PRIORITY_CLEAN_NOTE = drift_repo.LOW_PRIORITY_CLEAN_NOTE
+
+DriftScreenError = drift_repo.DriftScreenError
+RepoContext = drift_repo.RepoContext
+DocEntry = drift_repo.DocEntry
+BacklogItem = drift_repo.BacklogItem
+AuditCandidate = drift_repo.AuditCandidate
+
+configure_utf8_stdio = drift_repo.configure_utf8_stdio
+mask_secret = drift_repo.mask_secret
+scan_text_for_secrets = drift_repo.scan_text_for_secrets
+is_blocked_env_path = drift_repo.is_blocked_env_path
+is_reparse_or_symlink = drift_repo.is_reparse_or_symlink
+_is_reparse_or_symlink = drift_repo._is_reparse_or_symlink
+assert_safe_file_path = drift_repo.assert_safe_file_path
+assert_text_has_no_secrets = drift_repo.assert_text_has_no_secrets
+_iter_string_fields = drift_repo._iter_string_fields
+_is_real_number = drift_repo._is_real_number
+_extract_number = drift_repo._extract_number
+_glob_to_regex = drift_repo._glob_to_regex
+
+is_git_repo = drift_repo.is_git_repo
+collect_repo_files = drift_repo.collect_repo_files
+collect_git_log = drift_repo.collect_git_log
+compute_staleness_days = drift_repo.compute_staleness_days
+compute_staleness_days_bulk = drift_repo.compute_staleness_days_bulk
+collect_repo_context = drift_repo.collect_repo_context
+load_facts_blocks = drift_repo.load_facts_blocks
+build_repo_snapshot_text = drift_repo.build_repo_snapshot_text
+extract_missing_path_hints = drift_repo.extract_missing_path_hints
+extract_missing_flag_hints = drift_repo.extract_missing_flag_hints
+select_doc_files = drift_repo.select_doc_files
+load_doc_entries = drift_repo.load_doc_entries
+
+_aggregate_usage = drift_format._aggregate_usage
+_escape_md_cell = drift_format._escape_md_cell
+discard_broken_stdout = drift_format.discard_broken_stdout
+format_report_table = drift_format.format_report_table
+emit_report = drift_format.emit_report
+emit_error = drift_format.emit_error
+
+DEFAULT_CHUNK_MAX_DOCS = 15
+MAX_CHUNK_MAX_DOCS = 166
+DEFAULT_CHUNK_MAX_ITEMS = 50
+MAX_CHUNK_MAX_ITEMS = 200
+DEFAULT_CANDIDATES_GIT_LOG_LIMIT = 30
+
+HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$")
+LIST_ITEM_START_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$")
+STATUS_HEADER_NAMES: frozenset[str] = frozenset({"状態", "ステータス", "status", "state"})
+COMPLETED_TABLE_MARKERS: frozenset[str] = frozenset(
     {
-        ".git",
-        "node_modules",
-        "__pycache__",
-        ".venv",
-        "venv",
-        "dist",
-        "build",
-        "target",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
+        "完了",
+        "済",
+        "済み",
+        "対応済",
+        "対応済み",
+        "終了",
+        "クローズ",
+        "見送り",
+        "不要",
+        "done",
+        "closed",
+        "resolved",
+        "fixed",
+        "wontfix",
+        "won't fix",
+        "completed",
+        "complete",
+        "cancelled",
+        "canceled",
+        "skipped",
+        "n/a",
+        "x",
+        "[x]",
     }
 )
-
-SAFE_ENV_BASENAMES: frozenset[str] = decision_hygiene.SAFE_ENV_BASENAMES
-SAFE_ENV_SUFFIXES: tuple[str, ...] = decision_hygiene.SAFE_ENV_SUFFIXES
-
-PRIVATE_KEY_BLOCK_RE = decision_hygiene.PRIVATE_KEY_BLOCK_RE
-PRIVATE_KEY_HEADER_RE = decision_hygiene.PRIVATE_KEY_HEADER_RE
-
-SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = decision_hygiene.SECRET_DETECT_PATTERNS
-
-FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
-MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)")
-INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
-UNCHECKED_TASK_RE = re.compile(r"^\s*[-*+]\s+\[ \]\s+(.+?)\s*$")
-QUESTION_KEY_SAFE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-DOCS_RECOMMENDED_ACTIONS: dict[str, str] = {
-    "plan_worker_deep_check": (
-        "Likely has meaningful drift, broken references, or structural issues needing "
-        "a planning worker to inspect and plan fixes."
-    ),
-    "quick_parent_check": (
-        "Possible minor lag, ambiguity, or uncertain discrepancy that the parent agent "
-        "should quickly verify."
-    ),
-    "mechanization_review": (
-        "No urgent drift, but contains deterministic procedures that are strong candidates "
-        "for scripting."
-    ),
-    "likely_clean": (
-        "Consistent with the current repository snapshot and no follow-up action is evident."
-    ),
-    "other": "Insufficient context or falls outside the listed categories.",
-}
-
-DRIFT_SEVERITY_CRITERIA: list[str] = [
-    "0: no meaningful drift",
-    "1: minor wording or metadata lag",
-    "2: broken reference or outdated procedure",
-    "3: contradictory guidance likely to cause errors",
-]
-
-BACKLOG_STATUS_CRITERIA: dict[str, str] = {
-    "likely_resolved": (
-        "Recent commits or current repository files strongly indicate this backlog item "
-        "has already been implemented or resolved."
-    ),
-    "partially_addressed": (
-        "Related changes exist in recent commits or files, but part of the item or "
-        "verification still appears incomplete."
-    ),
-    "still_open": (
-        "No evidence in the recent commits or file snapshot indicates this backlog item "
-        "has been resolved yet."
-    ),
-    "other": "Insufficient context in the snapshot or falls outside these statuses.",
-}
-
-CANDIDATES_IMPACT_CRITERIA: list[str] = [
-    "0: cosmetic or nit",
-    "1: minor maintenance lag",
-    "2: functional workflow drift or broken tooling",
-    "3: high-impact contradiction or operational risk",
-]
-
-CANDIDATES_DISPATCH_ROUTES: dict[str, str] = {
-    "plan_worker_autonomous": (
-        "Fits a single track and can likely be planned for autonomous execution without "
-        "specification ambiguity."
-    ),
-    "plan_worker_discussion": (
-        "Fits a single track, but requires user confirmation on specification or policy "
-        "decisions during planning."
-    ),
-    "parent_direct": (
-        "Operational, external configuration, or tiny direct task better handled by the "
-        "parent agent than a worker."
-    ),
-    "defer_redesign": (
-        "Requires cross-cutting redesign exceeding a single PR or track and should be "
-        "deferred rather than planned now."
-    ),
-    "likely_false_positive": (
-        "Appears to be a false positive or already aligned based on the given evidence."
-    ),
-    "other": "Insufficient context or falls outside the listed routing options.",
-}
-
-VALID_BACKLOG_CHOICES = frozenset(BACKLOG_STATUS_CRITERIA.keys())
-VALID_DISPATCH_ROUTES = frozenset(CANDIDATES_DISPATCH_ROUTES.keys())
-
-LOW_PRIORITY_CLEAN_NOTE = (
-    "low_priority_clean はコンパクトなリポジトリスナップショット上の一次判定であり、"
-    "ゼロ乖離の保証ではありません。最終確認と行番号の確定は人間またはエージェントが行ってください。"
+INCOMPLETE_TABLE_MARKERS: frozenset[str] = frozenset(
+    {
+        "未着手",
+        "未完了",
+        "未対応",
+        "進行中",
+        "対応中",
+        "作業中",
+        "保留",
+        "要確認",
+        "オープン",
+        "open",
+        "todo",
+        "to do",
+        "to-do",
+        "pending",
+        "wip",
+        "in progress",
+        "in_progress",
+        "in-progress",
+        "blocked",
+        "reopened",
+        "new",
+        "draft",
+        "[ ]",
+    }
 )
-
-
-class DriftScreenError(Exception):
-    """スクリーニング CLI の入力検証・安全ガードエラー。"""
-
-    def __init__(self, code: str, message: str, exit_code: int = 2) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.exit_code = exit_code
-
-
-@dataclass(frozen=True)
-class RepoContext:
-    """対象リポジトリの収集済みメタデータ。"""
-
-    repo_root: Path
-    is_git: bool
-    repo_files: list[str]
-    repo_files_set: frozenset[str]
-    top_level_dirs: frozenset[str]
-    git_log: str
-    latest_commit_ts: int | None
-
-
-@dataclass(frozen=True)
-class DocEntry:
-    """docs モードの検査対象ドキュメント 1 件。"""
-
-    rel_path: str
-    content: str
-    staleness_days: int | None
-    missing_path_hints: list[str]
-
-
-@dataclass(frozen=True)
-class BacklogItem:
-    """backlog モードの未完了課題 1 件。"""
-
-    id: str
-    question_key: str
-    file: str | None
-    line: int | None
-    text: str
-
-
-@dataclass(frozen=True)
-class AuditCandidate:
-    """candidates モードの第一走査候補 1 件。"""
-
-    id: str
-    category: str
-    title: str
-    evidence: str
-    symptom: str
-    files: list[str] = field(default_factory=list)
-    estimated_scope: str | None = None
-
-
-def configure_utf8_stdio() -> None:
-    """stdin/stdout/stderr が reconfigure を持つ場合 UTF-8 へ再設定する。"""
-    decision_hygiene.configure_utf8_stdio()
-
-
-def mask_secret(text: str, secret: str | None = None) -> str:
-    """エラー出力から API キーおよび秘密情報トークン実値をマスクする。"""
-    return decision_hygiene.mask_secret(text, secret)
-
-
-def scan_text_for_secrets(text: str) -> list[str]:
-    """テキスト内の秘密鍵ヘッダ・API トークンパターンのラベル一覧を返す。"""
-    return decision_hygiene.scan_text_for_secrets(text, patterns=SECRET_PATTERNS)
-
-
-def is_blocked_env_path(path: Path | str) -> bool:
-    """送信禁止の .env 系ファイル（雛形を除く）かどうかを判定する。"""
-    return decision_hygiene.is_blocked_env_path(path)
-
-
-def assert_safe_file_path(path: Path | str, role: str) -> None:
-    """.env 系ファイルが読み取り対象に含まれる場合は終了コード 2 で遮断する。"""
-    if is_blocked_env_path(path):
-        raise DriftScreenError(
-            "secret_env_file",
-            f"{role} に機密ファイル候補（{Path(path).name}）が含まれているため送信を遮断しました。",
-            exit_code=2,
-        )
-
-
-def assert_text_has_no_secrets(text: str, label: str) -> None:
-    """テキスト内に秘密情報パターンがあれば実値を出さず終了コード 2 で遮断する。"""
-    matched = scan_text_for_secrets(text)
-    if matched:
-        joined = ", ".join(matched)
-        raise DriftScreenError(
-            "secret_detected",
-            f"{label} に秘密情報パターン（{joined}）が含まれているため送信を遮断しました。",
-            exit_code=2,
-        )
-
-
-_iter_string_fields = decision_hygiene.iter_string_fields
-_is_real_number = decision_common.is_real_number
-_extract_number = decision_common.extract_number
-
-
-def _run_git_command(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
-    try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-    except OSError:
-        return None
-
-
-def is_git_repo(repo_root: Path) -> bool:
-    """対象ディレクトリが Git 作業ツリー内かを安全に判定する。"""
-    proc = _run_git_command(repo_root, "rev-parse", "--is-inside-work-tree")
-    return proc is not None and proc.returncode == 0 and proc.stdout.strip() == "true"
-
-
-def _walk_filesystem_files(repo_root: Path) -> list[str]:
-    files: list[str] = []
-    for root, dirs, filenames in os.walk(repo_root):
-        dirs[:] = sorted(d for d in dirs if d not in DEFAULT_EXCLUDED_DIRS)
-        root_path = Path(root)
-        for name in sorted(filenames):
-            full = root_path / name
-            try:
-                rel = full.relative_to(repo_root).as_posix()
-            except ValueError:
-                continue
-            files.append(rel)
-    return sorted(files)
-
-
-def collect_repo_files(repo_root: Path, is_git: bool) -> list[str]:
-    """対象リポジトリ配下のファイル相対パス一覧（POSIX 形式）を返す。"""
-    if is_git:
-        proc = _run_git_command(repo_root, "-c", "core.quotePath=false", "ls-files")
-        if proc is not None and proc.returncode == 0:
-            files = [
-                line.strip().replace("\\", "/")
-                for line in proc.stdout.splitlines()
-                if line.strip()
-            ]
-            return sorted(set(files))
-    return _walk_filesystem_files(repo_root)
-
-
-def collect_git_log(repo_root: Path, limit: int, is_git: bool) -> str:
-    """Git 管理下かつ limit > 0 の場合に直近のコミット要約を返す。"""
-    if not is_git or limit <= 0:
-        return ""
-    proc = _run_git_command(
-        repo_root,
-        "-c",
-        "core.quotePath=false",
-        "log",
-        f"-n{limit}",
-        "--date=short",
-        "--stat",
-        "--format=commit %h %ad %s",
-    )
-    if proc is None or proc.returncode != 0:
-        return ""
-    return proc.stdout.strip()
-
-
-def _get_latest_commit_ts(repo_root: Path, is_git: bool) -> int | None:
-    if not is_git:
-        return None
-    proc = _run_git_command(repo_root, "log", "-1", "--format=%ct")
-    if proc is None or proc.returncode != 0:
-        return None
-    raw = proc.stdout.strip()
-    if raw.isdigit():
-        return int(raw)
-    return None
-
-
-def compute_staleness_days(
-    repo_root: Path,
-    rel_posix: str,
-    is_git: bool,
-    latest_commit_ts: int | None,
-) -> int | None:
-    """リポジトリ最新コミット日時と文書最終更新日時の経過日数を返す。"""
-    if not is_git or latest_commit_ts is None:
-        return None
-    proc = _run_git_command(repo_root, "log", "-1", "--format=%ct", "--", rel_posix)
-    if proc is None or proc.returncode != 0:
-        return None
-    raw = proc.stdout.strip()
-    if not raw.isdigit():
-        return None
-    doc_ts = int(raw)
-    return max(0, (latest_commit_ts - doc_ts) // 86400)
-
-
-def collect_repo_context(repo_root: Path, git_log_limit: int) -> RepoContext:
-    """対象リポジトリのファイル一覧と履歴スナップショットを収集する。"""
-    if not repo_root.is_dir():
-        raise DriftScreenError(
-            "invalid_repo_path",
-            f"リポジトリディレクトリが存在しません: {repo_root}",
-            exit_code=2,
-        )
-    resolved_root = repo_root.resolve()
-    git_flag = is_git_repo(resolved_root)
-    repo_files = collect_repo_files(resolved_root, git_flag)
-    top_dirs = frozenset(
-        entry.name
-        for entry in resolved_root.iterdir()
-        if entry.is_dir() and entry.name not in DEFAULT_EXCLUDED_DIRS
-    )
-    git_log = collect_git_log(resolved_root, git_log_limit, git_flag)
-    latest_ts = _get_latest_commit_ts(resolved_root, git_flag)
-    return RepoContext(
-        repo_root=resolved_root,
-        is_git=git_flag,
-        repo_files=repo_files,
-        repo_files_set=frozenset(repo_files),
-        top_level_dirs=top_dirs,
-        git_log=git_log,
-        latest_commit_ts=latest_ts,
-    )
-
-
-def load_facts_blocks(facts_files: list[str]) -> list[tuple[str, str]]:
-    """任意の --facts-file 群を検査し、(表示パス, 本文) の配列として読み込む。"""
-    blocks: list[tuple[str, str]] = []
-    for raw_path in facts_files:
-        path = Path(raw_path)
-        assert_safe_file_path(path, "--facts-file")
-        if not path.is_file():
-            raise DriftScreenError(
-                "facts_file_not_found",
-                f"--facts-file が見つかりません: {raw_path}",
-                exit_code=2,
-            )
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise DriftScreenError(
-                "facts_file_read_error",
-                f"--facts-file を読めません ({raw_path}): {exc}",
-                exit_code=2,
-            ) from exc
-        assert_text_has_no_secrets(text, f"--facts-file ({raw_path})")
-        blocks.append((raw_path, text))
-    return blocks
-
-
-def build_repo_snapshot_text(
-    ctx: RepoContext,
-    facts_blocks: list[tuple[str, str]],
-) -> str:
-    """共有入力用のコンパクトなリポジトリスナップショット文字列を構築する。"""
-    parts: list[str] = [
-        f"Repository Root: {ctx.repo_root.name}",
-        f"Git Repository: {'yes' if ctx.is_git else 'no (filesystem fallback)'}",
-    ]
-    total_files = len(ctx.repo_files)
-    shown_files = ctx.repo_files[:MAX_REPO_FILES_IN_SNAPSHOT]
-    file_header = f"Repository Files ({total_files} total"
-    if total_files > MAX_REPO_FILES_IN_SNAPSHOT:
-        file_header += f", showing first {MAX_REPO_FILES_IN_SNAPSHOT}"
-    file_header += "):"
-    file_body = "\n".join(shown_files) if shown_files else "(none)"
-    parts.append(f"{file_header}\n{file_body}")
-
-    if ctx.git_log:
-        parts.append(f"Recent Git Log:\n{ctx.git_log}")
-    else:
-        parts.append("Recent Git Log:\n(unavailable)")
-
-    for label, content in facts_blocks:
-        parts.append(f"Supplemental Facts ({label}):\n{content}")
-
-    return "\n\n".join(parts)
-
-
-def _strip_fenced_code_blocks(text: str) -> str:
-    """フェンスコードブロック内の行を空行へ置換し、誤検出を防ぐ。"""
-    out_lines: list[str] = []
-    in_fence = False
-    fence_char = ""
-    fence_len = 0
-    for line in text.splitlines():
-        m = FENCE_RE.match(line)
-        if m:
-            marker = m.group(1)
-            if not in_fence:
-                in_fence = True
-                fence_char = marker[0]
-                fence_len = len(marker)
-                out_lines.append("")
-                continue
-            if marker[0] == fence_char and len(marker) >= fence_len:
-                in_fence = False
-                fence_char = ""
-                fence_len = 0
-                out_lines.append("")
-                continue
-        out_lines.append("" if in_fence else line)
-    return "\n".join(out_lines)
-
-
-def _is_external_or_anchor(target: str) -> bool:
-    lower = target.lower()
-    if not target or target.startswith("#") or target.startswith("/"):
-        return True
-    return lower.startswith(("http://", "https://", "mailto:", "file://", "javascript:", "data:"))
-
-
-def _normalize_candidate_target(raw_target: str) -> str:
-    cleaned = raw_target.split("#", 1)[0].split("?", 1)[0].strip()
-    return cleaned
-
-
-def _has_disallowed_path_chars(candidate: str) -> bool:
-    if not candidate or candidate.startswith("/") or "//" in candidate or "..." in candidate:
-        return True
-    if any(ch.isspace() for ch in candidate):
-        return True
-    if any(ch in candidate for ch in "*?[]{}<>$~"):
-        return True
-    return False
-
-
-def _resolve_repo_candidate(candidate: str, doc_relpath: str, ctx: RepoContext) -> bool:
-    """相対パス候補が doc 相対または repo ルート相対で実在するかを返す。"""
-    clean = candidate.rstrip("/")
-    if not clean or clean in (".", ".."):
-        return True
-
-    doc_dir = posixpath.dirname(doc_relpath)
-    joined_from_doc = posixpath.normpath(posixpath.join(doc_dir, clean)) if doc_dir else posixpath.normpath(clean)
-    norm_from_root = posixpath.normpath(clean)
-
-    candidates_to_check: list[str] = []
-    for norm in (joined_from_doc, norm_from_root):
-        if norm != ".." and not norm.startswith("../"):
-            candidates_to_check.append(norm.lstrip("./") if norm.startswith("./") else norm)
-
-    if not candidates_to_check:
-        # リポジトリ外（../ など）を意図的に参照するリンクは欠損ヒント対象外にする
-        return True
-
-    for rel in candidates_to_check:
-        if rel in ctx.repo_files_set:
-            return True
-        target_disk = ctx.repo_root / rel
-        if target_disk.exists():
-            return True
-        dir_prefix = rel.rstrip("/") + "/"
-        if any(f.startswith(dir_prefix) for f in ctx.repo_files):
-            return True
-    return False
-
-
-def extract_missing_path_hints(doc_text: str, doc_relpath: str, ctx: RepoContext) -> list[str]:
-    """文書内の相対リンクとバッククォートパスから不在パス候補を決定論的に抽出する。"""
-    scanned = _strip_fenced_code_blocks(doc_text)
-    missing: set[str] = set()
-
-    for match in MARKDOWN_LINK_RE.finditer(scanned):
-        target = _normalize_candidate_target(match.group(1))
-        if _is_external_or_anchor(target) or _has_disallowed_path_chars(target):
-            continue
-        if not _resolve_repo_candidate(target, doc_relpath, ctx):
-            missing.add(target)
-
-    for match in INLINE_CODE_RE.finditer(scanned):
-        raw = match.group(1).strip()
-        if "/" not in raw or _is_external_or_anchor(raw) or _has_disallowed_path_chars(raw):
-            continue
-        if ":" in raw:
-            continue
-        first_seg = raw.split("/", 1)[0]
-        is_explicit_rel = raw.startswith(("./", "../"))
-        if not is_explicit_rel and first_seg not in ctx.top_level_dirs:
-            continue
-        if not _resolve_repo_candidate(raw, doc_relpath, ctx):
-            missing.add(raw)
-
-    return sorted(missing)
-
-
-_glob_to_regex = decision_common.glob_to_regex
-
-
-def select_doc_files(ctx: RepoContext, path_patterns: list[str] | None) -> list[str]:
-    """対象グロブまたはパス群に一致するリポジトリ内ファイル一覧を昇順で返す。"""
-    is_default = not path_patterns
-    patterns = path_patterns if path_patterns else list(DEFAULT_DOC_GLOBS)
-    compiled = [_glob_to_regex(pat) for pat in patterns]
-    excluded = [_glob_to_regex(pat) for pat in DEFAULT_EXCLUDED_DOC_GLOBS] if is_default else []
-    selected: list[str] = []
-    seen: set[str] = set()
-
-    for rel in ctx.repo_files:
-        if any(rx.match(rel) for rx in compiled):
-            if any(rx.match(rel) for rx in excluded):
-                continue
-            if rel not in seen:
-                seen.add(rel)
-                selected.append(rel)
-
-    # Git 管理下で未追跡ファイルを明示パス指定した場合にも実在ファイルなら拾えるようにする
-    if path_patterns:
-        for raw_pat in patterns:
-            norm = raw_pat.strip().replace("\\", "/")
-            if norm.startswith("./"):
-                norm = norm[2:]
-            if any(c in norm for c in "*?[]"):
-                continue
-            candidate_path = ctx.repo_root / norm
-            if norm and norm not in seen and candidate_path.is_file():
-                try:
-                    candidate_path.resolve().relative_to(ctx.repo_root)
-                except ValueError:
-                    continue
-                seen.add(norm)
-                selected.append(norm)
-
-    return sorted(selected)
-
-
-def load_doc_entries(ctx: RepoContext, rel_paths: list[str]) -> list[DocEntry]:
-    """対象文書を読み込み、機密検査と決定論的ヒント算出を行う。"""
-    entries: list[DocEntry] = []
-    for rel in rel_paths:
-        full_path = ctx.repo_root / rel
-        assert_safe_file_path(full_path, "検査対象ファイル")
-        if not full_path.is_file():
-            raise DriftScreenError(
-                "doc_file_not_found",
-                f"検査対象ファイルが見つかりません: {rel}",
-                exit_code=2,
-            )
-        try:
-            content = full_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise DriftScreenError(
-                "doc_read_error",
-                f"検査対象ファイルを UTF-8 として読めません ({rel}): {exc}",
-                exit_code=2,
-            ) from exc
-        assert_text_has_no_secrets(content, f"対象ファイル ({rel})")
-        staleness = compute_staleness_days(ctx.repo_root, rel, ctx.is_git, ctx.latest_commit_ts)
-        missing_hints = extract_missing_path_hints(content, rel, ctx)
-        entries.append(
-            DocEntry(
-                rel_path=rel,
-                content=content,
-                staleness_days=staleness,
-                missing_path_hints=missing_hints,
-            )
-        )
-    return entries
+INCOMPLETE_ASCII_WORD_RE = re.compile(
+    r"\b(?:open|todo|to-do|pending|wip|in[\s_-]+progress|blocked|reopened)\b",
+    re.IGNORECASE,
+)
+COMPLETED_ASCII_WORD_RE = re.compile(
+    r"\b(?:done|closed|resolved|fixed|wontfix|completed?|cancell?ed|skipped)\b",
+    re.IGNORECASE,
+)
+NEGATED_DONE_RE = re.compile(r"\b(?:not\s+done|undone|incomplete)\b", re.IGNORECASE)
 
 
 def build_docs_questions() -> dict[str, dict[str, Any]]:
@@ -728,6 +276,30 @@ def build_docs_questions() -> dict[str, dict[str, Any]]:
     }
 
 
+def _format_doc_block(entry: DocEntry, *, doc_ns: str | None = None) -> str:
+    staleness_label = (
+        f"{entry.staleness_days} days"
+        if entry.staleness_days is not None
+        else "unknown (non-git or untracked)"
+    )
+    hints_label = ", ".join(entry.missing_path_hints) if entry.missing_path_hints else "(none)"
+    flags_label = ", ".join(entry.missing_flag_hints) if entry.missing_flag_hints else "(none)"
+    header = (
+        f"Document Path [{doc_ns}]: {entry.rel_path}"
+        if doc_ns
+        else f"Document Path: {entry.rel_path}"
+    )
+    return "\n".join(
+        [
+            header,
+            f"Staleness Days (vs latest commit): {staleness_label}",
+            f"Deterministic Missing Path Hints: {hints_label}",
+            f"Deterministic Missing Flag Hints: {flags_label}",
+            f"Document Content:\n```\n{entry.content}\n```\n",
+        ]
+    )
+
+
 def build_doc_payload(
     entry: DocEntry,
     snapshot_text: str,
@@ -736,20 +308,7 @@ def build_doc_payload(
     max_chars: int = DEFAULT_DOCS_MAX_CHARS,
 ) -> dict[str, Any]:
     """docs モード 1 文書分の Decisions API ペイロードを構築・検証する。"""
-    staleness_label = (
-        f"{entry.staleness_days} days"
-        if entry.staleness_days is not None
-        else "unknown (non-git or untracked)"
-    )
-    hints_label = ", ".join(entry.missing_path_hints) if entry.missing_path_hints else "(none)"
-    doc_block = "\n".join(
-        [
-            f"Document Path: {entry.rel_path}",
-            f"Staleness Days (vs latest commit): {staleness_label}",
-            f"Deterministic Missing Path Hints: {hints_label}",
-            f"Document Content:\n```\n{entry.content}\n```\n",
-        ]
-    )
+    doc_block = _format_doc_block(entry)
     input_blocks = [
         {"type": "text", "text": snapshot_text + "\n\n"},
         {"type": "text", "text": doc_block},
@@ -780,6 +339,109 @@ def build_doc_payload(
     return payload
 
 
+def build_doc_chunks(
+    entries: list[DocEntry],
+    snapshot_text: str,
+    *,
+    model: str = DEFAULT_MODEL,
+    max_chars: int = DEFAULT_DOCS_MAX_CHARS,
+    chunk_max_docs: int = DEFAULT_CHUNK_MAX_DOCS,
+) -> list[dict[str, Any]]:
+    """docs モードの文書群をスナップショット 1 回共有チャンク群へパッキングする。"""
+    if isinstance(chunk_max_docs, bool) or chunk_max_docs < 1 or chunk_max_docs > MAX_CHUNK_MAX_DOCS:
+        raise DriftScreenError(
+            "invalid_chunk_max_docs",
+            f"--chunk-max-docs は 1 から {MAX_CHUNK_MAX_DOCS} の整数を指定してください。",
+            exit_code=2,
+        )
+    if not entries:
+        return []
+
+    base_questions = build_docs_questions()
+    q_per_doc = len(base_questions)
+    snapshot_prefix = snapshot_text + "\n\n"
+    snapshot_chars = len(snapshot_prefix)
+
+    packed_groups: list[list[tuple[str, DocEntry, str]]] = []
+    cur_group: list[tuple[str, DocEntry, str]] = []
+    cur_chars = snapshot_chars
+
+    for idx, entry in enumerate(entries, start=1):
+        doc_ns = f"doc_{idx:04d}"
+        doc_block = _format_doc_block(entry, doc_ns=doc_ns)
+        single_total = snapshot_chars + len(doc_block)
+        if single_total > max_chars:
+            raise DriftScreenError(
+                "input_size_limit_exceeded",
+                (
+                    f"文書 {entry.rel_path} の入力文字数（{single_total:,} 文字）が上限 "
+                    f"{max_chars:,} 文字を超えています。--paths や --git-log-limit を絞って分割してください。"
+                ),
+                exit_code=2,
+            )
+
+        next_count = len(cur_group) + 1
+        if cur_group and (
+            next_count > chunk_max_docs
+            or next_count * q_per_doc > MAX_QUESTIONS
+            or cur_chars + len(doc_block) > max_chars
+        ):
+            packed_groups.append(cur_group)
+            cur_group = []
+            cur_chars = snapshot_chars
+
+        cur_group.append((doc_ns, entry, doc_block))
+        cur_chars += len(doc_block)
+
+    if cur_group:
+        packed_groups.append(cur_group)
+
+    chunks: list[dict[str, Any]] = []
+    for chunk_index, group in enumerate(packed_groups):
+        input_blocks = [{"type": "text", "text": snapshot_prefix}]
+        questions: dict[str, dict[str, Any]] = {}
+        chunk_entries: list[DocEntry] = []
+        namespaces: list[str] = []
+        chunk_flag_hints: list[str] = []
+
+        for doc_ns, entry, doc_block in group:
+            input_blocks.append({"type": "text", "text": doc_block})
+            chunk_entries.append(entry)
+            namespaces.append(doc_ns)
+            chunk_flag_hints.extend(entry.missing_flag_hints)
+            for base_key, base_q in base_questions.items():
+                q_copy = dict(base_q)
+                q_copy["instructions"] = (
+                    f"Target document [{doc_ns}]: {entry.rel_path}\n{base_q['instructions']}"
+                )
+                questions[f"{doc_ns}__{base_key}"] = q_copy
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": input_blocks,
+            "questions": questions,
+        }
+        errors = run_decisions.validate_payload(payload)
+        if errors:
+            raise DriftScreenError(
+                "payload_validation_failed",
+                f"docs チャンク {chunk_index} のペイロード検証に失敗しました: " + "; ".join(errors),
+                exit_code=2,
+            )
+
+        chunks.append(
+            {
+                "chunk_index": chunk_index,
+                "namespaces": namespaces,
+                "entries": chunk_entries,
+                "files": [e.rel_path for e in chunk_entries],
+                "missing_flag_hints": chunk_flag_hints,
+                "payload": payload,
+            }
+        )
+    return chunks
+
+
 def classify_doc_answers(
     entry: DocEntry,
     enriched: dict[str, Any],
@@ -806,7 +468,7 @@ def classify_doc_answers(
     rec_action = act_ans.get("choice") if isinstance(act_ans.get("choice"), str) else None
     act_conf = _extract_number(act_ans, "confidence")
 
-    no_missing_hints = len(entry.missing_path_hints) == 0
+    no_missing_hints = len(entry.missing_path_hints) == 0 and len(entry.missing_flag_hints) == 0
     low_noul_drift = (
         stale is not None
         and stale < DEFAULT_NOUL_CLEAN_CEILING
@@ -845,6 +507,8 @@ def classify_doc_answers(
         bucket = "prioritize_for_audit"
         if entry.missing_path_hints:
             reasons.append(f"missing_path_hints({len(entry.missing_path_hints)})")
+        if entry.missing_flag_hints:
+            reasons.append(f"missing_flag_hints({len(entry.missing_flag_hints)})")
         if stale is None:
             reasons.append("missing_stale_score")
         elif stale >= DEFAULT_NOUL_CLEAN_CEILING:
@@ -877,6 +541,7 @@ def classify_doc_answers(
         "drift_severity_normalized": sev_norm,
         "staleness_days": entry.staleness_days,
         "missing_path_hints": entry.missing_path_hints,
+        "missing_flag_hints": entry.missing_flag_hints,
         "reasons": reasons,
     }
     if "usage" in enriched and isinstance(enriched["usage"], dict):
@@ -899,8 +564,191 @@ def _sanitize_question_key(raw_id: str, used: set[str], fallback_idx: int) -> st
     return candidate
 
 
-def load_backlog_items(backlog_path: Path, fmt: str) -> list[BacklogItem]:
-    """残課題帳簿（Markdown または JSON）を読み込み、未完了項目を抽出する。"""
+def _split_md_table_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|") and not stripped.endswith("\\|"):
+        stripped = stripped[:-1]
+    parts = re.split(r"(?<!\\)\|", stripped)
+    return [p.strip().replace("\\|", "|") for p in parts]
+
+
+def _normalize_header_label(cell: str) -> str:
+    return cell.strip().strip("`*_").strip().lower()
+
+
+def _is_incomplete_table_status(status_cell: str) -> bool:
+    norm = status_cell.strip().strip("`*_").strip().lower()
+    if not norm:
+        return False
+    if norm in COMPLETED_TABLE_MARKERS:
+        return False
+    if norm in INCOMPLETE_TABLE_MARKERS:
+        return True
+    if NEGATED_DONE_RE.search(norm):
+        return True
+    if any(tok in norm for tok in ("未着手", "未完了", "未対応", "進行中", "対応中", "作業中", "保留", "要確認")):
+        return True
+    if any(tok in norm for tok in ("完了", "対応済", "終了", "クローズ", "見送り", "不要", "✅", "✔")):
+        return False
+    if COMPLETED_ASCII_WORD_RE.search(norm):
+        return False
+    if "⏳" in norm or "🚧" in norm or "[ ]" in norm:
+        return True
+    return bool(INCOMPLETE_ASCII_WORD_RE.search(norm))
+
+
+def _update_heading_stack(heading_stack: dict[int, str], line: str) -> bool:
+    match = HEADING_RE.match(line)
+    if not match:
+        return False
+    level = len(match.group(1))
+    title = re.sub(r"\s+#+\s*$", "", match.group(2)).strip()
+    if not title:
+        return False
+    for existing_level in [k for k in heading_stack if k >= level]:
+        del heading_stack[existing_level]
+    heading_stack[level] = title
+    return True
+
+
+def _format_heading_breadcrumb(heading_stack: dict[int, str]) -> str | None:
+    if not heading_stack:
+        return None
+    return " > ".join(heading_stack[lvl] for lvl in sorted(heading_stack))
+
+
+def _parse_markdown_backlog(
+    raw_text: str,
+    rel_label: str,
+    *,
+    fmt: str,
+    include_tables: bool,
+) -> list[BacklogItem]:
+    lines = raw_text.splitlines()
+    n = len(lines)
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    heading_stack: dict[int, str] = {}
+
+    checkbox_raw: list[tuple[int, str | None, str]] = []
+    table_raw: list[tuple[int, str | None, str]] = []
+
+    i = 0
+    while i < n:
+        line = lines[i]
+        fence_match = FENCE_RE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_char = marker[0]
+                fence_len = len(marker)
+                i += 1
+                continue
+            if marker[0] == fence_char and len(marker) >= fence_len:
+                in_fence = False
+                fence_char = ""
+                fence_len = 0
+                i += 1
+                continue
+        if in_fence:
+            i += 1
+            continue
+
+        if _update_heading_stack(heading_stack, line):
+            i += 1
+            continue
+
+        current_section = _format_heading_breadcrumb(heading_stack)
+
+        task_match = UNCHECKED_TASK_RE.match(line)
+        if task_match:
+            checkbox_raw.append((i + 1, current_section, task_match.group(1).strip()))
+            i += 1
+            continue
+
+        if (
+            "|" in line
+            and i + 1 < n
+            and not FENCE_RE.match(lines[i + 1])
+            and TABLE_SEP_RE.match(lines[i + 1])
+        ):
+            header_cells = _split_md_table_row(line)
+            status_col: int | None = None
+            for col_idx, cell in enumerate(header_cells):
+                if _normalize_header_label(cell) in STATUS_HEADER_NAMES:
+                    status_col = col_idx
+                    break
+            i += 2
+            if status_col is None:
+                continue
+            while i < n:
+                row_line = lines[i]
+                if (
+                    not row_line.strip()
+                    or FENCE_RE.match(row_line)
+                    or HEADING_RE.match(row_line)
+                    or UNCHECKED_TASK_RE.match(row_line)
+                    or LIST_ITEM_START_RE.match(row_line)
+                ):
+                    break
+                if "|" not in row_line or TABLE_SEP_RE.match(row_line):
+                    break
+                cells = _split_md_table_row(row_line)
+                status_val = cells[status_col] if status_col < len(cells) else ""
+                if _is_incomplete_table_status(status_val):
+                    non_status = [
+                        c for c_idx, c in enumerate(cells) if c_idx != status_col and c
+                    ]
+                    if non_status:
+                        row_text = f"{' | '.join(non_status)} [status: {status_val}]"
+                        table_raw.append((i + 1, current_section, row_text))
+                i += 1
+            continue
+
+        i += 1
+
+    if fmt == "table":
+        chosen = table_raw
+    elif fmt == "markdown":
+        chosen = sorted(checkbox_raw + table_raw, key=lambda r: r[0]) if include_tables else checkbox_raw
+    else:
+        # auto
+        if include_tables:
+            chosen = sorted(checkbox_raw + table_raw, key=lambda r: r[0])
+        elif checkbox_raw:
+            chosen = checkbox_raw
+        else:
+            chosen = table_raw
+
+    items: list[BacklogItem] = []
+    used_keys: set[str] = set()
+    for seq, (line_no, section, text) in enumerate(chosen, start=1):
+        item_id = f"item_{seq:04d}"
+        q_key = _sanitize_question_key(item_id, used_keys, seq)
+        items.append(
+            BacklogItem(
+                id=item_id,
+                question_key=q_key,
+                file=rel_label,
+                line=line_no,
+                text=text,
+                section=section,
+            )
+        )
+    return items
+
+
+def load_backlog_items(
+    backlog_path: Path,
+    fmt: str,
+    *,
+    include_tables: bool = False,
+) -> list[BacklogItem]:
+    """残課題帳簿（Markdown チェックボックス/表 または JSON）を読み込み、未完了項目を抽出する。"""
     assert_safe_file_path(backlog_path, "--backlog")
     if not backlog_path.is_file():
         raise DriftScreenError(
@@ -921,10 +769,7 @@ def load_backlog_items(backlog_path: Path, fmt: str) -> list[BacklogItem]:
 
     resolved_fmt = fmt
     if resolved_fmt == "auto":
-        resolved_fmt = "json" if backlog_path.suffix.lower() == ".json" else "markdown"
-
-    items: list[BacklogItem] = []
-    used_keys: set[str] = set()
+        resolved_fmt = "json" if backlog_path.suffix.lower() == ".json" else "auto"
 
     if resolved_fmt == "json":
         try:
@@ -937,6 +782,8 @@ def load_backlog_items(backlog_path: Path, fmt: str) -> list[BacklogItem]:
                 "--backlog JSON のトップレベルは配列である必要があります。",
                 exit_code=2,
             )
+        items: list[BacklogItem] = []
+        used_keys: set[str] = set()
         for idx, row in enumerate(data):
             if not isinstance(row, dict):
                 raise DriftScreenError(
@@ -973,6 +820,13 @@ def load_backlog_items(backlog_path: Path, fmt: str) -> list[BacklogItem]:
                     f"backlog[{idx}].line は 0 以上の整数または null が必要です。",
                     exit_code=2,
                 )
+            section_val = row.get("section")
+            if section_val is not None and not isinstance(section_val, str):
+                raise DriftScreenError(
+                    "invalid_input_schema",
+                    f"backlog[{idx}].section は文字列または null が必要です。",
+                    exit_code=2,
+                )
             q_key = _sanitize_question_key(item_id, used_keys, idx + 1)
             items.append(
                 BacklogItem(
@@ -981,48 +835,17 @@ def load_backlog_items(backlog_path: Path, fmt: str) -> list[BacklogItem]:
                     file=file_val.strip() if isinstance(file_val, str) and file_val.strip() else None,
                     line=line_val,
                     text=text_val.strip(),
+                    section=section_val.strip() if isinstance(section_val, str) and section_val.strip() else None,
                 )
             )
         return items
 
-    # Markdown モード：フェンスコードブロック内のサンプルを除外しつつ - [ ] 行を抽出する
-    in_fence = False
-    fence_char = ""
-    fence_len = 0
-    seq = 0
-    rel_label = backlog_path.as_posix()
-    for line_no, line in enumerate(raw_text.splitlines(), start=1):
-        fence_match = FENCE_RE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if not in_fence:
-                in_fence = True
-                fence_char = marker[0]
-                fence_len = len(marker)
-                continue
-            if marker[0] == fence_char and len(marker) >= fence_len:
-                in_fence = False
-                fence_char = ""
-                fence_len = 0
-                continue
-        if in_fence:
-            continue
-        task_match = UNCHECKED_TASK_RE.match(line)
-        if not task_match:
-            continue
-        seq += 1
-        item_id = f"item_{seq:04d}"
-        q_key = _sanitize_question_key(item_id, used_keys, seq)
-        items.append(
-            BacklogItem(
-                id=item_id,
-                question_key=q_key,
-                file=rel_label,
-                line=line_no,
-                text=task_match.group(1).strip(),
-            )
-        )
-    return items
+    return _parse_markdown_backlog(
+        raw_text,
+        backlog_path.as_posix(),
+        fmt=resolved_fmt,
+        include_tables=include_tables,
+    )
 
 
 def build_backlog_payload(
@@ -1055,11 +878,12 @@ def build_backlog_payload(
     questions: dict[str, dict[str, Any]] = {}
     for item in items:
         loc = f"{item.file}:{item.line}" if item.file and item.line is not None else (item.file or "-")
+        section_line = f"\nSection: {item.section}" if item.section else ""
         questions[item.question_key] = {
             "type": "choice",
             "instructions": (
                 f"Based on the repository snapshot and recent commits, what is the current status "
-                f"of backlog item [{item.id}] (location: {loc})?\nItem text: {item.text}"
+                f"of backlog item [{item.id}] (location: {loc})?{section_line}\nItem text: {item.text}"
             ),
             "criteria": dict(BACKLOG_STATUS_CRITERIA),
         }
@@ -1121,6 +945,7 @@ def evaluate_backlog_response(
                 "question_key": item.question_key,
                 "file": item.file,
                 "line": item.line,
+                "section": item.section,
                 "text": item.text,
                 "status_choice": choice,
                 "confidence": round(conf, 4) if conf is not None else None,
@@ -1276,30 +1101,45 @@ def build_candidates_questions() -> dict[str, dict[str, Any]]:
     }
 
 
+def _format_candidate_block(candidate: AuditCandidate, *, cand_ns: str | None = None) -> str:
+    lines: list[str] = []
+    if cand_ns:
+        lines.append(f"Target Candidate [{cand_ns}]:")
+    lines.extend(
+        [
+            f"Candidate ID: {candidate.id}",
+            f"Category: {candidate.category}",
+            f"Title: {candidate.title}",
+            f"Files: {', '.join(candidate.files) if candidate.files else '(none)'}",
+        ]
+    )
+    if candidate.estimated_scope:
+        lines.append(f"Estimated Scope: {candidate.estimated_scope}")
+    lines.append(f"\nEvidence:\n{candidate.evidence}")
+    lines.append(f"\nObserved Symptom:\n{candidate.symptom}\n")
+    return "\n".join(lines)
+
+
 def build_candidate_payload(
     candidate: AuditCandidate,
     *,
     model: str = DEFAULT_MODEL,
     max_chars: int = DEFAULT_CANDIDATES_MAX_CHARS,
+    snapshot_text: str | None = None,
 ) -> dict[str, Any]:
     """candidates モード 1 候補分の Decisions API ペイロードを構築・検証する。"""
-    lines = [
-        f"Candidate ID: {candidate.id}",
-        f"Category: {candidate.category}",
-        f"Title: {candidate.title}",
-        f"Files: {', '.join(candidate.files) if candidate.files else '(none)'}",
-    ]
-    if candidate.estimated_scope:
-        lines.append(f"Estimated Scope: {candidate.estimated_scope}")
-    lines.append(f"\nEvidence:\n{candidate.evidence}")
-    lines.append(f"\nObserved Symptom:\n{candidate.symptom}\n")
+    input_text = _format_candidate_block(candidate)
+    input_blocks: list[dict[str, str]] = []
+    if snapshot_text is not None:
+        input_blocks.append({"type": "text", "text": snapshot_text + "\n\n"})
+    input_blocks.append({"type": "text", "text": input_text})
 
-    input_text = "\n".join(lines)
-    if len(input_text) > max_chars:
+    total_chars = sum(len(b["text"]) for b in input_blocks)
+    if total_chars > max_chars:
         raise DriftScreenError(
             "input_size_limit_exceeded",
             (
-                f"候補 {candidate.id} の入力文字数（{len(input_text):,} 文字）が上限 "
+                f"候補 {candidate.id} の入力文字数（{total_chars:,} 文字）が上限 "
                 f"{max_chars:,} 文字を超えています。evidence や symptom を要約して再実行してください。"
             ),
             exit_code=2,
@@ -1307,7 +1147,7 @@ def build_candidate_payload(
 
     payload: dict[str, Any] = {
         "model": model,
-        "input": [{"type": "text", "text": input_text}],
+        "input": input_blocks,
         "questions": build_candidates_questions(),
     }
     errors = run_decisions.validate_payload(payload)
@@ -1318,6 +1158,112 @@ def build_candidate_payload(
             exit_code=2,
         )
     return payload
+
+
+def build_candidate_chunks(
+    candidates: list[AuditCandidate],
+    *,
+    snapshot_text: str | None = None,
+    model: str = DEFAULT_MODEL,
+    max_chars: int = DEFAULT_CANDIDATES_MAX_CHARS,
+    chunk_max_items: int = DEFAULT_CHUNK_MAX_ITEMS,
+) -> list[dict[str, Any]]:
+    """candidates モードの候補群を共有スナップショット付きチャンク群へパッキングする。"""
+    if (
+        isinstance(chunk_max_items, bool)
+        or chunk_max_items < 1
+        or chunk_max_items > MAX_CHUNK_MAX_ITEMS
+    ):
+        raise DriftScreenError(
+            "invalid_chunk_max_items",
+            f"--chunk-max-items は 1 から {MAX_CHUNK_MAX_ITEMS} の整数を指定してください。",
+            exit_code=2,
+        )
+    if not candidates:
+        return []
+
+    base_questions = build_candidates_questions()
+    q_per_item = len(base_questions)
+    snapshot_prefix = (snapshot_text + "\n\n") if snapshot_text is not None else None
+    snapshot_chars = len(snapshot_prefix) if snapshot_prefix is not None else 0
+
+    packed_groups: list[list[tuple[str, AuditCandidate, str]]] = []
+    cur_group: list[tuple[str, AuditCandidate, str]] = []
+    cur_chars = snapshot_chars
+
+    for idx, cand in enumerate(candidates, start=1):
+        cand_ns = f"cand_{idx:04d}"
+        cand_block = _format_candidate_block(cand, cand_ns=cand_ns)
+        single_total = snapshot_chars + len(cand_block)
+        if single_total > max_chars:
+            raise DriftScreenError(
+                "input_size_limit_exceeded",
+                (
+                    f"候補 {cand.id} の入力文字数（{single_total:,} 文字）が上限 "
+                    f"{max_chars:,} 文字を超えています。evidence や symptom を要約して再実行してください。"
+                ),
+                exit_code=2,
+            )
+
+        next_count = len(cur_group) + 1
+        if cur_group and (
+            next_count > chunk_max_items
+            or next_count * q_per_item > MAX_QUESTIONS
+            or cur_chars + len(cand_block) > max_chars
+        ):
+            packed_groups.append(cur_group)
+            cur_group = []
+            cur_chars = snapshot_chars
+
+        cur_group.append((cand_ns, cand, cand_block))
+        cur_chars += len(cand_block)
+
+    if cur_group:
+        packed_groups.append(cur_group)
+
+    chunks: list[dict[str, Any]] = []
+    for chunk_index, group in enumerate(packed_groups):
+        input_blocks: list[dict[str, str]] = []
+        if snapshot_prefix is not None:
+            input_blocks.append({"type": "text", "text": snapshot_prefix})
+        questions: dict[str, dict[str, Any]] = {}
+        chunk_cands: list[AuditCandidate] = []
+        namespaces: list[str] = []
+
+        for cand_ns, cand, cand_block in group:
+            input_blocks.append({"type": "text", "text": cand_block})
+            chunk_cands.append(cand)
+            namespaces.append(cand_ns)
+            for base_key, base_q in base_questions.items():
+                q_copy = dict(base_q)
+                q_copy["instructions"] = (
+                    f"Target candidate [{cand_ns}]: {cand.id} ({cand.title})\n{base_q['instructions']}"
+                )
+                questions[f"{cand_ns}__{base_key}"] = q_copy
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": input_blocks,
+            "questions": questions,
+        }
+        errors = run_decisions.validate_payload(payload)
+        if errors:
+            raise DriftScreenError(
+                "payload_validation_failed",
+                f"candidates チャンク {chunk_index} のペイロード検証に失敗しました: " + "; ".join(errors),
+                exit_code=2,
+            )
+
+        chunks.append(
+            {
+                "chunk_index": chunk_index,
+                "namespaces": namespaces,
+                "candidates": chunk_cands,
+                "ids": [c.id for c in chunk_cands],
+                "payload": payload,
+            }
+        )
+    return chunks
 
 
 def classify_candidate_answers(
@@ -1383,194 +1329,8 @@ def classify_candidate_answers(
     return result
 
 
-_aggregate_usage = decision_common.aggregate_usage
-_escape_md_cell = decision_common.escape_md_cell
-
-
-def format_report_table(report: dict[str, Any]) -> str:
-    """3 サブコマンドの実行結果またはドライラン結果を Markdown 表形式へ整形する。"""
-    subcmd = report.get("subcommand")
-    status = report.get("status")
-
-    if status == "dry_run":
-        if subcmd == "docs":
-            lines = [
-                "| file | staleness_days | missing_hints | input_chars | questions | status |",
-                "| --- | --- | --- | --- | --- | --- |",
-            ]
-            for item in report.get("items") or []:
-                payload = item.get("payload") or {}
-                in_chars = sum(len(b.get("text", "")) for b in payload.get("input") or [])
-                q_count = len(payload.get("questions") or {})
-                stale = item.get("staleness_days")
-                stale_str = str(stale) if stale is not None else "-"
-                hints = len(item.get("missing_path_hints") or [])
-                lines.append(
-                    f"| {_escape_md_cell(item.get('file'))} | {stale_str} | {hints} | "
-                    f"{in_chars} | {q_count} | validated |"
-                )
-            lines.append("")
-            lines.append(f"Summary: dry_run subcommand=docs total={report.get('total', 0)}")
-            return "\n".join(lines)
-
-        if subcmd == "backlog":
-            payload = report.get("payload") or {}
-            in_chars = sum(len(b.get("text", "")) for b in payload.get("input") or [])
-            q_count = len(payload.get("questions") or {})
-            lines = [
-                "| id | question_key | location | text |",
-                "| --- | --- | --- | --- |",
-            ]
-            for item in report.get("items") or []:
-                loc = (
-                    f"{item.get('file')}:{item.get('line')}"
-                    if item.get("file") and item.get("line") is not None
-                    else (item.get("file") or "-")
-                )
-                lines.append(
-                    f"| {_escape_md_cell(item.get('id'))} | {_escape_md_cell(item.get('question_key'))} | "
-                    f"{_escape_md_cell(loc)} | {_escape_md_cell(item.get('text'))} |"
-                )
-            lines.append("")
-            lines.append(
-                f"Summary: dry_run subcommand=backlog total={report.get('total', 0)}, "
-                f"shared_input_chars={in_chars}, questions={q_count}"
-            )
-            return "\n".join(lines)
-
-        lines = [
-            "| id | category | title | input_chars | questions | status |",
-            "| --- | --- | --- | --- | --- | --- |",
-        ]
-        for item in report.get("items") or []:
-            payload = item.get("payload") or {}
-            in_chars = sum(len(b.get("text", "")) for b in payload.get("input") or [])
-            q_count = len(payload.get("questions") or {})
-            lines.append(
-                f"| {_escape_md_cell(item.get('id'))} | {_escape_md_cell(item.get('category'))} | "
-                f"{_escape_md_cell(item.get('title'))} | {in_chars} | {q_count} | validated |"
-            )
-        lines.append("")
-        lines.append(f"Summary: dry_run subcommand=candidates total={report.get('total', 0)}")
-        return "\n".join(lines)
-
-    if subcmd == "docs":
-        results = report.get("results") or []
-        lines = [
-            "| file | bucket | action | conf | stale | broken | mech | sev | hints |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-        ]
-        for row in results:
-            conf = row.get("action_confidence")
-            stale = row.get("stale_status_or_facts")
-            broken = row.get("broken_or_obsolete_refs")
-            mech = row.get("mechanizable_workflow")
-            sev = row.get("drift_severity")
-            hints = len(row.get("missing_path_hints") or [])
-            lines.append(
-                f"| {_escape_md_cell(row.get('file'))} | {_escape_md_cell(row.get('bucket'))} | "
-                f"{_escape_md_cell(row.get('recommended_action'))} | "
-                f"{f'{conf:.2f}' if _is_real_number(conf) else '-'} | "
-                f"{f'{stale:.2f}' if _is_real_number(stale) else '-'} | "
-                f"{f'{broken:.2f}' if _is_real_number(broken) else '-'} | "
-                f"{f'{mech:.2f}' if _is_real_number(mech) else '-'} | "
-                f"{f'{sev:.2f}' if _is_real_number(sev) else '-'} | {hints} |"
-            )
-        summary = report.get("summary") or {}
-        lines.append("")
-        lines.append(
-            f"Summary: total={report.get('total', 0)}, "
-            f"prioritize_for_audit={summary.get('prioritize_for_audit', 0)}, "
-            f"mechanization_candidate={summary.get('mechanization_candidate', 0)}, "
-            f"low_priority_clean={summary.get('low_priority_clean', 0)}"
-        )
-        usage = report.get("usage")
-        if isinstance(usage, dict):
-            lines.append(
-                f"usage: input_tokens={usage.get('total_input_tokens')}, "
-                f"output_tokens={usage.get('total_output_tokens')}"
-            )
-        if report.get("note"):
-            lines.append(f"Note: {report['note']}")
-        return "\n".join(lines)
-
-    if subcmd == "backlog":
-        results = report.get("results") or []
-        lines = [
-            "| id | location | status_choice | conf | needs_verification | text |",
-            "| --- | --- | --- | --- | --- | --- |",
-        ]
-        for row in results:
-            loc = (
-                f"{row.get('file')}:{row.get('line')}"
-                if row.get("file") and row.get("line") is not None
-                else (row.get("file") or "-")
-            )
-            conf = row.get("confidence")
-            lines.append(
-                f"| {_escape_md_cell(row.get('id'))} | {_escape_md_cell(loc)} | "
-                f"{_escape_md_cell(row.get('status_choice'))} | "
-                f"{f'{conf:.2f}' if _is_real_number(conf) else '-'} | "
-                f"{'true' if row.get('needs_verification') else 'false'} | "
-                f"{_escape_md_cell(row.get('text'))} |"
-            )
-        summary = report.get("summary") or {}
-        lines.append("")
-        lines.append(
-            f"Summary: total={report.get('total', 0)}, "
-            f"needs_verification={summary.get('needs_verification', 0)}, "
-            f"still_open={summary.get('still_open', 0)}"
-        )
-        usage = report.get("usage")
-        if isinstance(usage, dict):
-            lines.append(
-                f"usage: input_tokens={usage.get('total_input_tokens')}, "
-                f"output_tokens={usage.get('total_output_tokens')}"
-            )
-        return "\n".join(lines)
-
-    results = report.get("results") or []
-    lines = [
-        "| id | route | conf | single_track | discuss | mech | severity | parent_review | title |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    for row in results:
-        conf = row.get("route_confidence")
-        fits = row.get("fits_single_track")
-        disc = row.get("needs_discussion")
-        mech = row.get("deterministic_mechanizable")
-        sev = row.get("impact_severity")
-        lines.append(
-            f"| {_escape_md_cell(row.get('id'))} | {_escape_md_cell(row.get('dispatch_route'))} | "
-            f"{f'{conf:.2f}' if _is_real_number(conf) else '-'} | "
-            f"{f'{fits:.2f}' if _is_real_number(fits) else '-'} | "
-            f"{f'{disc:.2f}' if _is_real_number(disc) else '-'} | "
-            f"{f'{mech:.2f}' if _is_real_number(mech) else '-'} | "
-            f"{f'{sev:.2f}' if _is_real_number(sev) else '-'} | "
-            f"{'true' if row.get('needs_parent_review') else 'false'} | "
-            f"{_escape_md_cell(row.get('title'))} |"
-        )
-    summary = report.get("summary") or {}
-    lines.append("")
-    lines.append(
-        f"Summary: total={report.get('total', 0)}, "
-        f"needs_parent_review={summary.get('needs_parent_review', 0)}, "
-        f"ready={summary.get('ready', 0)}"
-    )
-    usage = report.get("usage")
-    if isinstance(usage, dict):
-        lines.append(
-            f"usage: input_tokens={usage.get('total_input_tokens')}, "
-            f"output_tokens={usage.get('total_output_tokens')}"
-        )
-    return "\n".join(lines)
-
-
-def _emit_report(report: dict[str, Any], output_format: str) -> None:
-    if output_format == "table":
-        print(format_report_table(report))
-    else:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+def _emit_report(report: dict[str, Any], output_format: str) -> bool:
+    return emit_report(report, output_format)
 
 
 def _emit_error(
@@ -1580,7 +1340,7 @@ def _emit_error(
     output_format: str,
     api_key: str,
 ) -> None:
-    decision_common.emit_cli_error(code, message, exit_code, output_format, api_key)
+    emit_error(code, message, exit_code, output_format, api_key)
 
 
 def _require_api_key(api_key: str) -> None:
@@ -1594,7 +1354,8 @@ def _require_api_key(api_key: str) -> None:
 
 
 def _validate_common_args(args: argparse.Namespace) -> None:
-    if getattr(args, "timeout", 1.0) <= 0:
+    raw_timeout = getattr(args, "timeout", None)
+    if raw_timeout is not None and (isinstance(raw_timeout, bool) or raw_timeout <= 0):
         raise DriftScreenError("invalid_timeout", "--timeout は 0 より大きい数を指定してください。", exit_code=2)
     if getattr(args, "max_chars", 1) < 1:
         raise DriftScreenError("invalid_max_chars", "--max-chars は 1 以上の整数を指定してください。", exit_code=2)
@@ -1615,6 +1376,60 @@ def _validate_common_args(args: argparse.Namespace) -> None:
             "--discussion-threshold は 0.0 から 1.0 の範囲で指定してください。",
             exit_code=2,
         )
+    backend = getattr(args, "backend", "auto")
+    if backend not in run_decisions.VALID_BACKENDS:
+        raise DriftScreenError(
+            "invalid_backend",
+            f"--backend は {sorted(run_decisions.VALID_BACKENDS)} のいずれかを指定してください。",
+            exit_code=2,
+        )
+    if raw_timeout is not None and backend == "sdk":
+        raise DriftScreenError(
+            "invalid_argument",
+            "--backend sdk では明示的な --timeout 指定に対応していません（--backend auto または rest を指定してください）。",
+            exit_code=2,
+        )
+    if hasattr(args, "chunk_max_docs"):
+        val = args.chunk_max_docs
+        if isinstance(val, bool) or val < 1 or val > MAX_CHUNK_MAX_DOCS:
+            raise DriftScreenError(
+                "invalid_chunk_max_docs",
+                f"--chunk-max-docs は 1 から {MAX_CHUNK_MAX_DOCS} の整数を指定してください。",
+                exit_code=2,
+            )
+    if hasattr(args, "chunk_max_items"):
+        val = args.chunk_max_items
+        if isinstance(val, bool) or val < 1 or val > MAX_CHUNK_MAX_ITEMS:
+            raise DriftScreenError(
+                "invalid_chunk_max_items",
+                f"--chunk-max-items は 1 から {MAX_CHUNK_MAX_ITEMS} の整数を指定してください。",
+                exit_code=2,
+            )
+
+
+def _resolve_effective_timeout_and_backend(args: argparse.Namespace) -> tuple[float, str]:
+    raw_timeout = getattr(args, "timeout", None)
+    backend = getattr(args, "backend", "auto")
+    if raw_timeout is None:
+        return DEFAULT_TIMEOUT, backend
+    effective_backend = "rest" if backend == "auto" else backend
+    return float(raw_timeout), effective_backend
+
+
+def _unnamespace_answers(
+    enriched_answers: Any,
+    ns: str,
+    base_keys: tuple[str, ...],
+) -> dict[str, Any]:
+    if not isinstance(enriched_answers, dict):
+        return {}
+    prefix = f"{ns}__"
+    extracted: dict[str, Any] = {}
+    for base_key in base_keys:
+        full_key = f"{prefix}{base_key}"
+        if full_key in enriched_answers:
+            extracted[base_key] = enriched_answers[full_key]
+    return extracted
 
 
 def _run_docs_subcommand(
@@ -1630,32 +1445,67 @@ def _run_docs_subcommand(
 
     rel_paths = select_doc_files(ctx, args.paths if args.paths else None)
     entries = load_doc_entries(ctx, rel_paths)
-    payloads = [
-        build_doc_payload(entry, snapshot_text, model=args.model, max_chars=args.max_chars)
-        for entry in entries
-    ]
+    batch_mode = getattr(args, "batch_mode", "chunk")
 
-    if args.dry_run:
-        _emit_report(
-            {
-                "status": "dry_run",
-                "subcommand": "docs",
-                "model": args.model,
-                "is_git": ctx.is_git,
-                "total": len(entries),
-                "items": [
-                    {
-                        "file": e.rel_path,
-                        "staleness_days": e.staleness_days,
-                        "missing_path_hints": e.missing_path_hints,
-                        "payload": p,
-                    }
-                    for e, p in zip(entries, payloads)
-                ],
-            },
-            args.format,
+    if batch_mode == "single":
+        payloads = [
+            build_doc_payload(entry, snapshot_text, model=args.model, max_chars=args.max_chars)
+            for entry in entries
+        ]
+        if args.dry_run:
+            _emit_report(
+                {
+                    "status": "dry_run",
+                    "subcommand": "docs",
+                    "batch_mode": "single",
+                    "model": args.model,
+                    "is_git": ctx.is_git,
+                    "total": len(entries),
+                    "items": [
+                        {
+                            "file": e.rel_path,
+                            "staleness_days": e.staleness_days,
+                            "missing_path_hints": e.missing_path_hints,
+                            "missing_flag_hints": e.missing_flag_hints,
+                            "payload": p,
+                        }
+                        for e, p in zip(entries, payloads)
+                    ],
+                },
+                args.format,
+            )
+            return 0
+    else:
+        chunks = build_doc_chunks(
+            entries,
+            snapshot_text,
+            model=args.model,
+            max_chars=args.max_chars,
+            chunk_max_docs=args.chunk_max_docs,
         )
-        return 0
+        if args.dry_run:
+            _emit_report(
+                {
+                    "status": "dry_run",
+                    "subcommand": "docs",
+                    "batch_mode": "chunk",
+                    "model": args.model,
+                    "is_git": ctx.is_git,
+                    "total": len(entries),
+                    "chunk_count": len(chunks),
+                    "chunks": [
+                        {
+                            "chunk_index": ch["chunk_index"],
+                            "files": ch["files"],
+                            "missing_flag_hints": ch["missing_flag_hints"],
+                            "payload": ch["payload"],
+                        }
+                        for ch in chunks
+                    ],
+                },
+                args.format,
+            )
+            return 0
 
     if not entries:
         _emit_report(
@@ -1678,22 +1528,65 @@ def _run_docs_subcommand(
         return 0
 
     _require_api_key(api_key)
+    effective_timeout, effective_backend = _resolve_effective_timeout_and_backend(args)
 
-    def _call_one(entry: DocEntry, payload: dict[str, Any]) -> dict[str, Any]:
-        raw = run_decisions.call_decisions_api(
-            payload,
-            api_key=api_key,
-            endpoint=args.endpoint,
-            timeout=args.timeout,
-            opener=opener,
-        )
-        enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
-        return classify_doc_answers(entry, enriched, min_confidence=args.min_confidence)
+    if batch_mode == "single":
+        def _call_one(entry: DocEntry, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
+            raw, used_backend = run_decisions.call_decisions_backend(
+                payload,
+                api_key=api_key,
+                backend=effective_backend,
+                endpoint=args.endpoint,
+                timeout=effective_timeout,
+                opener=opener,
+            )
+            enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
+            return classify_doc_answers(entry, enriched, min_confidence=args.min_confidence), used_backend
 
-    worker_count = max(1, min(args.max_workers, len(entries)))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(_call_one, e, p) for e, p in zip(entries, payloads)]
-        results = [future.result() for future in futures]
+        worker_count = max(1, min(args.max_workers, len(entries)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_call_one, e, p) for e, p in zip(entries, payloads)]
+            pair_results = [future.result() for future in futures]
+
+        results = [row for row, _ in pair_results]
+        used_backends = sorted({b for _, b in pair_results})
+        usage_summary = _aggregate_usage(results)
+    else:
+        doc_q_keys = tuple(build_docs_questions().keys())
+
+        def _call_chunk(chunk: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+            raw, used_backend = run_decisions.call_decisions_backend(
+                chunk["payload"],
+                api_key=api_key,
+                backend=effective_backend,
+                endpoint=args.endpoint,
+                timeout=effective_timeout,
+                opener=opener,
+            )
+            enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
+            chunk_rows: list[dict[str, Any]] = []
+            for doc_ns, entry in zip(chunk["namespaces"], chunk["entries"]):
+                doc_answers = _unnamespace_answers(enriched.get("answers"), doc_ns, doc_q_keys)
+                doc_enriched = {"answers": doc_answers}
+                chunk_rows.append(
+                    classify_doc_answers(entry, doc_enriched, min_confidence=args.min_confidence)
+                )
+            usage_record = (
+                {"usage": enriched["usage"]}
+                if isinstance(enriched.get("usage"), dict)
+                else {}
+            )
+            return chunk_rows, usage_record, used_backend
+
+        worker_count = max(1, min(args.max_workers, len(chunks)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_call_chunk, ch) for ch in chunks]
+            chunk_outputs = [future.result() for future in futures]
+
+        results = [row for chunk_rows, _, _ in chunk_outputs for row in chunk_rows]
+        usage_records = [u_rec for _, u_rec, _ in chunk_outputs if u_rec]
+        used_backends = sorted({b for _, _, b in chunk_outputs})
+        usage_summary = _aggregate_usage(usage_records)
 
     summary = {
         "prioritize_for_audit": sum(1 for r in results if r["bucket"] == "prioritize_for_audit"),
@@ -1703,6 +1596,8 @@ def _run_docs_subcommand(
     report: dict[str, Any] = {
         "status": "completed",
         "subcommand": "docs",
+        "batch_mode": batch_mode,
+        "backend": used_backends[0] if len(used_backends) == 1 else ",".join(used_backends),
         "model": args.model,
         "is_git": ctx.is_git,
         "total": len(results),
@@ -1710,7 +1605,6 @@ def _run_docs_subcommand(
         "results": results,
         "note": LOW_PRIORITY_CLEAN_NOTE,
     }
-    usage_summary = _aggregate_usage(results)
     if usage_summary is not None:
         report["usage"] = usage_summary
 
@@ -1729,7 +1623,11 @@ def _run_backlog_subcommand(
     snapshot_text = build_repo_snapshot_text(ctx, facts_blocks)
     assert_text_has_no_secrets(snapshot_text, "リポジトリスナップショット")
 
-    items = load_backlog_items(Path(args.backlog), args.backlog_format)
+    items = load_backlog_items(
+        Path(args.backlog),
+        args.backlog_format,
+        include_tables=getattr(args, "include_tables", False),
+    )
     if not items and not args.dry_run:
         _emit_report(
             {
@@ -1781,6 +1679,7 @@ def _run_backlog_subcommand(
                         "question_key": it.question_key,
                         "file": it.file,
                         "line": it.line,
+                        "section": it.section,
                         "text": it.text,
                     }
                     for it in items
@@ -1792,11 +1691,13 @@ def _run_backlog_subcommand(
         return 0
 
     _require_api_key(api_key)
-    raw = run_decisions.call_decisions_api(
+    effective_timeout, effective_backend = _resolve_effective_timeout_and_backend(args)
+    raw, used_backend = run_decisions.call_decisions_backend(
         payload,
         api_key=api_key,
+        backend=effective_backend,
         endpoint=args.endpoint,
-        timeout=args.timeout,
+        timeout=effective_timeout,
         opener=opener,
     )
     enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
@@ -1806,6 +1707,7 @@ def _run_backlog_subcommand(
     report: dict[str, Any] = {
         "status": "completed",
         "subcommand": "backlog",
+        "backend": used_backend,
         "model": args.model,
         "is_git": ctx.is_git,
         "total": len(results),
@@ -1836,6 +1738,12 @@ def _load_candidates_json(
     if input_path:
         path = Path(input_path)
         assert_safe_file_path(path, "--input")
+        if os.path.lexists(path) and is_reparse_or_symlink(path):
+            raise DriftScreenError(
+                "unsafe_input_file",
+                f"--input にシンボリックリンクまたはリパースポイントは指定できません: {input_path}",
+                exit_code=2,
+            )
         try:
             raw_text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -1853,6 +1761,25 @@ def _load_candidates_json(
         raise DriftScreenError("invalid_json", f"入力 JSON の構文が不正です: {exc}", exit_code=2) from exc
 
 
+def _build_optional_candidates_snapshot(args: argparse.Namespace) -> tuple[str | None, bool | None]:
+    repo_arg = getattr(args, "repo", None)
+    facts_files = getattr(args, "facts_file", []) or []
+    if repo_arg is not None:
+        ctx = collect_repo_context(Path(repo_arg), getattr(args, "git_log_limit", DEFAULT_CANDIDATES_GIT_LOG_LIMIT))
+        facts_blocks = load_facts_blocks(facts_files)
+        snapshot_text = build_repo_snapshot_text(ctx, facts_blocks)
+        assert_text_has_no_secrets(snapshot_text, "リポジトリスナップショット")
+        return snapshot_text, ctx.is_git
+    if facts_files:
+        facts_blocks = load_facts_blocks(facts_files)
+        snapshot_text = "\n\n".join(
+            f"Supplemental Facts ({label}):\n{content}" for label, content in facts_blocks
+        )
+        assert_text_has_no_secrets(snapshot_text, "補助事実テキスト")
+        return snapshot_text, None
+    return None, None
+
+
 def _run_candidates_subcommand(
     args: argparse.Namespace,
     *,
@@ -1862,16 +1789,24 @@ def _run_candidates_subcommand(
 ) -> int:
     raw_data = _load_candidates_json(args.input, args.stdin, stdin_text)
     candidates = parse_candidates(raw_data)
-    payloads = [
-        build_candidate_payload(c, model=args.model, max_chars=args.max_chars)
-        for c in candidates
-    ]
+    snapshot_text, is_git_flag = _build_optional_candidates_snapshot(args)
+    batch_mode = getattr(args, "batch_mode", "chunk")
 
-    if args.dry_run:
-        _emit_report(
-            {
+    if batch_mode == "single":
+        payloads = [
+            build_candidate_payload(
+                c,
+                model=args.model,
+                max_chars=args.max_chars,
+                snapshot_text=snapshot_text,
+            )
+            for c in candidates
+        ]
+        if args.dry_run:
+            dry_report: dict[str, Any] = {
                 "status": "dry_run",
                 "subcommand": "candidates",
+                "batch_mode": "single",
                 "model": args.model,
                 "total": len(candidates),
                 "items": [
@@ -1883,10 +1818,40 @@ def _run_candidates_subcommand(
                     }
                     for c, p in zip(candidates, payloads)
                 ],
-            },
-            args.format,
+            }
+            if is_git_flag is not None:
+                dry_report["is_git"] = is_git_flag
+            _emit_report(dry_report, args.format)
+            return 0
+    else:
+        chunks = build_candidate_chunks(
+            candidates,
+            snapshot_text=snapshot_text,
+            model=args.model,
+            max_chars=args.max_chars,
+            chunk_max_items=args.chunk_max_items,
         )
-        return 0
+        if args.dry_run:
+            dry_report = {
+                "status": "dry_run",
+                "subcommand": "candidates",
+                "batch_mode": "chunk",
+                "model": args.model,
+                "total": len(candidates),
+                "chunk_count": len(chunks),
+                "chunks": [
+                    {
+                        "chunk_index": ch["chunk_index"],
+                        "ids": ch["ids"],
+                        "payload": ch["payload"],
+                    }
+                    for ch in chunks
+                ],
+            }
+            if is_git_flag is not None:
+                dry_report["is_git"] = is_git_flag
+            _emit_report(dry_report, args.format)
+            return 0
 
     if not candidates:
         _emit_report(
@@ -1903,32 +1868,83 @@ def _run_candidates_subcommand(
         return 0
 
     _require_api_key(api_key)
+    effective_timeout, effective_backend = _resolve_effective_timeout_and_backend(args)
 
-    def _call_one(candidate: AuditCandidate, payload: dict[str, Any]) -> dict[str, Any]:
-        raw = run_decisions.call_decisions_api(
-            payload,
-            api_key=api_key,
-            endpoint=args.endpoint,
-            timeout=args.timeout,
-            opener=opener,
-        )
-        enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
-        return classify_candidate_answers(
-            candidate,
-            enriched,
-            min_confidence=args.min_confidence,
-            discussion_threshold=args.discussion_threshold,
-        )
+    if batch_mode == "single":
+        def _call_one(candidate: AuditCandidate, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
+            raw, used_backend = run_decisions.call_decisions_backend(
+                payload,
+                api_key=api_key,
+                backend=effective_backend,
+                endpoint=args.endpoint,
+                timeout=effective_timeout,
+                opener=opener,
+            )
+            enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
+            row = classify_candidate_answers(
+                candidate,
+                enriched,
+                min_confidence=args.min_confidence,
+                discussion_threshold=args.discussion_threshold,
+            )
+            return row, used_backend
 
-    worker_count = max(1, min(args.max_workers, len(candidates)))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(_call_one, c, p) for c, p in zip(candidates, payloads)]
-        results = [future.result() for future in futures]
+        worker_count = max(1, min(args.max_workers, len(candidates)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_call_one, c, p) for c, p in zip(candidates, payloads)]
+            pair_results = [future.result() for future in futures]
+
+        results = [row for row, _ in pair_results]
+        used_backends = sorted({b for _, b in pair_results})
+        usage_summary = _aggregate_usage(results)
+    else:
+        cand_q_keys = tuple(build_candidates_questions().keys())
+
+        def _call_chunk(chunk: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+            raw, used_backend = run_decisions.call_decisions_backend(
+                chunk["payload"],
+                api_key=api_key,
+                backend=effective_backend,
+                endpoint=args.endpoint,
+                timeout=effective_timeout,
+                opener=opener,
+            )
+            enriched = run_decisions.enrich_response(raw, min_confidence=args.min_confidence)
+            chunk_rows: list[dict[str, Any]] = []
+            for cand_ns, cand in zip(chunk["namespaces"], chunk["candidates"]):
+                cand_answers = _unnamespace_answers(enriched.get("answers"), cand_ns, cand_q_keys)
+                cand_enriched = {"answers": cand_answers}
+                chunk_rows.append(
+                    classify_candidate_answers(
+                        cand,
+                        cand_enriched,
+                        min_confidence=args.min_confidence,
+                        discussion_threshold=args.discussion_threshold,
+                    )
+                )
+            usage_record = (
+                {"usage": enriched["usage"]}
+                if isinstance(enriched.get("usage"), dict)
+                else {}
+            )
+            return chunk_rows, usage_record, used_backend
+
+        worker_count = max(1, min(args.max_workers, len(chunks)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_call_chunk, ch) for ch in chunks]
+            chunk_outputs = [future.result() for future in futures]
+
+        results = [row for chunk_rows, _, _ in chunk_outputs for row in chunk_rows]
+        usage_records = [u_rec for _, u_rec, _ in chunk_outputs if u_rec]
+        used_backends = sorted({b for _, _, b in chunk_outputs})
+        usage_summary = _aggregate_usage(usage_records)
 
     review_count = sum(1 for r in results if r["needs_parent_review"])
     report: dict[str, Any] = {
         "status": "completed",
         "subcommand": "candidates",
+        "batch_mode": batch_mode,
+        "backend": used_backends[0] if len(used_backends) == 1 else ",".join(used_backends),
         "model": args.model,
         "total": len(results),
         "summary": {
@@ -1937,7 +1953,8 @@ def _run_candidates_subcommand(
         },
         "results": results,
     }
-    usage_summary = _aggregate_usage(results)
+    if is_git_flag is not None:
+        report["is_git"] = is_git_flag
     if usage_summary is not None:
         report["usage"] = usage_summary
 
@@ -1947,8 +1964,19 @@ def _run_candidates_subcommand(
 
 def _add_shared_api_options(parser: argparse.ArgumentParser, default_max_chars: int) -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="モデル ID（既定: gemini-decision-1）")
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "sdk", "rest"),
+        default="auto",
+        help="API 呼び出し経路（既定: auto、SDK 優先で REST フォールバック）",
+    )
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Decisions API エンドポイント URL")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP タイムアウト秒（既定: 30）")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="HTTP タイムアウト秒（既定: 30、明示指定時は REST 経路を使用）",
+    )
     parser.add_argument(
         "--min-confidence",
         type=float,
@@ -2010,6 +2038,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_WORKERS,
         help="並列リクエスト数上限（既定: 4）",
     )
+    docs_parser.add_argument(
+        "--batch-mode",
+        choices=("chunk", "single"),
+        default="chunk",
+        help="バッチ送信方式（既定: chunk、single で従来の 1 文書 1 リクエスト）",
+    )
+    docs_parser.add_argument(
+        "--chunk-max-docs",
+        type=int,
+        default=DEFAULT_CHUNK_MAX_DOCS,
+        help=f"chunk モード時の 1 チャンクあたり最大文書数（1..{MAX_CHUNK_MAX_DOCS}、既定: {DEFAULT_CHUNK_MAX_DOCS}）",
+    )
     _add_shared_api_options(docs_parser, DEFAULT_DOCS_MAX_CHARS)
 
     backlog_parser = subparsers.add_parser(
@@ -2019,9 +2059,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     backlog_parser.add_argument("--backlog", required=True, help="残課題帳簿ファイル（Markdown または JSON）")
     backlog_parser.add_argument(
         "--backlog-format",
-        choices=("auto", "markdown", "json"),
+        choices=("auto", "markdown", "table", "json"),
         default="auto",
         help="残課題ファイルの形式（既定: auto）",
+    )
+    backlog_parser.add_argument(
+        "--include-tables",
+        action="store_true",
+        help="auto/markdown モード時にチェックボックスと併せて Markdown 表からも未完了項目を抽出する",
     )
     backlog_parser.add_argument("--repo", default=".", help="対象リポジトリルート（既定: .）")
     backlog_parser.add_argument(
@@ -2044,6 +2089,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     cand_parser.add_argument("--input", default=None, help="候補 JSON 配列ファイルのパス")
     cand_parser.add_argument("--stdin", action="store_true", help="標準入力から候補 JSON 配列を読み込む")
+    cand_parser.add_argument(
+        "--repo",
+        default=None,
+        help="任意: 共有スナップショットを構築する対象リポジトリルート",
+    )
+    cand_parser.add_argument(
+        "--facts-file",
+        action="append",
+        default=[],
+        help="共有スナップショットへ追加する補助事実テキストファイル（複数指定可）",
+    )
+    cand_parser.add_argument(
+        "--git-log-limit",
+        type=int,
+        default=DEFAULT_CANDIDATES_GIT_LOG_LIMIT,
+        help="--repo 指定時にスナップショットへ含める直近コミット件数（既定: 30）",
+    )
+    cand_parser.add_argument(
+        "--batch-mode",
+        choices=("chunk", "single"),
+        default="chunk",
+        help="バッチ送信方式（既定: chunk、single で従来の 1 候補 1 リクエスト）",
+    )
+    cand_parser.add_argument(
+        "--chunk-max-items",
+        type=int,
+        default=DEFAULT_CHUNK_MAX_ITEMS,
+        help=f"chunk モード時の 1 チャンクあたり最大候補数（1..{MAX_CHUNK_MAX_ITEMS}、既定: {DEFAULT_CHUNK_MAX_ITEMS}）",
+    )
     cand_parser.add_argument(
         "--max-workers",
         type=int,
@@ -2105,7 +2179,20 @@ def main(
         msg = exc.message if isinstance(exc, run_decisions.ApiRequestError) else str(exc)
         _emit_error("api_request_failed", f"API 呼び出しエラー: {msg}", 1, args.format, api_key)
         return 1
+    except OSError as exc:
+        if decision_common.is_broken_pipe_error(exc):
+            discard_fn = getattr(drift_format, "discard_broken_stdout", None)
+            if callable(discard_fn):
+                discard_fn()
+            return 0
+        _emit_error("unexpected_error", str(exc), 2, args.format, api_key)
+        return 2
     except Exception as exc:  # noqa: BLE001
+        if decision_common.is_broken_pipe_error(exc):
+            discard_fn = getattr(drift_format, "discard_broken_stdout", None)
+            if callable(discard_fn):
+                discard_fn()
+            return 0
         _emit_error("unexpected_error", str(exc), 2, args.format, api_key)
         return 2
 
