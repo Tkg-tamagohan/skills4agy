@@ -71,6 +71,7 @@ python "$HOME/.gemini/config/plugins/shared-skills/skills/pr-review-triage/scrip
 2. ユーザーから反映指示を受けたら、次の順序で実行する（`git push --force` と既定ブランチへの直接 push は行わない）。
    1. 入力テキスト（コミットメッセージ、返信計画 JSON、サマリコメント、PR 本文等）は PowerShell の `"..."` や `@"..."@` を経由せず `write_file` で `$env:TEMP` または `scratch/` 配下へ BOM なし UTF-8 で書き出す（全コマンドで秘密情報、BOM、`U+FFFD`、および想定外 ASCII 制御文字と単独 CR の検査を強制）。
    2. `pr_ops.py commit-push --files <対象ファイル...> --message-file <msg.txt>` で明示ファイルのみ `git add`、コミット、`git push origin <branch>` を実行し、新コミット SHA を確定させる。
+      - コミット対象ファイルも秘密情報検査（`BEARER_TOKEN_RE` を含む）の対象であり、テストコード内の擬似トークンを静的リテラルで書くと `secret_detected` で遮断されるため、ルール `test-conventions` に従い実行時の文字列結合で組み立てる。
    3. `pr_ops.py apply-triage --plan <plan.json> --commit-sha <head_sha>` で確定 SHA 差し替え済みの日本語スレッド返信、`resolveReviewThread`、`pr_guardrails.py` 検証済みマーカーブロック付きの日本語サマリコメント投稿（`gh pr comment --body-file`）、および GraphQL 再取得、strict 復元、および `U+FFFD` 検証までを一括実行する。
    4. PR マージ後もリポジトリ全体で守るべき恒久化候補がある場合は、リポジトリ内ファイルを勝手に編集せず、Stage 3 の完了報告で反映先案（`AGENTS.md`、`.agents/rules/`、`.agents/invariants.json` 等）を提案のみ提示する。
 
