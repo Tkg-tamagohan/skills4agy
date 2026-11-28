@@ -1521,5 +1521,332 @@ class TestPrOpsCommitPush(unittest.TestCase):
             self.assertEqual(code, 2)
 
 
+class TestPrOpsControlChars(unittest.TestCase):
+    """想定外 ASCII 制御文字・単独 CR の検出・許容仕様 (CTRL-01〜CTRL-05) を検証する。"""
+
+    def test_ctrl_01_validate_text_hygiene_rejects_control_chars_and_allows_lf_tab_crlf(self) -> None:
+        invalid_cases = [
+            ("bel", "abc\x07def", "\x07", "U+0007"),
+            ("bs", "abc\x08def", "\x08", "U+0008"),
+            ("vt", "abc\x0bdef", "\x0b", "U+000B"),
+            ("ff", "abc\x0cdef", "\x0c", "U+000C"),
+            ("esc", "abc\x1bdef", "\x1b", "U+001B"),
+            ("del", "abc\x7fdef", "\x7f", "U+007F"),
+            ("nul", "abc\x00def", "\x00", "U+0000"),
+            ("lone_cr_mid", "abc\rdef", "\r", "U+000D"),
+            ("lone_cr_trailing", "abcdef\r", "\r", "U+000D"),
+            ("lone_cr_before_crlf", "abc\r\r\ndef", "\r", "U+000D"),
+        ]
+        for case_name, sample, raw_ch, expected_code in invalid_cases:
+            with self.subTest(case=case_name):
+                with self.assertRaises(pr_ops.PrOpsError) as cm:
+                    pr_ops._validate_text_hygiene(sample, f"field_{case_name}")
+                self.assertEqual(cm.exception.code, "control_char_detected")
+                self.assertIn(expected_code, cm.exception.message)
+                self.assertNotIn(raw_ch, cm.exception.message)
+
+        valid_text = "日本語テキスト\n2行目\r\n\tインデント `inline` と\n```python\nprint('ok')\r\n```\n"
+        pr_ops._validate_text_hygiene(valid_text, "valid_markdown")
+
+        # forbid_control_chars=False 時は制御文字を許容しつつ、秘密情報と U+FFFD 検査は維持する
+        pr_ops._validate_text_hygiene(
+            "allow\x00\x07\x08\x0b\x0c\x1b\x7f\rall",
+            "relaxed_ctrl",
+            forbid_control_chars=False,
+        )
+        with self.assertRaises(pr_ops.PrOpsError) as cm_ufffd:
+            pr_ops._validate_text_hygiene("bad\x07\ufffd", "still_ufffd", forbid_control_chars=False)
+        self.assertEqual(cm_ufffd.exception.code, "replacement_char_detected")
+
+    def test_ctrl_02_apply_triage_blocks_json_escaped_and_summary_file_control_chars(self) -> None:
+        def fail_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+            raise AssertionError(f"Validation failure must not invoke commands: {cmd}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+
+            # JSON エスケープされた制御文字 (\b, \f, \u0007, 単独 \r) を検出する
+            escaped_plans = [
+                ("json_bs", '{"replies": [{"thread_id": "PRRT_12345678", "body": "bad\\btext"}]}', "U+0008"),
+                ("json_ff", '{"summary_comment": "bad\\ftext"}', "U+000C"),
+                ("json_bel", '{"replies": [{"thread_id": "PRRT_12345678", "body": "bad\\u0007text"}]}', "U+0007"),
+                (
+                    "json_lone_cr",
+                    '{"guardrail_items": [{"scope": "scripts/**", "rule": "bad\\rrule", "evidence": "commit 1234567"}]}',
+                    "U+000D",
+                ),
+            ]
+            for name, raw_json, expected_u in escaped_plans:
+                with self.subTest(plan=name):
+                    plan_path = tmp_dir / f"{name}.json"
+                    plan_path.write_text(raw_json, encoding="utf-8", newline="\n")
+                    code, _, err = _run_cli_capture(
+                        ["apply-triage", "--pr", "6", "--cwd", tmp, "--plan", str(plan_path)],
+                        runner=fail_runner,
+                    )
+                    self.assertEqual(code, 2)
+                    self.assertIn("[ERROR:control_char_detected]", err)
+                    self.assertIn(expected_u, err)
+
+            # --summary-file の生制御文字を検出する
+            for name, raw_bytes, expected_u in (
+                ("summary_bel", b"summary\x07bad\n", "U+0007"),
+                ("summary_ff", b"summary\x0cbad\n", "U+000C"),
+                ("summary_lone_cr", b"summary\rbad\n", "U+000D"),
+            ):
+                with self.subTest(summary=name):
+                    sum_path = tmp_dir / f"{name}.md"
+                    sum_path.write_bytes(raw_bytes)
+                    code, _, err = _run_cli_capture(
+                        ["apply-triage", "--pr", "6", "--cwd", tmp, "--summary-file", str(sum_path)],
+                        runner=fail_runner,
+                    )
+                    self.assertEqual(code, 2)
+                    self.assertIn("[ERROR:control_char_detected]", err)
+                    self.assertIn(expected_u, err)
+
+    def test_ctrl_03_apply_triage_verify_detects_control_chars_in_sources_and_threads(self) -> None:
+        def make_runner(*, pr_body: str = "", comment_body: str = "clean", thread_body: str = "clean"):
+            def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+                if cmd[:4] == ["git", "remote", "get-url", "origin"]:
+                    return pr_ops.CmdResult(0, "https://github.com/octo/repo.git\n", "")
+                if cmd[:3] == ["gh", "pr", "view"]:
+                    return pr_ops.CmdResult(
+                        0,
+                        json.dumps(
+                            {
+                                "headRefOid": "1234567890abcdef",
+                                "body": pr_body,
+                                "comments": [{"author": {"login": "me"}, "createdAt": "2026-11-28T00:00:00Z", "body": comment_body}],
+                                "reviews": [],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "",
+                    )
+                if cmd[:3] == ["gh", "pr", "comment"]:
+                    return pr_ops.CmdResult(0, "https://github.com/octo/repo/pull/6#issuecomment-1\n", "")
+                if cmd[:3] == ["gh", "api", "graphql"]:
+                    payload = json.loads(input_text or "{}")
+                    q = payload.get("query") or ""
+                    if "reviewThreads" in q:
+                        return pr_ops.CmdResult(
+                            0,
+                            json.dumps(
+                                {
+                                    "data": {
+                                        "repository": {
+                                            "pullRequest": {
+                                                "headRefOid": "1234567890abcdef",
+                                                "reviewThreads": {
+                                                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                    "nodes": [
+                                                        {
+                                                            "id": "PRRT_12345678",
+                                                            "isResolved": True,
+                                                            "isOutdated": False,
+                                                            "comments": {
+                                                                "nodes": [
+                                                                    {
+                                                                        "id": "C1",
+                                                                        "author": {"login": "me"},
+                                                                        "body": thread_body,
+                                                                        "createdAt": "2026-11-28T00:00:00Z",
+                                                                        "url": "https://example/1",
+                                                                    }
+                                                                ]
+                                                            },
+                                                        }
+                                                    ],
+                                                },
+                                            }
+                                        }
+                                    }
+                                },
+                                ensure_ascii=False,
+                            ),
+                            "",
+                        )
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            return fake_runner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            plan_path.write_text(json.dumps({"summary_comment": "確認済み"}, ensure_ascii=False), encoding="utf-8")
+
+            for case_name, kwargs in (
+                ("sources_pr_body", {"pr_body": "PR本文\x07混入"}),
+                ("sources_pr_comment", {"comment_body": "コメント\r単独CR"}),
+                ("threads_comment", {"thread_body": "スレッド返信\x1b混入"}),
+            ):
+                with self.subTest(case=case_name):
+                    code, stdout, stderr = _run_cli_capture(
+                        ["apply-triage", "--pr", "6", "--cwd", tmp, "--plan", str(plan_path)],
+                        runner=make_runner(**kwargs),
+                    )
+                    self.assertEqual(code, 1, stderr)
+                    out = json.loads(stdout)
+                    self.assertFalse(out["ok"])
+                    self.assertTrue(out["verification"]["control_char_found"])
+
+            code, stdout, stderr = _run_cli_capture(
+                ["apply-triage", "--pr", "6", "--cwd", tmp, "--plan", str(plan_path)],
+                runner=make_runner(
+                    pr_body="正常 CRLF\r\n\tタブ\nLF",
+                    comment_body="正常コメント\r\n\tOK",
+                    thread_body="正常スレッド\n\tOK\r\n",
+                ),
+            )
+            self.assertEqual(code, 0, stderr)
+            out = json.loads(stdout)
+            self.assertTrue(out["ok"])
+            self.assertFalse(out["verification"]["control_char_found"])
+
+    def test_ctrl_04_status_reports_body_control_char_found_and_summary_warning(self) -> None:
+        def make_runner(pr_body: str):
+            def fake_runner(cmd: list[str], cwd: Path, input_text: str | None) -> pr_ops.CmdResult:
+                if cmd[:4] == ["git", "remote", "get-url", "origin"]:
+                    return pr_ops.CmdResult(0, "https://github.com/octo/repo.git\n", "")
+                if cmd[:3] == ["gh", "pr", "view"]:
+                    return pr_ops.CmdResult(
+                        0,
+                        json.dumps(
+                            {
+                                "number": 42,
+                                "url": "https://github.com/octo/repo/pull/42",
+                                "title": "Check body",
+                                "state": "OPEN",
+                                "headRefName": "feat/check",
+                                "headRefOid": "abcdef1234567890",
+                                "baseRefName": "main",
+                                "body": pr_body,
+                                "comments": [],
+                                "reviews": [],
+                                "statusCheckRollup": [],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "",
+                    )
+                if cmd[:3] == ["gh", "api", "graphql"]:
+                    return pr_ops.CmdResult(
+                        0,
+                        json.dumps(
+                            {
+                                "data": {
+                                    "repository": {
+                                        "pullRequest": {
+                                            "headRefOid": "abcdef1234567890",
+                                            "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+                                        }
+                                    }
+                                }
+                            }
+                        ),
+                        "",
+                    )
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            return fake_runner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_runner = make_runner("PR body\rwith lone cr and\x07bel")
+            code, stdout, stderr = _run_cli_capture(["status", "--pr", "42", "--cwd", tmp], runner=bad_runner)
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue(json.loads(stdout)["pr"]["body_control_char_found"])
+
+            code, stdout, stderr = _run_cli_capture(
+                ["status", "--pr", "42", "--cwd", tmp, "--format", "summary"],
+                runner=bad_runner,
+            )
+            self.assertEqual(code, 0, stderr)
+            summary_lines = stdout.splitlines()
+            self.assertIn("WARNING: PR 本文に想定外の ASCII 制御文字または単独 CR が含まれています。", summary_lines)
+
+            clean_runner = make_runner("PR body\r\n\twith CRLF and\nLF only")
+            code, stdout, stderr = _run_cli_capture(["status", "--pr", "42", "--cwd", tmp], runner=clean_runner)
+            self.assertEqual(code, 0, stderr)
+            self.assertFalse(json.loads(stdout)["pr"]["body_control_char_found"])
+
+            code, stdout, stderr = _run_cli_capture(
+                ["status", "--pr", "42", "--cwd", tmp, "--format", "summary"],
+                runner=clean_runner,
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertFalse(any(line.startswith("WARNING:") for line in stdout.splitlines()))
+
+    def test_ctrl_05_commit_push_blocks_message_file_and_allows_staged_files_with_control_chars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            work, _ = _init_git_repo_with_bare_remote(tmp_dir, branch="feat/ctrl-check")
+            fixture_bytes = b"page1\x0cpage2\rline_end\n"
+            fixture_file = work / "fixture.txt"
+            fixture_file.write_bytes(fixture_bytes)
+
+            head_before = subprocess.run(
+                ["git", "-C", str(work), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            for name, msg_bytes, expected_u in (
+                ("msg_bel.txt", b"feat: bad\x07message\n", "U+0007"),
+                ("msg_lone_cr.txt", b"feat: bad\rmessage\n", "U+000D"),
+            ):
+                with self.subTest(message=name):
+                    bad_msg = tmp_dir / name
+                    bad_msg.write_bytes(msg_bytes)
+                    code, _, err = _run_cli_capture(
+                        [
+                            "commit-push",
+                            "--cwd",
+                            str(work),
+                            "--files",
+                            "fixture.txt",
+                            "--message-file",
+                            str(bad_msg),
+                            "--no-push",
+                        ]
+                    )
+                    self.assertEqual(code, 2)
+                    self.assertIn("[ERROR:control_char_detected]", err)
+                    self.assertIn(expected_u, err)
+
+            head_after_reject = subprocess.run(
+                ["git", "-C", str(work), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(head_before, head_after_reject)
+
+            good_msg = tmp_dir / "good_msg.txt"
+            good_msg.write_text("feat: commit fixture containing control chars\n", encoding="utf-8", newline="\n")
+            code, stdout, stderr = _run_cli_capture(
+                [
+                    "commit-push",
+                    "--cwd",
+                    str(work),
+                    "--files",
+                    "fixture.txt",
+                    "--message-file",
+                    str(good_msg),
+                    "--no-push",
+                ]
+            )
+            self.assertEqual(code, 0, stderr)
+            out = json.loads(stdout)
+            self.assertTrue(out["ok"])
+            self.assertEqual(out["files"], ["fixture.txt"])
+            committed_bytes = subprocess.run(
+                ["git", "-C", str(work), "show", f"{out['commit_sha']}:fixture.txt"],
+                check=True,
+                capture_output=True,
+            ).stdout
+            self.assertEqual(committed_bytes, fixture_bytes)
+
+
 if __name__ == "__main__":
     unittest.main()
