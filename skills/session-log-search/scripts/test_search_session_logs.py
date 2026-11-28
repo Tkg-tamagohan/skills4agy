@@ -1038,6 +1038,129 @@ class SearchSessionLogsTests(unittest.TestCase):
             self.assertIn(huge_token, data2["results"][0]["text"])
             self.assertTrue(data2["warnings"])
 
+    def test_sl30_unicode_casefold_span_mapping(self) -> None:
+        """SL-30: casefold で長さが変わる Unicode 語 (Straße) とその後続語が正しい元位置で抜粋される。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            tp = app_dir / "brain" / "conv-sz" / ".system_generated" / "logs" / "transcript.jsonl"
+            content = "Start Straße " + ("長い診断文が続きます。" * 40) + " TAIL_AFTER_SZ " + ("末尾" * 30)
+            _write_jsonl(tp, [_make_planner(0, content, "2026-11-20T10:00:00Z")])
+
+            rc1, d1 = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--budget-tokens",
+                    "100",
+                    "--format",
+                    "json",
+                    "--",
+                    "Straße",
+                ]
+            )
+            self.assertEqual(rc1, 0)
+            self.assertIn("Straße", d1["results"][0]["text"])
+
+            rc2, d2 = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--budget-tokens",
+                    "100",
+                    "--format",
+                    "json",
+                    "--",
+                    "TAIL_AFTER_SZ",
+                ]
+            )
+            self.assertEqual(rc2, 0)
+            self.assertIn("TAIL_AFTER_SZ", d2["results"][0]["text"])
+
+    def test_sl31_term_order_independent_longest_span_at_same_start(self) -> None:
+        """SL-31: 接頭辞と完全パスの両順序で検索しても同じ開始位置では長い完全パス全体が保持される。"""
+        prefix = "C:/workspace/"
+        full_path = prefix + ("segment_dir/" * 6) + "target_file_name.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            for idx in range(2):
+                tp = app_dir / "brain" / f"conv-order-{idx}" / ".system_generated" / "logs" / "transcript.jsonl"
+                body = ("診断メッセージの文脈" * 12) + " " + full_path + " " + ("補足" * 12)
+                _write_jsonl(tp, [_make_planner(0, body, f"2026-11-20T10:0{idx}:00Z")])
+
+            for ordered_terms in ([prefix, full_path], [full_path, prefix]):
+                rc, data = self._run_main_json(
+                    [
+                        "--app-data-dir",
+                        str(app_dir),
+                        "--budget-tokens",
+                        "100",
+                        "--format",
+                        "json",
+                        "--",
+                        *ordered_terms,
+                    ]
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(data["restored_turns"], 2)
+                for res in data["results"]:
+                    self.assertIn(full_path, res["text"])
+
+    def test_sl32_cross_window_match_and_masked_match_never_produce_ellipsis_only(self) -> None:
+        """SL-32: 窓境界をまたぐ長いパスも省略記号だけにならず保持され、マスク後消失時も本文が残る。"""
+        long_path = "C:/cross_boundary/" + ("nested_directory/" * 5) + "final_module.py"
+        self.assertGreater(len(long_path), 100)
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            for idx in range(8):
+                tp = app_dir / "brain" / f"conv-cross-{idx}" / ".system_generated" / "logs" / "transcript.jsonl"
+                # 768 文字窓境界を必ずまたぐ 700 文字目付近に長いパスを配置
+                body = ("あ" * 700) + " " + long_path + " " + ("い" * 200)
+                _write_jsonl(tp, [_make_planner(0, body, f"2026-11-20T10:0{idx}:00Z")])
+
+            rc, data = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--budget-tokens",
+                    "100",
+                    "--format",
+                    "json",
+                    "--",
+                    long_path,
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(data["restored_turns"], 8)
+            for res in data["results"]:
+                self.assertIn(long_path, res["text"])
+                self.assertNotEqual(res["text"].strip("."), "")
+
+            # マスクで検索語が [REDACTED] に置換された場合でも空抜粋にならないこと
+            fake_ghp = "ghp_" + ("Z" * 30)
+            tp_mask = app_dir / "brain" / "conv-masked-only" / ".system_generated" / "logs" / "transcript.jsonl"
+            _write_jsonl(
+                tp_mask,
+                [_make_planner(0, ("文脈" * 120) + f" token={fake_ghp} " + ("続き" * 120), "2026-11-21T10:00:00Z")],
+            )
+            rc_m, data_m = self._run_main_json(
+                [
+                    "--app-data-dir",
+                    str(app_dir),
+                    "--conversation-id",
+                    "conv-masked-only",
+                    "--budget-tokens",
+                    "100",
+                    "--format",
+                    "json",
+                    "--",
+                    fake_ghp,
+                ]
+            )
+            self.assertEqual(rc_m, 0)
+            self.assertEqual(data_m["restored_turns"], 1)
+            self.assertNotIn(fake_ghp, data_m["results"][0]["text"])
+            self.assertNotEqual(data_m["results"][0]["text"].strip("."), "")
+
 
 if __name__ == "__main__":
     unittest.main()

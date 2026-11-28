@@ -993,34 +993,71 @@ def score_windows_bm25(
     return windows
 
 
+def _find_best_casefold_span(
+    text: str, terms_cf: Sequence[str]
+) -> tuple[int, int] | None:
+    """text を casefold() した空間で一致を探し、元の文字位置 (start, end) を返す。"""
+    if not text:
+        return None
+    cf_chars: list[str] = []
+    cf_to_orig_start: list[int] = []
+    cf_to_orig_end: list[int] = []
+    for orig_idx, ch in enumerate(text):
+        for fch in ch.casefold():
+            cf_chars.append(fch)
+            cf_to_orig_start.append(orig_idx)
+            cf_to_orig_end.append(orig_idx + 1)
+    cf_text = "".join(cf_chars)
+
+    best_span: tuple[int, int] | None = None
+    for term in terms_cf:
+        if not term:
+            continue
+        pos = cf_text.find(term)
+        if pos < 0:
+            continue
+        span = (cf_to_orig_start[pos], cf_to_orig_end[pos + len(term) - 1])
+        # 前方の一致を優先し、開始位置が同じなら終了位置が最も後ろ（最長）の一致を選ぶ
+        if (
+            best_span is None
+            or span[0] < best_span[0]
+            or (span[0] == best_span[0] and span[1] > best_span[1])
+        ):
+            best_span = span
+    return best_span
+
+
 def _make_window_excerpt(
     best_win: WindowCandidate, terms_cf: Sequence[str], radius: int = EXCERPT_RADIUS
 ) -> str:
-    """一致窓内で検索語の範囲全体（または中央）の前後 radius 文字を切り出す（マスク済みテキスト前提）。"""
+    """一致窓（または行全体）で検索語の範囲全体の前後 radius 文字を切り出す（マスク済みテキスト前提）。"""
     line_text = best_win.line_text
     win_text = best_win.window_text
     win_start = best_win.window_idx * WINDOW_STRIDE
 
-    hit_span: tuple[int, int] | None = None
-    for term in terms_cf:
-        if not term:
-            continue
-        m = re.search(re.escape(term), win_text, re.IGNORECASE)
-        if m is not None:
-            span = (m.start(), m.end())
-            if hit_span is None or span[0] < hit_span[0]:
-                hit_span = span
-
-    if hit_span is None:
-        center = win_start + len(win_text) // 2
-        match_start = center
-        match_end = center
+    win_span = _find_best_casefold_span(win_text, terms_cf)
+    if win_span is not None:
+        match_start = win_start + win_span[0]
+        match_end = win_start + win_span[1]
     else:
-        match_start = win_start + hit_span[0]
-        match_end = win_start + hit_span[1]
+        line_span = _find_best_casefold_span(line_text, terms_cf)
+        if line_span is not None:
+            match_start, match_end = line_span
+        else:
+            center = min(len(line_text), win_start + len(win_text) // 2)
+            # マスク等で一致語が消えた場合でも省略記号のみの空抜粋を防ぐ
+            eff_rad = max(radius, 32)
+            start = max(0, center - eff_rad)
+            end = min(len(line_text), center + eff_rad)
+            excerpt = line_text[start:end]
+            prefix = "..." if start > 0 else ""
+            suffix = "..." if end < len(line_text) else ""
+            return f"{prefix}{excerpt}{suffix}"
 
     start = max(0, match_start - radius)
     end = min(len(line_text), match_end + radius)
+    if start == end and line_text:
+        end = min(len(line_text), start + 32)
     excerpt = line_text[start:end]
     prefix = "..." if start > 0 else ""
     suffix = "..." if end < len(line_text) else ""
